@@ -1,0 +1,1846 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8"/>
+<meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover"/>
+<meta name="theme-color" content="#0A0A0B"/>
+<meta name="apple-mobile-web-app-capable" content="yes"/>
+<title>KoboFlow &#8212; Track Every Kobo</title>
+<link rel="preconnect" href="https://fonts.googleapis.com"/>
+<link href="https://fonts.googleapis.com/css2?family=Bebas+Neue&family=DM+Sans:wght@400;500;600;700&display=swap" rel="stylesheet"/>
+<script>
+/* KoboFlow IDB Shim v2 — fully offline, no CDN, Android-safe */
+(function(g){
+  var DB_NAME_KEY = '__kfdb__';
+  var DB_VERSION  = 2;
+  var STORES = ['transactions','loans','vlogs','ownerAnalytics','cashFlowSnapshots','roiSnapshots','runwaySnapshots'];
+
+  var _db = null;
+  var _queue = [];
+
+  function openDB(cb) {
+    if (_db) { cb(_db); return; }
+    var req = indexedDB.open('KoboFlowDB', DB_VERSION);
+    req.onupgradeneeded = function(e) {
+      var database = e.target.result;
+      for (var si = 0; si < STORES.length; si++) {
+        var sname = STORES[si];
+        if (!database.objectStoreNames.contains(sname)) {
+          var store = database.createObjectStore(sname, {keyPath:'id', autoIncrement:true});
+          if (sname === 'transactions') {
+            store.createIndex('type',  'type',  {unique:false});
+            store.createIndex('date',  'date',  {unique:false});
+            store.createIndex('state', 'state', {unique:false});
+          }
+        }
+      }
+    };
+    req.onsuccess = function(e) {
+      _db = e.target.result;
+      cb(_db);
+    };
+    req.onerror = function(e) {
+      console.error('KoboFlow IDB open error:', e.target.error);
+      cb(null);
+    };
+  }
+
+  function makeTable(storeName) {
+    return {
+      add: function(record) {
+        return new Promise(function(resolve, reject) {
+          openDB(function(database) {
+            if (!database) { resolve(null); return; }
+            try {
+              var tx  = database.transaction([storeName], 'readwrite');
+              var req = tx.objectStore(storeName).add(record);
+              req.onsuccess = function() { resolve(req.result); };
+              req.onerror   = function() { reject(req.error); };
+            } catch(err) { reject(err); }
+          });
+        });
+      },
+      toArray: function() {
+        return new Promise(function(resolve, reject) {
+          openDB(function(database) {
+            if (!database) { resolve([]); return; }
+            try {
+              var tx  = database.transaction([storeName], 'readonly');
+              var req = tx.objectStore(storeName).getAll();
+              req.onsuccess = function() { resolve(req.result || []); };
+              req.onerror   = function() { resolve([]); };
+            } catch(err) { resolve([]); }
+          });
+        });
+      },
+      clear: function() {
+        return new Promise(function(resolve) {
+          openDB(function(database) {
+            if (!database) { resolve(); return; }
+            try {
+              var tx  = database.transaction([storeName], 'readwrite');
+              var req = tx.objectStore(storeName).clear();
+              req.onsuccess = function() { resolve(); };
+              req.onerror   = function() { resolve(); };
+            } catch(err) { resolve(); }
+          });
+        });
+      }
+    };
+  }
+
+  function KoboDB() {
+    this.transactions      = makeTable('transactions');
+    this.loans             = makeTable('loans');
+    this.vlogs             = makeTable('vlogs');
+    this.ownerAnalytics    = makeTable('ownerAnalytics');
+    this.cashFlowSnapshots = makeTable('cashFlowSnapshots');
+    this.roiSnapshots      = makeTable('roiSnapshots');
+    this.runwaySnapshots   = makeTable('runwaySnapshots');
+    this.version = function() { return this; };
+    this.stores  = function() { return this; };
+  }
+
+  g.Dexie = function() { return new KoboDB(); };
+})(window);
+</script>
+<style>
+:root{
+  --bg:#0A0A0B;--surf:#111113;--surf2:#18181C;--surf3:#222228;--border:#2A2A32;
+  --amber:#F5A623;--amberdim:#3D2A0A;--green:#22C55E;--greendim:#0D2E1A;
+  --red:#EF4444;--reddim:#2E0D0D;--blue:#3B82F6;--bluedim:#0D1A2E;
+  --purple:#A855F7;--purpledim:#1E0A3C;
+  --text:#F0EDE8;--muted:#7A7880;--dim:#4A4858;
+  --bebas:'Bebas Neue',sans-serif;--dm:'DM Sans',sans-serif;
+}
+*,*::before,*::after{box-sizing:border-box;margin:0;padding:0;}
+html,body{height:100%;background:var(--bg);font-family:var(--dm);color:var(--text);-webkit-tap-highlight-color:transparent;overscroll-behavior:none;}
+::-webkit-scrollbar{width:3px;}::-webkit-scrollbar-thumb{background:var(--border);border-radius:2px;}
+input,select,button{font-family:var(--dm);}
+input::placeholder{color:var(--dim);}
+select option{background:var(--surf2);color:var(--text);}
+button{cursor:pointer;}
+#app{max-width:480px;margin:0 auto;min-height:100dvh;display:flex;flex-direction:column;background:var(--bg);}
+#topbar{display:flex;align-items:center;justify-content:space-between;padding:12px 16px 8px;border-bottom:1px solid var(--border);background:var(--bg);position:sticky;top:0;z-index:20;}
+.brand{display:flex;align-items:center;gap:9px;}
+.brand-icon{width:30px;height:30px;border-radius:7px;background:var(--amber);display:flex;align-items:center;justify-content:center;font-family:var(--bebas);font-size:17px;color:#000;}
+.brand-name{font-family:var(--bebas);font-size:17px;letter-spacing:.08em;line-height:1;}
+.brand-tag{font-size:8px;color:var(--dim);letter-spacing:.12em;text-transform:uppercase;}
+.topbar-right{display:flex;align-items:center;gap:7px;}
+#review-badge{background:var(--amber);color:#000;border-radius:5px;padding:2px 7px;font-size:10px;font-weight:700;display:none;}
+.icon-btn{width:34px;height:34px;border-radius:7px;background:var(--surf2);border:1px solid var(--border);color:var(--muted);font-size:18px;display:flex;align-items:center;justify-content:center;line-height:1;}
+#capture-strip{padding:10px 16px 7px;border-bottom:1px solid var(--border);background:var(--bg);}
+#capture-wrap{border:1.5px solid var(--border);border-radius:11px;overflow:hidden;transition:border-color .2s,box-shadow .2s;background:var(--surf);}
+#capture-wrap.active{border-color:var(--amber);box-shadow:0 0 0 3px var(--amberdim);}
+.capture-row{display:flex;align-items:center;}
+.capture-symbol{padding:0 12px;font-family:var(--bebas);font-size:21px;color:var(--amber);user-select:none;}
+#capture-input{flex:1;background:transparent;border:none;outline:none;color:var(--text);font-size:16px;padding:13px 0;font-weight:500;caret-color:var(--amber);}
+#capture-btn{background:var(--amber);color:#000;border:none;padding:0 15px;min-height:48px;align-self:stretch;font-family:var(--bebas);font-size:14px;letter-spacing:.08em;transition:background .2s;flex-shrink:0;}
+#capture-btn.saved{background:var(--green);}
+#capture-preview{border-top:1px solid var(--border);padding:6px 12px;display:none;align-items:center;gap:6px;flex-wrap:wrap;}
+#capture-preview.show{display:flex;}
+.preview-label{color:var(--muted);font-size:10px;text-transform:uppercase;letter-spacing:.1em;}
+#capture-hint{color:var(--dim);font-size:9px;text-align:center;margin-top:4px;letter-spacing:.04em;}
+.pill{display:inline-flex;align-items:center;gap:4px;border-radius:4px;font-size:9px;font-weight:700;letter-spacing:.08em;padding:2px 7px;text-transform:uppercase;}
+.pill-dot{width:4px;height:4px;border-radius:50%;flex-shrink:0;}
+#main{flex:1;overflow-y:auto;padding:14px 16px 108px;}
+.screen{display:none;}
+.screen.active{display:block;animation:fadeUp .16s ease;}
+@keyframes fadeUp{from{opacity:0;transform:translateY(7px);}to{opacity:1;transform:none;}}
+.screen-title{font-family:var(--bebas);font-size:24px;letter-spacing:.04em;margin-bottom:3px;}
+.screen-sub{color:var(--muted);font-size:12px;margin-bottom:14px;}
+.card{background:var(--surf);border:1px solid var(--border);border-radius:11px;padding:14px;margin-bottom:10px;}
+.card-label{color:var(--muted);font-size:10px;letter-spacing:.1em;text-transform:uppercase;margin-bottom:10px;}
+.score-ring-wrap{position:relative;width:86px;height:86px;flex-shrink:0;}
+#score-center{position:absolute;inset:0;display:flex;flex-direction:column;align-items:center;justify-content:center;}
+#score-wrap{display:flex;align-items:center;gap:14px;}
+.grid3{display:grid;grid-template-columns:1fr 1fr 1fr;gap:7px;margin-bottom:10px;}
+.grid2{display:grid;grid-template-columns:1fr 1fr;gap:7px;margin-bottom:10px;}
+.stat-card{background:var(--surf);border:1px solid var(--border);border-radius:9px;padding:11px 9px;}
+.stat-label{color:var(--muted);font-size:9px;letter-spacing:.1em;text-transform:uppercase;margin-bottom:5px;}
+.stat-val{font-family:var(--bebas);font-size:16px;letter-spacing:.02em;}
+.ob-item{display:flex;justify-content:space-between;align-items:center;margin-bottom:7px;padding:8px 10px;border-radius:8px;background:var(--surf2);border:1px solid var(--border);}
+.ob-item.overdue{background:var(--reddim);border-color:var(--red);}
+.ob-left{display:flex;gap:8px;align-items:center;}
+.ob-desc{color:var(--text);font-size:13px;font-weight:500;}
+.ob-due{font-size:10px;color:var(--muted);}
+.ob-item.overdue .ob-due{color:var(--red);font-weight:700;}
+.ob-amount{font-family:var(--bebas);font-size:15px;color:var(--text);}
+.ob-item.overdue .ob-amount{color:var(--red);}
+.budget-row{margin-bottom:14px;}
+.budget-top{display:flex;justify-content:space-between;align-items:center;margin-bottom:4px;}
+.budget-cat{display:flex;align-items:center;gap:6px;font-size:12px;font-weight:500;}
+.budget-right{display:flex;align-items:center;gap:7px;}
+.budget-fig{color:var(--muted);font-size:10px;}
+.budget-pct{font-family:var(--bebas);font-size:15px;min-width:34px;text-align:right;}
+.budget-track{height:4px;background:var(--surf3);border-radius:2px;overflow:hidden;}
+.budget-bar{height:100%;border-radius:2px;width:0%;transition:width .9s cubic-bezier(.4,0,.2,1);}
+.accounts-scroll{display:flex;gap:8px;overflow-x:auto;padding-bottom:4px;margin-bottom:12px;scrollbar-width:none;}
+.accounts-scroll::-webkit-scrollbar{display:none;}
+.acct-card{background:var(--surf);border:1px solid var(--border);border-radius:10px;padding:12px;min-width:128px;flex-shrink:0;}
+.acct-name{font-size:10px;color:var(--muted);text-transform:uppercase;letter-spacing:.07em;margin-bottom:4px;}
+.acct-bal{font-family:var(--bebas);font-size:19px;color:var(--amber);}
+.acct-type{font-size:9px;color:var(--dim);margin-top:2px;}
+.filter-row{display:flex;gap:5px;margin-bottom:12px;overflow-x:auto;padding-bottom:2px;scrollbar-width:none;}
+.filter-row::-webkit-scrollbar{display:none;}
+.filter-btn{background:var(--surf2);color:var(--muted);border:none;border-radius:5px;padding:5px 9px;font-size:10px;font-weight:700;letter-spacing:.08em;white-space:nowrap;display:flex;align-items:center;gap:3px;}
+.filter-btn.active{background:var(--amber);color:#000;}
+.filter-count{border-radius:3px;padding:1px 4px;font-size:9px;background:var(--surf3);}
+.filter-btn.active .filter-count{background:rgba(0,0,0,.2);}
+.inbox-item{background:var(--surf);border:1px solid var(--border);border-radius:9px;padding:11px 12px;display:flex;align-items:center;gap:10px;margin-bottom:7px;}
+.inbox-item.needs-review{border-color:var(--amberdim);}
+.inbox-icon{width:36px;height:36px;border-radius:7px;background:var(--surf2);display:flex;align-items:center;justify-content:center;font-size:15px;flex-shrink:0;color:var(--muted);font-weight:700;}
+.inbox-icon.income{background:var(--greendim);color:var(--green);}
+.inbox-icon.transfer{background:var(--bluedim);color:var(--blue);}
+.inbox-icon.owner_withdrawal{background:var(--purpledim);color:var(--purple);}
+.inbox-icon.capital_injection{background:var(--greendim);color:var(--green);}
+.inbox-mid{flex:1;min-width:0;}
+.inbox-desc-txt{font-size:13px;font-weight:600;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;margin-bottom:3px;}
+.inbox-meta{font-size:10px;color:var(--muted);}
+.inbox-right{text-align:right;flex-shrink:0;}
+.amount-badge{font-family:var(--bebas);font-size:17px;letter-spacing:.02em;}
+.amount-badge.income,.amount-badge.capital_injection{color:var(--green);}
+.amount-badge.expense,.amount-badge.obligation{color:var(--text);}
+.amount-badge.transfer{color:var(--blue);}
+.amount-badge.owner_withdrawal{color:var(--purple);}
+.amount-badge.investment{color:var(--amber);}
+.action-btns{display:flex;gap:3px;margin-top:4px;justify-content:flex-end;}
+.act-btn{border:none;border-radius:4px;padding:3px 7px;font-size:9px;font-weight:700;}
+.act-approve{background:var(--greendim);color:var(--green);}
+.act-dismiss{background:var(--surf3);color:var(--muted);}
+.tl-day-header{margin:16px 0 9px;}
+.tl-day-label{font-family:var(--bebas);font-size:18px;letter-spacing:.06em;color:var(--amber);}
+.tl-day-net{font-size:11px;color:var(--muted);margin-top:2px;}
+.tl-item{display:flex;align-items:center;gap:9px;padding:9px 12px;background:var(--surf);border:1px solid var(--border);border-radius:9px;margin-bottom:6px;}
+.tl-dot{width:7px;height:7px;border-radius:50%;flex-shrink:0;}
+.tl-dot.income,.tl-dot.capital_injection{background:var(--green);}
+.tl-dot.expense,.tl-dot.obligation{background:var(--red);}
+.tl-dot.transfer{background:var(--blue);}
+.tl-dot.owner_withdrawal{background:var(--purple);}
+.tl-dot.investment{background:var(--amber);}
+.tl-body{flex:1;min-width:0;}
+.tl-desc{font-size:13px;font-weight:500;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;}
+.tl-meta{font-size:10px;color:var(--muted);margin-top:1px;}
+.tl-amount{font-family:var(--bebas);font-size:16px;flex-shrink:0;}
+.tl-amount.income,.tl-amount.capital_injection{color:var(--green);}
+.tl-amount.transfer{color:var(--blue);}
+.tl-amount.owner_withdrawal{color:var(--purple);}
+.tl-amount.investment{color:var(--amber);}
+#tl-search{width:100%;background:var(--surf2);border:1px solid var(--border);border-radius:8px;padding:9px 12px;color:var(--text);font-size:13px;outline:none;margin-bottom:10px;}
+#tl-search:focus{border-color:var(--amber);}
+.tl-filter-row{display:flex;gap:5px;margin-bottom:14px;overflow-x:auto;scrollbar-width:none;}
+.tl-filter-row::-webkit-scrollbar{display:none;}
+.tl-filter-btn{background:var(--surf2);color:var(--muted);border:none;border-radius:5px;padding:5px 11px;font-size:10px;font-weight:700;letter-spacing:.08em;white-space:nowrap;}
+.tl-filter-btn.active{background:var(--amber);color:#000;}
+.vehicle-tabs{display:flex;gap:5px;margin-bottom:14px;overflow-x:auto;scrollbar-width:none;}
+.vehicle-tabs::-webkit-scrollbar{display:none;}
+.vtab{background:var(--surf2);color:var(--muted);border:1px solid var(--border);border-radius:8px;padding:7px 12px;font-size:11px;font-weight:700;letter-spacing:.05em;white-space:nowrap;}
+.vtab.active{background:var(--amber);color:#000;border-color:var(--amber);}
+.vehicle-panel{display:none;}
+.vehicle-panel.active{display:block;}
+.vehicle-hero{background:var(--surf);border:1px solid var(--border);border-radius:11px;padding:14px;margin-bottom:10px;}
+.vh-top{display:flex;align-items:center;gap:12px;margin-bottom:12px;}
+.vh-icon{width:46px;height:46px;border-radius:9px;background:var(--surf2);display:flex;align-items:center;justify-content:center;font-size:24px;flex-shrink:0;}
+.vh-name{font-family:var(--bebas);font-size:20px;letter-spacing:.04em;}
+.vh-sub{font-size:11px;color:var(--muted);margin-top:2px;}
+.vh-stats{display:grid;grid-template-columns:1fr 1fr 1fr;gap:7px;margin-bottom:12px;}
+.vh-stat{background:var(--surf2);border-radius:7px;padding:9px 7px;text-align:center;}
+.vh-stat-val{font-family:var(--bebas);font-size:15px;color:var(--amber);}
+.vh-stat-label{font-size:8px;color:var(--muted);text-transform:uppercase;letter-spacing:.08em;margin-top:2px;}
+.vlog-item{display:flex;align-items:center;gap:9px;padding:9px 12px;background:var(--surf);border:1px solid var(--border);border-radius:9px;margin-bottom:6px;}
+.vlog-icon{width:30px;height:30px;border-radius:6px;background:var(--surf2);display:flex;align-items:center;justify-content:center;font-size:13px;flex-shrink:0;}
+.vlog-body{flex:1;min-width:0;}
+.vlog-desc{font-size:12px;font-weight:500;}
+.vlog-meta{font-size:10px;color:var(--muted);margin-top:1px;}
+.vlog-amount{font-family:var(--bebas);font-size:15px;color:var(--text);flex-shrink:0;}
+.cal-month-header{font-family:var(--bebas);font-size:17px;color:var(--amber);letter-spacing:.06em;margin:16px 0 9px;}
+.cal-item{display:flex;align-items:center;gap:10px;padding:10px 13px;background:var(--surf);border:1px solid var(--border);border-radius:9px;margin-bottom:6px;}
+.cal-item.today-item{border-color:var(--amber);}
+.cal-item.overdue-item{border-color:var(--red);background:var(--reddim);}
+.cal-date-badge{min-width:42px;text-align:center;background:var(--surf2);border-radius:7px;padding:5px 4px;}
+.cal-day{font-family:var(--bebas);font-size:18px;line-height:1;color:var(--amber);}
+.cal-mon{font-size:9px;color:var(--muted);text-transform:uppercase;letter-spacing:.06em;}
+.cal-body{flex:1;}
+.cal-desc{font-size:13px;font-weight:500;}
+.cal-cat{font-size:10px;color:var(--muted);margin-top:2px;}
+.cal-amount{font-family:var(--bebas);font-size:16px;color:var(--red);}
+.pressure-hero{text-align:center;padding:14px 0 10px;}
+.pressure-label{font-size:10px;color:var(--muted);letter-spacing:.1em;text-transform:uppercase;margin-bottom:7px;}
+.pressure-score{font-family:var(--bebas);font-size:50px;line-height:1;}
+.pressure-status{font-size:13px;margin-top:4px;}
+.pressure-track{height:10px;background:var(--surf3);border-radius:5px;margin:12px 0 6px;overflow:hidden;}
+.pressure-fill{height:100%;border-radius:5px;width:0%;transition:width 1s ease;}
+.pressure-row{display:flex;justify-content:space-between;align-items:center;padding:9px 0;border-bottom:1px solid var(--border);}
+.pressure-row:last-child{border-bottom:none;}
+.pressure-item-name{font-size:12px;}
+.pressure-item-amt{font-family:var(--bebas);font-size:15px;color:var(--red);}
+.drop-row{display:flex;justify-content:space-between;align-items:center;padding:10px 0;border-bottom:1px solid var(--border);}
+.drop-row:last-child{border-bottom:none;}
+.drop-cat{font-size:13px;}
+.drop-change{font-family:var(--bebas);font-size:15px;}
+.drop-change.up{color:var(--red);}
+.drop-change.down{color:var(--green);}
+.cap-section{margin-bottom:18px;}
+.cap-section-title{font-family:var(--bebas);font-size:16px;letter-spacing:.06em;color:var(--amber);margin-bottom:9px;border-bottom:1px solid var(--border);padding-bottom:5px;}
+.loan-item{background:var(--surf);border:1px solid var(--border);border-radius:9px;padding:13px;margin-bottom:9px;}
+.loan-top{display:flex;justify-content:space-between;align-items:flex-start;margin-bottom:9px;}
+.loan-name{font-size:14px;font-weight:600;}
+.loan-source{font-size:10px;color:var(--muted);margin-top:2px;}
+.loan-balance{font-family:var(--bebas);font-size:19px;color:var(--red);}
+.loan-bal-label{font-size:9px;color:var(--red);text-transform:uppercase;letter-spacing:.08em;}
+.loan-fields{display:flex;gap:9px;flex-wrap:wrap;margin-bottom:7px;}
+.loan-field{flex:1;min-width:75px;}
+.loan-field-label{font-size:9px;color:var(--muted);letter-spacing:.08em;text-transform:uppercase;margin-bottom:3px;}
+.loan-field-val{font-size:12px;font-weight:600;}
+.loan-progress-track{height:4px;background:var(--surf3);border-radius:2px;margin-top:7px;overflow:hidden;}
+.loan-progress-bar{height:100%;background:var(--amber);border-radius:2px;width:0%;transition:width .9s ease;}
+.inject-item{background:var(--surf);border:1px solid var(--border);border-radius:9px;padding:11px 13px;display:flex;justify-content:space-between;align-items:center;margin-bottom:7px;}
+.inject-left .inject-name{font-size:13px;font-weight:500;}
+.inject-left .inject-meta{font-size:10px;color:var(--muted);margin-top:2px;}
+.inject-amount{font-family:var(--bebas);font-size:17px;color:var(--green);}
+.nw-hero{text-align:center;padding:14px 0 12px;}
+.nw-label{font-size:10px;color:var(--muted);letter-spacing:.12em;text-transform:uppercase;margin-bottom:7px;}
+.nw-amount{font-family:var(--bebas);font-size:40px;letter-spacing:.02em;line-height:1;}
+.nw-change{font-size:12px;margin-top:5px;}
+.nw-divider{border:none;border-top:1px solid var(--border);margin:10px 0;}
+.nw-row{display:flex;justify-content:space-between;align-items:center;margin-bottom:9px;}
+.nw-row-label{display:flex;align-items:center;gap:7px;font-size:12px;color:var(--muted);}
+.nw-row-val{font-size:13px;font-weight:600;}
+.fi-track{height:7px;background:var(--surf3);border-radius:4px;margin-top:9px;overflow:hidden;}
+.fi-bar{height:100%;background:linear-gradient(90deg,var(--amber),var(--green));border-radius:4px;width:0%;transition:width 1s ease;}
+.fi-labels{display:flex;justify-content:space-between;margin-top:5px;}
+.fi-label{font-size:9px;color:var(--muted);}
+.nw-trend-row{display:flex;align-items:flex-end;gap:5px;height:64px;margin-top:8px;}
+.nw-bar-wrap{flex:1;display:flex;flex-direction:column;align-items:center;gap:3px;}
+.nw-bar{width:100%;border-radius:3px 3px 0 0;}
+.nw-bar-label{font-size:8px;color:var(--muted);}
+.form-group{margin-bottom:11px;}
+.form-group label{display:block;font-size:10px;color:var(--muted);letter-spacing:.08em;text-transform:uppercase;margin-bottom:4px;}
+.form-input{width:100%;background:var(--surf2);border:1px solid var(--border);border-radius:8px;padding:10px 12px;color:var(--text);font-size:14px;outline:none;display:block;}
+.form-input:focus{border-color:var(--amber);}
+.opp-calc-btn{width:100%;background:var(--amber);color:#000;border:none;border-radius:9px;padding:13px;font-family:var(--bebas);font-size:17px;letter-spacing:.08em;margin-top:4px;}
+.opp-result{display:none;}
+.opp-result.show{display:block;animation:fadeUp .18s ease;}
+.opp-verdict{text-align:center;padding:16px;border-radius:11px;margin-bottom:12px;border:1.5px solid transparent;}
+.opp-verdict.green{background:var(--greendim);border-color:var(--green);}
+.opp-verdict.amber{background:var(--amberdim);border-color:var(--amber);}
+.opp-verdict.red{background:var(--reddim);border-color:var(--red);}
+.verdict-icon{font-size:30px;margin-bottom:5px;}
+.verdict-label{font-family:var(--bebas);font-size:22px;letter-spacing:.08em;}
+.verdict-sub{font-size:11px;color:var(--muted);margin-top:3px;}
+.opp-metrics{display:grid;grid-template-columns:1fr 1fr;gap:7px;margin-bottom:10px;}
+.opp-metric{background:var(--surf);border:1px solid var(--border);border-radius:9px;padding:11px;}
+.opp-metric-label{font-size:9px;color:var(--muted);text-transform:uppercase;letter-spacing:.08em;margin-bottom:4px;}
+.opp-metric-val{font-family:var(--bebas);font-size:18px;}
+.opp-risk-bar{height:5px;background:var(--surf3);border-radius:3px;margin-top:7px;overflow:hidden;}
+.opp-risk-fill{height:100%;border-radius:3px;width:0%;transition:width .8s ease;}
+.ana-card{border-radius:11px;padding:14px;border:1px solid transparent;}
+.ana-card.income-card{background:var(--greendim);border-color:rgba(34,197,94,.15);}
+.ana-card.expense-card{background:var(--reddim);border-color:rgba(239,68,68,.15);}
+.ana-label{font-size:10px;letter-spacing:.1em;text-transform:uppercase;margin-bottom:5px;}
+.ana-val{font-family:var(--bebas);font-size:21px;}
+.income-card .ana-label,.income-card .ana-val{color:var(--green);}
+.expense-card .ana-label,.expense-card .ana-val{color:var(--red);}
+.cat-row{margin-bottom:11px;}
+.cat-top{display:flex;justify-content:space-between;margin-bottom:3px;}
+.cat-name{font-size:12px;}
+.cat-val{font-family:var(--bebas);font-size:14px;}
+.cat-track{height:3px;background:var(--surf3);border-radius:2px;overflow:hidden;}
+.cat-bar{height:100%;border-radius:2px;width:0%;transition:width .7s cubic-bezier(.4,0,.2,1);}
+.insight-row{display:flex;gap:10px;align-items:flex-start;margin-bottom:11px;}
+.insight-icon{font-size:15px;flex-shrink:0;}
+.insight-text{color:var(--text);font-size:12px;line-height:1.5;}
+.settings-row{display:flex;justify-content:space-between;align-items:center;padding:11px 0;border-bottom:1px solid var(--border);}
+.settings-row:last-child{border-bottom:none;}
+.settings-row-label{font-size:13px;}
+.settings-row-sub{font-size:10px;color:var(--muted);margin-top:2px;}
+.settings-btn{background:var(--surf2);border:1px solid var(--border);color:var(--text);border-radius:7px;padding:7px 13px;font-size:12px;font-weight:600;}
+.settings-btn.danger{background:var(--reddim);border-color:var(--red);color:var(--red);}
+.settings-btn.primary{background:var(--amberdim);border-color:var(--amber);color:var(--amber);}
+.settings-section-title{font-family:var(--bebas);font-size:15px;letter-spacing:.06em;color:var(--amber);margin-bottom:9px;border-bottom:1px solid var(--border);padding-bottom:5px;}
+.type-chips{display:flex;gap:5px;flex-wrap:wrap;margin-bottom:12px;}
+.type-chip{border:none;border-radius:5px;padding:6px 10px;font-size:10px;font-weight:700;letter-spacing:.07em;text-transform:uppercase;background:var(--surf2);color:var(--muted);}
+.type-chip.active{background:var(--amber);color:#000;}
+#nav{position:fixed;bottom:0;left:50%;transform:translateX(-50%);width:100%;max-width:480px;background:var(--surf);border-top:1px solid var(--border);display:flex;padding-bottom:env(safe-area-inset-bottom);z-index:20;overflow-x:auto;scrollbar-width:none;}
+#nav::-webkit-scrollbar{display:none;}
+.nav-btn{flex:0 0 auto;min-width:52px;background:none;border:none;display:flex;flex-direction:column;align-items:center;gap:2px;padding:7px 0 5px;}
+.nav-icon{font-size:14px;line-height:1;color:var(--dim);transition:color .15s;}
+.nav-label{font-size:7px;font-weight:700;letter-spacing:.05em;color:var(--dim);text-transform:uppercase;transition:color .15s;}
+.nav-dot{width:3px;height:3px;border-radius:50%;background:var(--amber);opacity:0;transition:opacity .15s;margin-top:1px;}
+.nav-btn.active .nav-icon,.nav-btn.active .nav-label{color:var(--amber);}
+.nav-btn.active .nav-dot{opacity:1;}
+.modal-overlay{position:fixed;inset:0;background:rgba(0,0,0,.8);display:none;align-items:flex-end;justify-content:center;z-index:50;backdrop-filter:blur(4px);}
+.modal-overlay.open{display:flex;}
+.modal-box{background:var(--surf);border-radius:15px 15px 0 0;padding:20px 18px 30px;width:100%;max-width:480px;border:1px solid var(--border);border-bottom:none;animation:slideUp .24s cubic-bezier(.34,1.4,.64,1);max-height:92dvh;overflow-y:auto;}
+@keyframes slideUp{from{transform:translateY(100%);}to{transform:none;}}
+.modal-head{display:flex;justify-content:space-between;align-items:center;margin-bottom:16px;}
+.modal-title{font-family:var(--bebas);font-size:20px;letter-spacing:.04em;}
+.modal-close{background:none;border:none;color:var(--muted);font-size:21px;}
+.modal-input{width:100%;background:var(--surf2);border:1px solid var(--border);border-radius:8px;padding:10px 12px;color:var(--text);font-size:14px;outline:none;margin-bottom:9px;display:block;}
+.modal-input:focus{border-color:var(--amber);}
+#modal-amount{font-family:var(--bebas);font-size:19px;letter-spacing:.04em;}
+.modal-save{width:100%;background:var(--amber);color:#000;border:none;border-radius:9px;padding:13px;font-family:var(--bebas);font-size:17px;letter-spacing:.08em;margin-top:4px;}
+.empty-state{text-align:center;padding:36px 18px;color:var(--dim);}
+.empty-icon{font-size:30px;margin-bottom:7px;}
+#toast{position:fixed;top:76px;left:50%;transform:translateX(-50%);background:var(--surf3);border:1px solid var(--border);border-radius:8px;padding:8px 16px;font-size:12px;font-weight:600;color:var(--text);z-index:100;display:none;white-space:nowrap;box-shadow:0 4px 16px rgba(0,0,0,.4);}
+#toast.show{display:block;animation:fadeUp .2s ease;}
+
+/* V2.1 MODULES */
+.runway-card{background:var(--surf);border:1.5px solid var(--border);border-radius:11px;padding:14px;margin-bottom:10px;}
+.runway-hero{display:flex;align-items:center;justify-content:space-between;}
+.runway-days{font-family:var(--bebas);font-size:52px;line-height:1;}
+.runway-label{font-size:10px;color:var(--muted);text-transform:uppercase;letter-spacing:.1em;margin-top:3px;}
+.runway-meta{font-size:12px;color:var(--muted);margin-top:8px;display:flex;gap:16px;flex-wrap:wrap;}
+.runway-meta span{display:flex;flex-direction:column;gap:2px;}
+.runway-meta b{font-family:var(--bebas);font-size:15px;color:var(--text);}
+.autopilot-card{background:var(--surf);border:1.5px solid var(--amber);border-radius:11px;padding:14px;margin-bottom:10px;}
+.autopilot-title{font-family:var(--bebas);font-size:13px;letter-spacing:.12em;color:var(--amber);margin-bottom:10px;display:flex;align-items:center;gap:7px;}
+.autopilot-row{display:flex;justify-content:space-between;align-items:center;padding:6px 0;border-bottom:1px solid var(--border);}
+.autopilot-row:last-child{border-bottom:none;}
+.autopilot-lbl{font-size:12px;color:var(--muted);}
+.autopilot-val{font-family:var(--bebas);font-size:15px;}
+.autopilot-warning{background:var(--reddim);border:1px solid var(--red);border-radius:8px;padding:8px 11px;font-size:11px;color:var(--red);margin-top:8px;line-height:1.5;}
+.autopilot-ok{background:var(--greendim);border:1px solid var(--green);border-radius:8px;padding:8px 11px;font-size:11px;color:var(--green);margin-top:8px;line-height:1.5;}
+.cf-section{margin-bottom:14px;}
+.cf-section-title{font-family:var(--bebas);font-size:15px;letter-spacing:.06em;color:var(--amber);margin-bottom:8px;border-bottom:1px solid var(--border);padding-bottom:4px;}
+.cf-row{display:flex;justify-content:space-between;align-items:center;padding:7px 0;border-bottom:1px solid var(--border);}
+.cf-row:last-child{border-bottom:none;}
+.cf-cat{font-size:12px;color:var(--muted);}
+.cf-amt{font-family:var(--bebas);font-size:14px;}
+.cf-total-row{display:flex;justify-content:space-between;align-items:center;padding:10px 12px;border-radius:8px;background:var(--surf2);margin-top:6px;}
+.cf-total-lbl{font-size:13px;font-weight:600;}
+.cf-total-amt{font-family:var(--bebas);font-size:18px;}
+.wd-ratio-bar{height:8px;background:var(--surf3);border-radius:4px;overflow:hidden;margin:8px 0 4px;}
+.wd-ratio-fill{height:100%;border-radius:4px;transition:width 1s ease;}
+.roi-bar-row{display:flex;align-items:flex-end;gap:5px;height:70px;margin-top:8px;}
+.roi-bar-wrap{flex:1;display:flex;flex-direction:column;align-items:center;gap:3px;}
+.roi-bar{width:100%;border-radius:3px 3px 0 0;transition:height .8s ease;}
+.roi-bar-label{font-size:8px;color:var(--muted);}
+.roi-bar-val{font-size:8px;font-weight:700;}
+</style>
+</head>
+<body>
+<div id="app">
+  <div id="topbar">
+    <div class="brand">
+      <div class="brand-icon">K</div>
+      <div><div class="brand-name">KOBOFLOW</div><div class="brand-tag">Track Every Kobo</div></div>
+    </div>
+    <div class="topbar-right">
+      <div id="review-badge">0</div>
+      <button class="icon-btn" id="add-btn">+</button>
+      <button class="icon-btn" id="settings-nav-btn" style="font-size:14px;">&#9881;</button>
+    </div>
+  </div>
+
+  <div id="capture-strip">
+    <div id="capture-wrap">
+      <div class="capture-row">
+        <div class="capture-symbol">&#8358;</div>
+        <input id="capture-input" type="text" placeholder="2500 fuel fjr" autocomplete="off" autocorrect="off" spellcheck="false"/>
+        <button id="capture-btn">SAVE</button>
+      </div>
+      <div id="capture-preview">
+        <span class="preview-label">Parsed:</span>
+        <span id="preview-type" class="pill"></span>
+        <span id="preview-cat" class="pill"></span>
+        <span id="preview-acct" class="pill" style="background:#222228;color:#7A7880;"></span>
+      </div>
+    </div>
+    <div id="capture-hint">2500 fuel fjr &middot; 15000 fuel green &middot; 50000 owner withdrawal &middot; 150000 restock emzor</div>
+  </div>
+
+  <div id="main">
+    <div class="screen active" id="screen-home">
+      <div style="margin-bottom:14px;">
+        <div id="greeting-text" style="color:var(--muted);font-size:11px;letter-spacing:.12em;text-transform:uppercase;margin-bottom:3px;">Good Morning</div>
+        <div class="screen-title">FINANCIAL BRIEFING</div>
+      </div>
+      <div class="card">
+        <div id="score-wrap">
+          <div class="score-ring-wrap">
+            <svg width="86" height="86" style="transform:rotate(-90deg);display:block;">
+              <circle cx="43" cy="43" r="34" fill="none" stroke="var(--surf3)" stroke-width="5"/>
+              <circle id="score-arc" cx="43" cy="43" r="34" fill="none" stroke="#22C55E" stroke-width="5" stroke-linecap="round" stroke-dasharray="213.6 213.6" stroke-dashoffset="213.6"/>
+            </svg>
+            <div id="score-center">
+              <div id="score-num" style="font-family:var(--bebas);font-size:24px;line-height:1;color:#22C55E;">72</div>
+              <div style="font-size:8px;color:var(--muted);letter-spacing:.1em;text-transform:uppercase;">Score</div>
+            </div>
+          </div>
+          <div style="flex:1;">
+            <div class="card-label" style="margin-bottom:5px;">Financial Health</div>
+            <div id="score-msg" style="font-size:12px;line-height:1.6;color:var(--text);">Spending is well within control.</div>
+            <div id="pressure-mini" style="color:var(--muted);font-size:11px;margin-top:3px;">Pressure: calculating...</div>
+          </div>
+        </div>
+      </div>
+      <div class="grid3">
+        <div class="stat-card"><div class="stat-label">Yesterday In</div><div class="stat-val" id="yd-in" style="color:var(--green);">--</div></div>
+        <div class="stat-card"><div class="stat-label">Yesterday Out</div><div class="stat-val" id="yd-out" style="color:var(--red);">--</div></div>
+        <div class="stat-card"><div class="stat-label">Net</div><div class="stat-val" id="yd-net">--</div></div>
+      </div>
+
+      <!-- MORNING AUTOPILOT (v2.1) -->
+      <div class="autopilot-card" id="autopilot-card">
+        <div class="autopilot-title">&#9654; TODAY'S FINANCIAL BRIEFING</div>
+        <div id="autopilot-body"></div>
+      </div>
+      <!-- CASH RUNWAY (v2.1) -->
+      <div class="runway-card" id="runway-card">
+        <div style="display:flex;justify-content:space-between;align-items:flex-start;">
+          <div>
+            <div class="card-label" style="margin-bottom:4px;">CASH RUNWAY</div>
+            <div class="runway-days" id="runway-days">--</div>
+            <div class="runway-label">DAYS REMAINING</div>
+          </div>
+          <div style="text-align:right;">
+            <div id="runway-status" style="font-size:11px;font-weight:700;letter-spacing:.08em;text-transform:uppercase;margin-bottom:6px;">Calculating...</div>
+            <div style="font-size:10px;color:var(--muted);">If no new income arrives</div>
+          </div>
+        </div>
+        <div class="runway-meta" id="runway-meta"></div>
+      </div>
+      <div style="margin-bottom:4px;"><span class="card-label">ACCOUNTS</span></div>
+      <div class="accounts-scroll" id="accounts-scroll"></div>
+      <div class="card"><div class="card-label">Upcoming Obligations</div><div id="ob-list"></div></div>
+      <div class="card"><div class="card-label">Budget Status</div><div id="budget-list"></div></div>
+    </div>
+
+    <div class="screen" id="screen-timeline">
+      <div class="screen-title">FINANCIAL TIMELINE</div>
+      <div class="screen-sub">What happened to my money?</div>
+      <input id="tl-search" type="text" placeholder="Search entries, categories, vehicles..."/>
+      <div class="tl-filter-row" id="tl-filter-row">
+        <button class="tl-filter-btn active" data-f="all">All</button>
+        <button class="tl-filter-btn" data-f="income">Income</button>
+        <button class="tl-filter-btn" data-f="expense">Expense</button>
+        <button class="tl-filter-btn" data-f="transfer">Transfer</button>
+        <button class="tl-filter-btn" data-f="owner_withdrawal">Withdrawal</button>
+        <button class="tl-filter-btn" data-f="capital_injection">Capital</button>
+        <button class="tl-filter-btn" data-f="today">Today</button>
+        <button class="tl-filter-btn" data-f="yesterday">Yesterday</button>
+      </div>
+      <div id="timeline-list"></div>
+    </div>
+
+    <div class="screen" id="screen-inbox">
+      <div class="screen-title">FINANCIAL INBOX</div>
+      <div id="inbox-meta" class="screen-sub">Loading...</div>
+      <div class="filter-row" id="filter-row"></div>
+      <div id="inbox-list"></div>
+    </div>
+
+    <div class="screen" id="screen-vehicles">
+      <div class="screen-title">VEHICLE COSTS</div>
+      <div class="screen-sub">FJR1300AE &middot; Sportage Green &middot; Sportage Black</div>
+      <div class="vehicle-tabs" id="vehicle-tabs"></div>
+      <div id="vehicle-panels"></div>
+    </div>
+
+    <div class="screen" id="screen-calendar">
+      <div class="screen-title">CASH CALENDAR</div>
+      <div class="screen-sub">See cash demands before they arrive</div>
+      <div class="card" id="cal-summary"></div>
+      <div id="calendar-list"></div>
+    </div>
+
+    <div class="screen" id="screen-pressure">
+      <div class="screen-title">FINANCIAL PRESSURE</div>
+      <div class="screen-sub">Obligations vs available cash &middot; 30-day window</div>
+      <div class="card">
+        <div class="pressure-hero">
+          <div class="pressure-label">Pressure Score</div>
+          <div class="pressure-score" id="pressure-score">58</div>
+          <div class="pressure-status" id="pressure-status">Moderate Pressure</div>
+        </div>
+        <div class="pressure-track"><div class="pressure-fill" id="pressure-fill"></div></div>
+        <div style="display:flex;justify-content:space-between;margin-top:4px;">
+          <span style="font-size:9px;color:var(--muted);">Low</span>
+          <span style="font-size:9px;color:var(--muted);">High</span>
+        </div>
+      </div>
+      <div class="card">
+        <div class="card-label">Obligations Due (30 Days)</div>
+        <div id="pressure-items"></div>
+        <div style="border-top:1px solid var(--border);margin-top:10px;padding-top:10px;display:flex;justify-content:space-between;">
+          <span style="font-size:13px;font-weight:600;">Total Obligations</span>
+          <span id="pressure-total" style="font-family:var(--bebas);font-size:17px;color:var(--red);">--</span>
+        </div>
+      </div>
+      <div class="card"><div class="card-label">Cash vs Obligations</div><div class="grid2" id="pressure-vs" style="margin-bottom:0;"></div></div>
+    </div>
+
+    <div class="screen" id="screen-cashdrop">
+      <div class="screen-title">WHY DID CASH DROP?</div>
+      <div class="screen-sub">Month-over-month spending changes</div>
+      <div class="card"><div class="card-label">Compared to Last Month</div><div id="drop-list"></div></div>
+      <div class="card"><div class="card-label">Largest Contributors to Drop</div><div id="drop-chart"></div></div>
+    </div>
+
+    <div class="screen" id="screen-capital">
+      <div class="screen-title">CAPITAL CENTER</div>
+      <div class="screen-sub">How your growth is being financed</div>
+      <div class="grid2" id="cap-summary"></div>
+      <div class="cap-section">
+        <div class="cap-section-title">ACTIVE LOANS</div>
+        <div id="loans-list"></div>
+        <button id="add-loan-btn" style="width:100%;background:var(--surf2);border:1px dashed var(--border);border-radius:9px;padding:11px;color:var(--muted);font-size:12px;font-weight:600;margin-top:3px;">+ Add Loan</button>
+      </div>
+      <div class="cap-section">
+        <div class="cap-section-title">CAPITAL INJECTIONS</div>
+        <div id="injections-list"></div>
+      </div>
+    </div>
+
+    <div class="screen" id="screen-networth">
+      <div class="screen-title">NET WORTH</div>
+      <div class="screen-sub">Assets minus Liabilities</div>
+      <div class="card">
+        <div class="nw-hero">
+          <div class="nw-label">Current Net Worth</div>
+          <div class="nw-amount" id="nw-total" style="color:var(--green);">--</div>
+          <div class="nw-change" id="nw-change" style="color:var(--green);">--</div>
+        </div>
+        <hr class="nw-divider"/>
+        <div style="display:flex;gap:10px;">
+          <div style="flex:1;text-align:center;">
+            <div style="font-size:9px;color:var(--muted);text-transform:uppercase;letter-spacing:.08em;margin-bottom:3px;">Assets</div>
+            <div id="nw-assets" style="font-family:var(--bebas);font-size:19px;color:var(--green);">--</div>
+          </div>
+          <div style="width:1px;background:var(--border);"></div>
+          <div style="flex:1;text-align:center;">
+            <div style="font-size:9px;color:var(--muted);text-transform:uppercase;letter-spacing:.08em;margin-bottom:3px;">Liabilities</div>
+            <div id="nw-liabs" style="font-family:var(--bebas);font-size:19px;color:var(--red);">--</div>
+          </div>
+        </div>
+      </div>
+      <div class="card"><div class="card-label">Assets</div><div id="nw-assets-list"></div></div>
+      <div class="card"><div class="card-label">Liabilities</div><div id="nw-liabs-list"></div></div>
+      <div class="card"><div class="card-label">6-Month Trend</div><div class="nw-trend-row" id="nw-trend"></div></div>
+      <div class="card">
+        <div class="card-label">Financial Independence Progress</div>
+        <div id="fi-pct-label" style="font-family:var(--bebas);font-size:20px;color:var(--amber);margin-bottom:3px;">0%</div>
+        <div style="font-size:11px;color:var(--muted);margin-bottom:9px;">Net Worth vs &#8358;10M Goal</div>
+        <div class="fi-track"><div class="fi-bar" id="fi-bar"></div></div>
+        <div class="fi-labels"><span class="fi-label">&#8358;0</span><span class="fi-label">&#8358;5M</span><span class="fi-label">&#8358;10M</span></div>
+      </div>
+    </div>
+
+    <div class="screen" id="screen-opportunity">
+      <div class="screen-title">OPPORTUNITY ANALYZER</div>
+      <div class="screen-sub">Evaluate before you commit</div>
+      <div class="card">
+        <div class="form-group"><label>Opportunity Name</label><input id="opp-name" class="form-input" type="text" placeholder="e.g. Supplier Credit"/></div>
+        <div class="grid2" style="margin-bottom:0;">
+          <div class="form-group"><label>Amount (&#8358;)</label><input id="opp-amount" class="form-input" type="number" inputmode="numeric" placeholder="2000000"/></div>
+          <div class="form-group"><label>Interest Rate (%)</label><input id="opp-rate" class="form-input" type="number" inputmode="decimal" placeholder="15"/></div>
+        </div>
+        <div class="grid2" style="margin-bottom:0;">
+          <div class="form-group"><label>Tenure (Months)</label><input id="opp-tenure" class="form-input" type="number" inputmode="numeric" placeholder="12"/></div>
+          <div class="form-group"><label>Monthly Return (&#8358;)</label><input id="opp-return" class="form-input" type="number" inputmode="numeric" placeholder="80000"/></div>
+        </div>
+        <div class="form-group"><label>Risk Level</label>
+          <select id="opp-risk" class="form-input">
+            <option value="low">Low &mdash; Established, predictable</option>
+            <option value="medium" selected>Medium &mdash; Some uncertainty</option>
+            <option value="high">High &mdash; New / volatile market</option>
+          </select>
+        </div>
+        <button class="opp-calc-btn" id="opp-calc-btn">ANALYZE OPPORTUNITY</button>
+      </div>
+      <div class="opp-result" id="opp-result">
+        <div class="opp-verdict" id="opp-verdict">
+          <div class="verdict-icon" id="verdict-icon">&#x2705;</div>
+          <div class="verdict-label" id="verdict-label">ACCEPTABLE</div>
+          <div class="verdict-sub" id="verdict-sub"></div>
+        </div>
+        <div class="opp-metrics" id="opp-metrics"></div>
+        <div class="card">
+          <div class="card-label">Cash Flow Risk</div>
+          <div style="display:flex;justify-content:space-between;margin-bottom:5px;">
+            <span id="risk-label" style="font-size:12px;color:var(--text);">Moderate</span>
+            <span id="risk-pct" style="font-family:var(--bebas);font-size:15px;color:var(--amber);">50%</span>
+          </div>
+          <div class="opp-risk-bar"><div class="opp-risk-fill" id="opp-risk-fill" style="background:var(--amber);"></div></div>
+          <div style="font-size:11px;color:var(--muted);margin-top:9px;line-height:1.6;" id="opp-advice"></div>
+        </div>
+      </div>
+    </div>
+
+    <div class="screen" id="screen-analytics">
+      <div class="screen-title">INTEL</div>
+      <div class="screen-sub">Spending intelligence</div>
+      <div class="grid2">
+        <div class="ana-card income-card"><div class="ana-label">Total In</div><div class="ana-val" id="ana-in">--</div></div>
+        <div class="ana-card expense-card"><div class="ana-label">Total Out</div><div class="ana-val" id="ana-out">--</div></div>
+      </div>
+      <div class="card"><div class="card-label">Spending by Category</div><div id="cat-breakdown"></div></div>
+      <div class="card"><div class="card-label">Insights</div><div id="insights-list"></div></div>
+    </div>
+
+    <div class="screen" id="screen-settings">
+      <div class="screen-title">SETTINGS</div>
+      <div class="screen-sub">Data &amp; preferences</div>
+      <div class="card">
+        <div class="settings-section-title">DATA MANAGEMENT</div>
+        <div class="settings-row">
+          <div><div class="settings-row-label">Export CSV</div><div class="settings-row-sub">All transactions as spreadsheet</div></div>
+          <button class="settings-btn primary" id="export-csv-btn">Export</button>
+        </div>
+        <div class="settings-row">
+          <div><div class="settings-row-label">Export JSON</div><div class="settings-row-sub">Full backup</div></div>
+          <button class="settings-btn primary" id="export-json-btn">Export</button>
+        </div>
+        <div class="settings-row">
+          <div><div class="settings-row-label">Import JSON</div><div class="settings-row-sub">Restore from backup</div></div>
+          <button class="settings-btn" id="import-json-btn">Import</button>
+        </div>
+        <input type="file" id="import-file-input" accept=".json" style="display:none;"/>
+      </div>
+      <div class="card">
+        <div class="settings-section-title">STORAGE</div>
+        <div class="settings-row">
+          <div><div class="settings-row-label">Transactions</div></div>
+          <span id="tx-count" style="font-family:var(--bebas);font-size:18px;color:var(--amber);">--</span>
+        </div>
+        <div class="settings-row">
+          <div><div class="settings-row-label">Storage Engine</div></div>
+          <span style="font-size:12px;color:var(--green);">Dexie.js / IndexedDB</span>
+        </div>
+        <div class="settings-row">
+          <div><div class="settings-row-label">Offline Mode</div></div>
+          <span style="font-size:12px;color:var(--green);">&#10003; Active</span>
+        </div>
+      </div>
+      <div class="card">
+        <div class="settings-section-title">DANGER ZONE</div>
+        <div class="settings-row">
+          <div><div class="settings-row-label">Clear All Data</div><div class="settings-row-sub">Cannot be undone</div></div>
+          <button class="settings-btn danger" id="clear-data-btn">Clear</button>
+        </div>
+      </div>
+      <div style="text-align:center;padding:16px 0;color:var(--dim);font-size:10px;letter-spacing:.08em;">KOBOFLOW v2.0 &middot; TRACK EVERY KOBO</div>
+    </div>
+  </div>
+    <!-- OWNER IMPACT (v2.1) -->
+    <div class="screen" id="screen-ownerimpact">
+      <div class="screen-title">OWNER IMPACT</div>
+      <div class="screen-sub">Am I starving the business?</div>
+      <div class="grid2" id="wd-stats"></div>
+      <div class="card">
+        <div class="card-label">Withdrawal vs Income Ratio</div>
+        <div style="display:flex;justify-content:space-between;margin-bottom:4px;">
+          <span style="font-size:12px;color:var(--muted);">Owner took</span>
+          <span id="wd-ratio-pct" style="font-family:var(--bebas);font-size:18px;">--%</span>
+        </div>
+        <div class="wd-ratio-bar"><div class="wd-ratio-fill" id="wd-ratio-fill"></div></div>
+        <div style="display:flex;justify-content:space-between;margin-top:2px;">
+          <span style="font-size:9px;color:var(--muted);">Healthy (&lt;15%)</span>
+          <span style="font-size:9px;color:var(--muted);">Warning (30%+)</span>
+        </div>
+      </div>
+      <div class="card"><div class="card-label">Insights</div><div id="wd-insights"></div></div>
+    </div>
+
+    <!-- RESTOCK ROI (v2.1) -->
+    <div class="screen" id="screen-restockroi">
+      <div class="screen-title">RESTOCK ROI</div>
+      <div class="screen-sub">Did this inventory purchase create value?</div>
+      <div class="grid2" id="roi-stats"></div>
+      <div class="card">
+        <div class="card-label">ROI This Month</div>
+        <div style="text-align:center;padding:12px 0 8px;">
+          <div id="roi-pct" style="font-family:var(--bebas);font-size:56px;line-height:1;">--%</div>
+          <div style="font-size:11px;color:var(--muted);margin-top:4px;">Return on Restocking Spend</div>
+        </div>
+        <div class="grid3" id="roi-detail" style="margin-bottom:0;"></div>
+      </div>
+      <div class="card">
+        <div class="card-label">6-Month ROI Trend</div>
+        <div class="roi-bar-row" id="roi-trend-chart"></div>
+      </div>
+      <div class="card"><div class="card-label">Insights</div><div id="roi-insights"></div></div>
+    </div>
+
+    <!-- CASH FLOW STATEMENT (v2.1) -->
+    <div class="screen" id="screen-cashflow">
+      <div class="screen-title">CASH FLOW</div>
+      <div class="screen-sub">True cash flow statement</div>
+      <div class="grid3" id="cf-summary-grid" style="margin-bottom:12px;"></div>
+      <div class="card">
+        <div class="cf-section-title">OPERATING ACTIVITIES</div>
+        <div id="cf-operating"></div>
+        <div class="cf-total-row"><span class="cf-total-lbl">Operating Cash Flow</span><span class="cf-total-amt" id="cf-op-total">--</span></div>
+      </div>
+      <div class="card">
+        <div class="cf-section-title">INVESTING ACTIVITIES</div>
+        <div id="cf-investing"></div>
+        <div class="cf-total-row"><span class="cf-total-lbl">Investing Cash Flow</span><span class="cf-total-amt" id="cf-inv-total">--</span></div>
+      </div>
+      <div class="card">
+        <div class="cf-section-title">FINANCING ACTIVITIES</div>
+        <div id="cf-financing"></div>
+        <div class="cf-total-row"><span class="cf-total-lbl">Financing Cash Flow</span><span class="cf-total-amt" id="cf-fin-total">--</span></div>
+      </div>
+      <div class="card">
+        <div class="card-label">6-Month Trend</div>
+        <div class="roi-bar-row" id="cf-trend-chart"></div>
+      </div>
+      <div class="card"><div class="card-label">Insights</div><div id="cf-insights"></div></div>
+    </div>
+
+
+  <nav id="nav">
+    <button class="nav-btn active" data-screen="home"><div class="nav-icon">&#9678;</div><div class="nav-label">Brief</div><div class="nav-dot"></div></button>
+    <button class="nav-btn" data-screen="timeline"><div class="nav-icon">&#8803;</div><div class="nav-label">History</div><div class="nav-dot"></div></button>
+    <button class="nav-btn" data-screen="inbox"><div class="nav-icon">&#9636;</div><div class="nav-label">Inbox</div><div class="nav-dot"></div></button>
+    <button class="nav-btn" data-screen="vehicles"><div class="nav-icon">&#128663;</div><div class="nav-label">Vehicles</div><div class="nav-dot"></div></button>
+    <button class="nav-btn" data-screen="calendar"><div class="nav-icon">&#128197;</div><div class="nav-label">Calendar</div><div class="nav-dot"></div></button>
+    <button class="nav-btn" data-screen="pressure"><div class="nav-icon">&#128200;</div><div class="nav-label">Pressure</div><div class="nav-dot"></div></button>
+    <button class="nav-btn" data-screen="cashdrop"><div class="nav-icon">&#8595;</div><div class="nav-label">Cash Drop</div><div class="nav-dot"></div></button>
+    <button class="nav-btn" data-screen="capital"><div class="nav-icon">&#9697;</div><div class="nav-label">Capital</div><div class="nav-dot"></div></button>
+    <button class="nav-btn" data-screen="networth"><div class="nav-icon">&#11075;</div><div class="nav-label">Worth</div><div class="nav-dot"></div></button>
+    <button class="nav-btn" data-screen="opportunity"><div class="nav-icon">&#9889;</div><div class="nav-label">Analyze</div><div class="nav-dot"></div></button>
+    <button class="nav-btn" data-screen="analytics"><div class="nav-icon">&#8767;</div><div class="nav-label">Intel</div><div class="nav-dot"></div></button>
+    <button class="nav-btn" data-screen="ownerimpact"><div class="nav-icon">&#8595;</div><div class="nav-label">Owner</div><div class="nav-dot"></div></button>
+    <button class="nav-btn" data-screen="restockroi"><div class="nav-icon">&#128200;</div><div class="nav-label">ROI</div><div class="nav-dot"></div></button>
+    <button class="nav-btn" data-screen="cashflow"><div class="nav-icon">&#9654;</div><div class="nav-label">Cash Flow</div><div class="nav-dot"></div></button>
+    <button class="nav-btn" data-screen="settings"><div class="nav-icon">&#9881;</div><div class="nav-label">Settings</div><div class="nav-dot"></div></button>
+  </nav>
+
+  <div class="modal-overlay" id="modal-overlay">
+    <div class="modal-box">
+      <div class="modal-head"><div class="modal-title">ADD ENTRY</div><button class="modal-close" id="modal-close-btn">&#215;</button></div>
+      <div class="type-chips" id="type-chips">
+        <button class="type-chip active" data-type="expense">Expense</button>
+        <button class="type-chip" data-type="income">Income</button>
+        <button class="type-chip" data-type="transfer">Transfer</button>
+        <button class="type-chip" data-type="owner_withdrawal">Owner W/D</button>
+        <button class="type-chip" data-type="investment">Investment</button>
+        <button class="type-chip" data-type="capital_injection">Capital Inj.</button>
+        <button class="type-chip" data-type="obligation">Obligation</button>
+      </div>
+      <input id="modal-amount" class="modal-input" type="number" inputmode="numeric" placeholder="Amount"/>
+      <input id="modal-desc" class="modal-input" type="text" placeholder="Description"/>
+      <select id="modal-cat" class="modal-input">
+        <option>Vehicle: FJR1300AE</option><option>Vehicle: Sportage Green</option><option>Vehicle: Sportage Black</option>
+        <option>Food</option><option>Household</option><option>Business Overhead</option>
+        <option>Utilities</option><option>Pharmacy Sales</option><option>Restocking</option>
+        <option>Obligations</option><option>Loan</option><option>Savings</option><option>Other</option>
+      </select>
+      <div class="grid2" style="margin-bottom:0;">
+        <div>
+          <div style="font-size:10px;color:var(--muted);text-transform:uppercase;letter-spacing:.08em;margin-bottom:4px;">From Account</div>
+          <select id="modal-from" class="modal-input" style="margin-bottom:0;"></select>
+        </div>
+        <div>
+          <div style="font-size:10px;color:var(--muted);text-transform:uppercase;letter-spacing:.08em;margin-bottom:4px;">To Account</div>
+          <select id="modal-to" class="modal-input" style="margin-bottom:0;"></select>
+        </div>
+      </div>
+      <button class="modal-save" id="modal-save-btn" style="margin-top:12px;">SAVE ENTRY</button>
+    </div>
+  </div>
+
+  <div class="modal-overlay" id="loan-modal-overlay">
+    <div class="modal-box">
+      <div class="modal-head"><div class="modal-title">ADD LOAN</div><button class="modal-close" id="loan-modal-close">&#215;</button></div>
+      <div class="form-group"><label>Loan Name</label><input id="ln-name" class="form-input" type="text" placeholder="e.g. GTBank Business Loan"/></div>
+      <div class="form-group"><label>Source</label><input id="ln-source" class="form-input" type="text" placeholder="e.g. GTBank / Cooperative / Family"/></div>
+      <div class="grid2" style="margin-bottom:0;">
+        <div class="form-group"><label>Principal (&#8358;)</label><input id="ln-principal" class="form-input" type="number" inputmode="numeric" placeholder="500000"/></div>
+        <div class="form-group"><label>Interest Rate (%)</label><input id="ln-rate" class="form-input" type="number" inputmode="decimal" placeholder="15"/></div>
+      </div>
+      <div class="grid2" style="margin-bottom:0;">
+        <div class="form-group"><label>Tenure (Months)</label><input id="ln-tenure" class="form-input" type="number" inputmode="numeric" placeholder="12"/></div>
+        <div class="form-group"><label>Amount Repaid (&#8358;)</label><input id="ln-repaid" class="form-input" type="number" inputmode="numeric" placeholder="0"/></div>
+      </div>
+      <button class="modal-save" id="loan-save-btn">SAVE LOAN</button>
+    </div>
+  </div>
+
+  <div class="modal-overlay" id="vlog-modal-overlay">
+    <div class="modal-box">
+      <div class="modal-head"><div class="modal-title" id="vlog-modal-title">LOG EXPENSE</div><button class="modal-close" id="vlog-modal-close">&#215;</button></div>
+      <div class="form-group"><label>Category</label>
+        <select id="vlog-cat" class="form-input">
+          <option value="Fuel">Fuel</option><option value="Repair">Repair / Maintenance</option>
+          <option value="Tyres">Tyres</option><option value="Service">Servicing</option>
+          <option value="Battery">Battery</option><option value="Insurance">Insurance</option>
+          <option value="Registration">Registration / Licence</option>
+          <option value="Wash">Wash / Cleaning</option><option value="Other">Other</option>
+        </select>
+      </div>
+      <div class="form-group"><label>Amount (&#8358;)</label><input id="vlog-amount" class="form-input" type="number" inputmode="numeric" placeholder="e.g. 5000"/></div>
+      <div class="form-group"><label>Description (optional)</label><input id="vlog-desc" class="form-input" type="text" placeholder="e.g. full tank, front tyres"/></div>
+      <button class="modal-save" id="vlog-save-btn">LOG EXPENSE</button>
+    </div>
+  </div>
+
+  <div id="toast"></div>
+</div>
+<script>
+document.addEventListener('DOMContentLoaded',function(){
+var db=new Dexie('KoboFlowDB');
+db.version(2).stores({transactions:'++id,type,cat,date,state',loans:'++id',vlogs:'++id',ownerAnalytics:'++id',cashFlowSnapshots:'++id',roiSnapshots:'++id',runwaySnapshots:'++id'});
+
+var N='₦';
+function fmt(n){return N+Math.abs(Math.round(n)).toLocaleString('en-NG');}
+function pct(u,t){return t?Math.round(u/t*100):0;}
+function hColor(p){return p>80?'#EF4444':p>60?'#F5A623':'#22C55E';}
+function getNow(){return new Date().toTimeString().slice(0,5);}
+function getToday(){return new Date().toISOString().slice(0,10);}
+function getYest(){var d=new Date();d.setDate(d.getDate()-1);return d.toISOString().slice(0,10);}
+function dateLabel(iso){var t=getToday(),y=getYest();if(iso===t)return'Today';if(iso===y)return'Yesterday';var d=new Date(iso);return d.toLocaleDateString('en-NG',{day:'numeric',month:'short',year:'numeric'});}
+function qs(id){return document.getElementById(id);}
+function raf2(fn){requestAnimationFrame(function(){requestAnimationFrame(fn);});}
+function showToast(msg){var t=qs('toast');if(!t)return;t.textContent=msg;t.className='show';setTimeout(function(){t.className='';},2200);}
+
+var ACCOUNTS=[
+  {id:'pharma_cash', label:'Pharmacy Cash',  balance:185000, type:'Business', icon:'&#127978;'},
+  {id:'pharma_bank', label:'Pharmacy Bank',  balance:312500, type:'Business', icon:'&#127974;'},
+  {id:'pers_cash',   label:'Personal Cash',  balance:45000,  type:'Personal', icon:'&#128181;'},
+  {id:'pers_bank',   label:'Personal Bank',  balance:120000, type:'Personal', icon:'&#128179;'},
+  {id:'coop',        label:'Coop Savings',   balance:180000, type:'Savings',  icon:'&#129309;'},
+  {id:'emergency',   label:'Emergency Fund', balance:50000,  type:'Savings',  icon:'&#128737;'},
+  {id:'fixed_dep',   label:'Fixed Deposit',  balance:0,      type:'Investment',icon:'&#128200;'},
+];
+
+var T=getToday(),Y=getYest();
+var VEHICLES=[
+  {id:'fjr',  name:'FJR1300AE',    icon:'M',sub:'Motorcycle',
+   keywords:['fjr','fjr1300','motorcycle','moto','bike'],budget:30000,
+   logs:[{id:1,cat:'Fuel',  amount:2500, desc:'Full tank',     date:T,time:'08:14'},
+         {id:2,cat:'Repair',amount:8000, desc:'Chain sprocket',date:Y,time:'14:00'},
+         {id:3,cat:'Fuel',  amount:2500, desc:'Full tank',     date:Y,time:'07:50'},
+         {id:4,cat:'Service',amount:15000,desc:'Full service', date:Y,time:'10:00'}]},
+  {id:'green',name:'Sportage Green',icon:'G',sub:'Green Sportage',
+   keywords:['green','sportage green','kia green'],budget:60000,
+   logs:[{id:5,cat:'Fuel',  amount:15000,desc:'Full tank',    date:T,time:'07:45'},
+         {id:6,cat:'Wash',  amount:2000, desc:'Full wash',    date:Y,time:'11:30'},
+         {id:7,cat:'Repair',amount:30000,desc:'Brake pads',   date:Y,time:'10:00'},
+         {id:8,cat:'Tyres', amount:80000,desc:'2 front tyres',date:Y,time:'09:00'}]},
+  {id:'black',name:'Sportage Black',icon:'B',sub:'Black Sportage',
+   keywords:['black','sportage black','kia black'],budget:60000,
+   logs:[{id:9, cat:'Fuel',     amount:12000,desc:'Full tank',    date:T,time:'08:30'},
+         {id:10,cat:'Insurance',amount:38000,desc:'Annual renewal',date:Y,time:'10:00'},
+         {id:11,cat:'Wash',     amount:5000, desc:'Detailing',    date:Y,time:'15:00'}]},
+];
+
+var BUDGETS=[
+  {cat:'Household',       used:85000, total:200000,icon:'&#127968;'},
+  {cat:'FJR1300AE',       used:28000, total:30000, icon:'[M]'},
+  {cat:'Sportage Green',  used:47000, total:60000, icon:'[G]'},
+  {cat:'Sportage Black',  used:55000, total:60000, icon:'[B]'},
+  {cat:'Business Overhead',used:45000,total:100000,icon:'&#127978;'},
+  {cat:'Food',            used:28000, total:50000, icon:'&#127857;'},
+  {cat:'Restocking',      used:350000,total:600000,icon:'&#128230;'},
+];
+
+var OBLIGATIONS_DATA=[
+  {desc:'IBEDC Electricity',  amount:22000, due:'Today',      overdue:false,icon:'&#9889;', day:1},
+  {desc:'Shop Rent (Balance)',amount:150000,due:'In 3 days',  overdue:false,icon:'&#127978;',day:4},
+  {desc:'GTBank Loan EMI',    amount:35000, due:'Overdue 2d', overdue:true, icon:'&#127974;',day:0},
+  {desc:'Internet (Smile)',   amount:15000, due:'In 12 days', overdue:false,icon:'&#128246;',day:12},
+  {desc:'School Fees',        amount:180000,due:'In 21 days', overdue:false,icon:'&#127891;',day:21},
+  {desc:'Supplier Payment',   amount:250000,due:'In 15 days', overdue:false,icon:'&#128230;',day:15},
+  {desc:'Cooperative Monthly',amount:10000, due:'In 5 days',  overdue:false,icon:'&#129309;',day:5},
+];
+
+var LOANS=[
+  {id:1,name:'GTBank Business Loan',source:'GTBank',      principal:500000,rate:18,tenure:12,repaid:120000},
+  {id:2,name:'Cooperative Loan',    source:'Coop Society',principal:200000,rate:10,tenure:6, repaid:80000},
+];
+
+var INJECTIONS=[
+  {name:'Personal Savings', source:'Owner',   amount:300000,date:'Mar 2026',purpose:'Working capital'},
+  {name:'Family Loan',      source:'Family',  amount:200000,date:'Jan 2026',purpose:'Stock expansion'},
+  {name:'Business Reinvest',source:'Pharmacy',amount:150000,date:'Apr 2026',purpose:'Generator'},
+];
+
+var NW_TREND=[
+  {month:'Nov',val:380000},{month:'Dec',val:420000},{month:'Jan',val:395000},
+  {month:'Feb',val:460000},{month:'Mar',val:505000},{month:'Apr',val:537500},
+];
+
+var DROPS=[
+  {cat:'Restocking',       change:350000,icon:'&#128230;'},
+  {cat:'Owner Withdrawals',change:120000,icon:'&#8595;'},
+  {cat:'Vehicle Costs',    change:80000, icon:'&#128663;'},
+  {cat:'Household',        change:60000, icon:'&#127968;'},
+  {cat:'Business Overhead',change:30000, icon:'&#127978;'},
+  {cat:'Food',             change:-12000,icon:'&#127857;'},
+];
+
+var items=[
+  {id:1, amount:485000,desc:'Pharmacy Sales',   cat:'Pharmacy Sales',         type:'income',          state:'AI Categorized',time:'18:00',date:Y,fromAcct:'pharma_cash',toAcct:''},
+  {id:2, amount:150000,desc:'Restock Emzor',    cat:'Restocking',             type:'expense',         state:'AI Categorized',time:'11:30',date:Y,fromAcct:'pharma_cash',toAcct:''},
+  {id:3, amount:2500,  desc:'Fuel FJR',         cat:'Vehicle: FJR1300AE',     type:'expense',         state:'AI Categorized',time:'08:14',date:Y,fromAcct:'pers_cash',toAcct:'',vehicle:'fjr'},
+  {id:4, amount:15000, desc:'Fuel Green',       cat:'Vehicle: Sportage Green',type:'expense',         state:'AI Categorized',time:'07:45',date:Y,fromAcct:'pers_cash',toAcct:'',vehicle:'green'},
+  {id:5, amount:10000, desc:'Coop Savings',     cat:'Savings',                type:'transfer',        state:'AI Categorized',time:'10:30',date:Y,fromAcct:'pers_bank',toAcct:'coop'},
+  {id:6, amount:50000, desc:'Owner Withdrawal', cat:'Owner Withdrawal',       type:'owner_withdrawal',state:'AI Categorized',time:'09:00',date:Y,fromAcct:'pharma_cash',toAcct:'pers_cash'},
+  {id:7, amount:50000, desc:'Generator Repair', cat:'Business Overhead',      type:'expense',         state:'Needs Review',  time:'16:45',date:Y,fromAcct:'pharma_cash',toAcct:''},
+  {id:8, amount:450000,desc:'Supplier Payment', cat:'Restocking',             type:'expense',         state:'Needs Review',  time:'11:30',date:Y,fromAcct:'pharma_bank',toAcct:''},
+  {id:9, amount:150000,desc:'Owner Withdrawal', cat:'Owner Withdrawal',       type:'owner_withdrawal',state:'AI Categorized',time:'09:05',date:T,fromAcct:'pharma_cash',toAcct:'pers_cash'},
+  {id:10,amount:12000, desc:'Fuel Black',       cat:'Vehicle: Sportage Black',type:'expense',         state:'AI Categorized',time:'08:30',date:T,fromAcct:'pers_cash',toAcct:'',vehicle:'black'},
+  {id:11,amount:700000,desc:'Loan Received',    cat:'Loan',                   type:'capital_injection',state:'AI Categorized',time:'12:00',date:T,fromAcct:'',toAcct:'pharma_bank'},
+];
+
+var nextId=200,nextVlogId=100,nextLoanId=10;
+var activeVehicle='fjr',activeFilter='All',modalType='expense',tlFilter='all',tlSearch='';
+var CAT_COLORS=['#F5A623','#3B82F6','#22C55E','#A855F7','#EF4444','#14B8A6','#F97316','#EC4899'];
+var STATES=['All','Unprocessed','AI Categorized','Needs Review','Linked'];
+var SS={'Unprocessed':{bg:'#222228',color:'#7A7880'},'AI Categorized':{bg:'#0D1A2E',color:'#3B82F6'},'Needs Review':{bg:'#3D2A0A',color:'#F5A623'},'Linked':{bg:'#0D2E1A',color:'#22C55E'},'Archived':{bg:'#222228',color:'#4A4858'}};
+
+function parseEntry(raw){
+  var parts=raw.trim().split(/\s+/);
+  var amount=parseFloat(parts[0].replace(/,/g,''));
+  var rest=parts.slice(1).join(' ').toLowerCase();
+  var desc=parts.slice(1).join(' ');
+  var cat='Other',type='expense',vehicle=null,fromAcct='pers_cash',toAcct='';
+  for(var vi=0;vi<VEHICLES.length;vi++){
+    var v=VEHICLES[vi];
+    for(var ki=0;ki<v.keywords.length;ki++){
+      if(rest.indexOf(v.keywords[ki])>=0){vehicle=v.id;cat='Vehicle: '+v.name;fromAcct='pers_cash';break;}
+    }
+    if(vehicle)break;
+  }
+  if(!vehicle){
+    if(/restock|emzor|dana|juhel|fidson|health gear|inventory purchase|supplier stock/.test(rest)){cat='Restocking';fromAcct='pharma_cash';}
+    else if(/pharmacy sales|daily sales|sales summary/.test(rest)){cat='Pharmacy Sales';type='income';toAcct='pharma_cash';}
+    else if(/owner withdrawal|owner w\/d|withdrawal/.test(rest)){cat='Owner Withdrawal';type='owner_withdrawal';fromAcct='pharma_cash';toAcct='pers_cash';}
+    else if(/loan received|capital injection/.test(rest)){cat='Loan';type='capital_injection';toAcct='pharma_bank';}
+    else if(/coop|cooperative/.test(rest)){cat='Savings';type='transfer';fromAcct='pers_bank';toAcct='coop';}
+    else if(/savings|transfer/.test(rest)){cat='Savings';type='transfer';fromAcct='pers_cash';toAcct='pers_bank';}
+    else if(/fuel|petrol/.test(rest)){cat='Vehicle: FJR1300AE';vehicle='fjr';}
+    else if(/lunch|food|breakfast|dinner|meal|eat|bread|rice|market/.test(rest)){cat='Food';}
+    else if(/internet|electricity|nepa|ibedc|generator|rent/.test(rest)){cat='Business Overhead';fromAcct='pharma_cash';}
+    else if(/household|house|home|kerosene|gas|cooking/.test(rest)){cat='Household';}
+    else if(/repair|fix|maintenance|mechanic/.test(rest)){cat='Business Overhead';fromAcct='pharma_cash';}
+    else if(/salary|income|refund|gift/.test(rest)){cat='Income';type='income';toAcct='pers_cash';}
+    else if(/invest|fixed deposit/.test(rest)){cat='Investment';type='investment';fromAcct='pers_bank';toAcct='fixed_dep';}
+  }
+  return{amount:isNaN(amount)?0:amount,desc:desc||'Entry',cat:cat,type:type,vehicle:vehicle||null,fromAcct:fromAcct,toAcct:toAcct,state:'AI Categorized'};
+}
+
+function pill(text,bg,color){return'<span class="pill" style="background:'+bg+';color:'+color+'"><span class="pill-dot" style="background:'+color+'"></span>'+text+'</span>';}
+
+(function(){
+  var h=new Date().getHours();
+  var el=qs('greeting-text');
+  if(el)el.textContent=h<12?'Good Morning':h<17?'Good Afternoon':'Good Evening';
+})();
+
+(function(){
+  var opts=ACCOUNTS.map(function(a){return'<option value="'+a.id+'">'+a.label+'</option>';}).join('');
+  var none='<option value="">-- None --</option>';
+  var mf=qs('modal-from'),mt=qs('modal-to');
+  if(mf)mf.innerHTML=none+opts;
+  if(mt)mt.innerHTML=none+opts;
+})();
+
+function renderScore(){
+  var avg=BUDGETS.reduce(function(s,b){return s+pct(b.used,b.total);},0)/BUDGETS.length;
+  var score=Math.max(0,Math.round(100-avg*0.8));
+  var color=score>70?'#22C55E':score>50?'#F5A623':'#EF4444';
+  var circ=213.6;
+  var arc=qs('score-arc');
+  if(arc){
+    arc.setAttribute('stroke',color);
+    arc.setAttribute('stroke-dasharray',circ+' '+circ);
+    arc.setAttribute('stroke-dashoffset',circ);
+    arc.style.transition='none';
+    raf2(function(){arc.style.transition='stroke-dashoffset 1.2s ease';arc.setAttribute('stroke-dashoffset',circ-(score/100)*circ);});
+  }
+  var num=qs('score-num');if(num){num.textContent=score;num.style.color=color;}
+  var msg=qs('score-msg');if(msg)msg.textContent=score>70?'Spending well controlled.':score>50?'Some categories trending high.':'Overspending detected. Review budgets.';
+}
+
+function renderDashboard(){
+  renderScore();
+  var ydIn=items.filter(function(i){return i.date===Y&&(i.type==='income'||i.type==='capital_injection');}).reduce(function(s,i){return s+i.amount;},0);
+  var ydOut=items.filter(function(i){return i.date===Y&&i.type==='expense';}).reduce(function(s,i){return s+i.amount;},0);
+  var net=ydIn-ydOut;
+  var el;
+  el=qs('yd-in');if(el)el.textContent=fmt(ydIn);
+  el=qs('yd-out');if(el)el.textContent=fmt(ydOut);
+  el=qs('yd-net');if(el){el.textContent=(net<0?'-':'')+fmt(net);el.style.color=net>=0?'#22C55E':'#EF4444';}
+  el=qs('accounts-scroll');
+  if(el)el.innerHTML=ACCOUNTS.map(function(a){return'<div class="acct-card"><div class="acct-name">'+a.icon+' '+a.label+'</div><div class="acct-bal">'+fmt(a.balance)+'</div><div class="acct-type">'+a.type+'</div></div>';}).join('');
+  el=qs('ob-list');
+  if(el)el.innerHTML=OBLIGATIONS_DATA.map(function(o){return'<div class="ob-item'+(o.overdue?' overdue':'')+'"><div class="ob-left"><span>'+o.icon+'</span><div><div class="ob-desc">'+o.desc+'</div><div class="ob-due">'+o.due+'</div></div></div><div class="ob-amount">'+fmt(o.amount)+'</div></div>';}).join('');
+  el=qs('budget-list');
+  if(el){
+    el.innerHTML=BUDGETS.map(function(b){var p=pct(b.used,b.total),c=hColor(p);return'<div class="budget-row"><div class="budget-top"><div class="budget-cat"><span>'+b.icon+'</span> '+b.cat+'</div><div class="budget-right"><span class="budget-fig">'+fmt(b.used)+' of '+fmt(b.total)+'</span><span class="budget-pct" style="color:'+c+'">'+p+'%</span></div></div><div class="budget-track"><div class="budget-bar" style="background:'+c+';" data-pct="'+p+'"></div></div></div>';}).join('');
+    raf2(function(){document.querySelectorAll('.budget-bar').forEach(function(b){b.style.width=b.getAttribute('data-pct')+'%';});});
+  }
+}
+
+function renderTimeline(){
+  var filtered=items.filter(function(i){
+    var mf=tlFilter==='all'||i.type===tlFilter||(tlFilter==='today'&&i.date===T)||(tlFilter==='yesterday'&&i.date===Y);
+    var ms=!tlSearch||(i.desc.toLowerCase().indexOf(tlSearch.toLowerCase())>=0)||(i.cat.toLowerCase().indexOf(tlSearch.toLowerCase())>=0);
+    return mf&&ms;
+  });
+  var groups={},order=[];
+  filtered.forEach(function(i){if(!groups[i.date]){groups[i.date]=[];order.push(i.date);}groups[i.date].push(i);});
+  var seen={};order=order.filter(function(d){if(seen[d])return false;seen[d]=true;return true;});
+  var el=qs('timeline-list');if(!el)return;
+  if(!filtered.length){el.innerHTML='<div class="empty-state"><div class="empty-icon">&#128197;</div><div>No entries match your filter.</div></div>';return;}
+  el.innerHTML=order.map(function(date){
+    var di=groups[date];
+    var din=di.filter(function(i){return i.type==='income'||i.type==='capital_injection';}).reduce(function(s,i){return s+i.amount;},0);
+    var dout=di.filter(function(i){return i.type==='expense';}).reduce(function(s,i){return s+i.amount;},0);
+    var dn=din-dout,nc=dn>=0?'#22C55E':'#EF4444';
+    var rows=di.map(function(i){
+      var sign=(i.type==='income'||i.type==='capital_injection')?'+':i.type==='transfer'||i.type==='owner_withdrawal'?'~':'-';
+      var ac=(i.fromAcct||i.toAcct)?' &middot; '+(i.fromAcct?i.fromAcct.replace(/_/g,' '):'')+( i.toAcct?' > '+i.toAcct.replace(/_/g,' '):'' ):'';
+      var amtc='tl-amount'+(i.type==='income'||i.type==='capital_injection'?' income':i.type==='transfer'?' transfer':i.type==='owner_withdrawal'?' owner_withdrawal':i.type==='investment'?' investment':'');
+      return'<div class="tl-item"><div class="tl-dot '+i.type+'"></div><div class="tl-body"><div class="tl-desc">'+i.desc+'</div><div class="tl-meta">'+i.time+' &middot; '+i.cat+ac+'</div></div><div class="'+amtc+'">'+sign+fmt(i.amount)+'</div></div>';
+    }).join('');
+    return'<div class="tl-day-header"><div class="tl-day-label">'+dateLabel(date).toUpperCase()+'</div><div class="tl-day-net" style="color:'+nc+';">Net: '+(dn>=0?'+':'-')+fmt(Math.abs(dn))+'</div></div>'+rows;
+  }).join('');
+}
+
+function renderInbox(){
+  var nr=items.filter(function(i){return i.state==='Needs Review';}).length;
+  var badge=qs('review-badge');
+  if(badge){badge.style.display=nr>0?'block':'none';badge.textContent=nr;}
+  var meta=qs('inbox-meta');if(meta)meta.textContent=items.length+' entries | '+nr+' need review';
+  var fr=qs('filter-row');
+  if(fr)fr.innerHTML=STATES.map(function(s){var c=s==='All'?items.length:items.filter(function(i){return i.state===s;}).length;return'<button class="filter-btn'+(activeFilter===s?' active':'')+'" data-state="'+s+'">'+s+'<span class="filter-count">'+c+'</span></button>';}).join('');
+  var filt=activeFilter==='All'?items:items.filter(function(i){return i.state===activeFilter;});
+  var list=qs('inbox-list');if(!list)return;
+  if(!filt.length){list.innerHTML='<div class="empty-state"><div class="empty-icon">&#128237;</div><div>No entries in this state</div></div>';return;}
+  list.innerHTML=filt.map(function(i){
+    var ss2=SS[i.state]||SS['Unprocessed'];
+    var sign=(i.type==='income'||i.type==='capital_injection')?'+':i.type==='transfer'||i.type==='owner_withdrawal'?'~':'-';
+    var icCls='inbox-icon'+((i.type==='income'||i.type==='capital_injection')?' income':i.type==='transfer'?' transfer':i.type==='owner_withdrawal'?' owner_withdrawal':'');
+    var icCh=(i.type==='income'||i.type==='capital_injection')?'+':i.type==='transfer'?'~':i.type==='owner_withdrawal'?'v':'-';
+    var acts=i.state==='Needs Review'?'<div class="action-btns"><button class="act-btn act-approve" data-approve="'+i.id+'">OK</button><button class="act-btn act-dismiss" data-dismiss="'+i.id+'">X</button></div>':'';
+    return'<div class="inbox-item'+(i.state==='Needs Review'?' needs-review':'')+'"><div class="'+icCls+'">'+icCh+'</div><div class="inbox-mid"><div style="display:flex;align-items:center;gap:6px;margin-bottom:3px;flex-wrap:wrap;"><span class="inbox-desc-txt">'+i.desc+'</span>'+pill(i.state,ss2.bg,ss2.color)+pill(i.type.replace(/_/g,' '),'#222228','#7A7880')+'</div><div class="inbox-meta">'+dateLabel(i.date)+' &middot; '+i.time+' &middot; '+i.cat+'</div></div><div class="inbox-right"><div class="amount-badge '+i.type+'">'+sign+fmt(i.amount)+'</div>'+acts+'</div></div>';
+  }).join('');
+}
+
+function vTotal(v){return v.logs.reduce(function(s,l){return s+l.amount;},0);}
+function renderVehicles(){
+  var tabs=qs('vehicle-tabs'),panels=qs('vehicle-panels');
+  if(!tabs||!panels)return;
+  tabs.innerHTML=VEHICLES.map(function(v){return'<button class="vtab'+(v.id===activeVehicle?' active':'')+'" data-vid="'+v.id+'">'+v.icon+' '+v.name+'</button>';}).join('');
+  panels.innerHTML=VEHICLES.map(function(v){
+    var spent=vTotal(v),p=pct(spent,v.budget),c=hColor(p);
+    var ct={};v.logs.forEach(function(l){ct[l.cat]=(ct[l.cat]||0)+l.amount;});
+    var catRows=Object.keys(ct).map(function(k){return[k,ct[k]];}).sort(function(a,b){return b[1]-a[1];}).map(function(e,idx){
+      var cp=pct(e[1],spent),cc=CAT_COLORS[idx%CAT_COLORS.length];
+      return'<div class="budget-row"><div class="budget-top"><div class="budget-cat">'+e[0]+'</div><div class="budget-right"><span class="budget-fig">'+fmt(e[1])+'</span><span class="budget-pct" style="color:'+cc+'">'+cp+'%</span></div></div><div class="budget-track"><div class="budget-bar" style="background:'+cc+';" data-pct="'+cp+'"></div></div></div>';
+    }).join('');
+    var logRows=v.logs.map(function(l){
+      var icons={'Fuel':'&#9981;','Repair':'&#128295;','Tyres':'O','Service':'&#9881;','Battery':'B','Insurance':'S','Registration':'R','Wash':'~','Other':'$'};
+      var ic=icons[l.cat]||'$';
+      return'<div class="vlog-item"><div class="vlog-icon">'+ic+'</div><div class="vlog-body"><div class="vlog-desc">'+(l.desc||l.cat)+'</div><div class="vlog-meta">'+dateLabel(l.date)+' &middot; '+l.cat+'</div></div><div class="vlog-amount">-'+fmt(l.amount)+'</div></div>';
+    }).join('');
+    return'<div class="vehicle-panel'+(v.id===activeVehicle?' active':'')+'" data-panel="'+v.id+'">'
+      +'<div class="vehicle-hero"><div class="vh-top"><div class="vh-icon" style="font-family:var(--bebas);font-size:22px;color:var(--amber);">'+v.icon+'</div><div><div class="vh-name">'+v.name+'</div><div class="vh-sub">'+v.sub+'</div></div></div>'
+      +'<div class="vh-stats"><div class="vh-stat"><div class="vh-stat-val">'+fmt(spent)+'</div><div class="vh-stat-label">Spent</div></div><div class="vh-stat"><div class="vh-stat-val">'+fmt(v.budget)+'</div><div class="vh-stat-label">Budget</div></div><div class="vh-stat"><div class="vh-stat-val" style="color:'+c+';">'+p+'%</div><div class="vh-stat-label">Used</div></div></div>'
+      +'<div class="budget-track" style="height:5px;overflow:hidden;border-radius:2px;"><div class="budget-bar" style="background:'+c+';height:100%;" data-pct="'+p+'"></div></div></div>'
+      +'<div class="card"><div class="card-label">By Type</div>'+catRows+'</div>'
+      +'<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:9px;"><div style="font-family:var(--bebas);font-size:16px;letter-spacing:.04em;color:var(--amber);">EXPENSE LOG</div><button class="add-vlog-btn" data-vid="'+v.id+'" style="background:var(--surf2);border:1px solid var(--border);border-radius:6px;padding:6px 12px;color:var(--muted);font-size:11px;font-weight:600;">+ Log</button></div>'
+      +logRows+'</div>';
+  }).join('');
+  raf2(function(){document.querySelectorAll('.budget-bar').forEach(function(b){b.style.width=b.getAttribute('data-pct')+'%';});});
+}
+
+function renderCalendar(){
+  var totalObs=OBLIGATIONS_DATA.reduce(function(s,o){return s+o.amount;},0);
+  var totalCash=ACCOUNTS.filter(function(a){return a.type==='Business'||a.type==='Personal';}).reduce(function(s,a){return s+a.balance;},0);
+  var surplus=totalCash-totalObs;
+  var cs=qs('cal-summary');
+  if(cs)cs.innerHTML='<div class="grid3" style="margin-bottom:0;"><div class="stat-card"><div class="stat-label">Upcoming</div><div class="stat-val" style="color:#EF4444;">'+fmt(totalObs)+'</div></div><div class="stat-card"><div class="stat-label">Available Cash</div><div class="stat-val" style="color:#22C55E;">'+fmt(totalCash)+'</div></div><div class="stat-card"><div class="stat-label">'+(surplus>=0?'Surplus':'Gap')+'</div><div class="stat-val" style="color:'+(surplus>=0?'#22C55E':'#EF4444')+';">'+(surplus>=0?'+':'-')+fmt(Math.abs(surplus))+'</div></div></div>';
+  var cl=qs('calendar-list');if(!cl)return;
+  cl.innerHTML='<div class="cal-month-header">June 2026</div>'
+    +OBLIGATIONS_DATA.slice().sort(function(a,b){return a.day-b.day;}).map(function(o){
+      var cls=o.overdue?' overdue-item':o.due==='Today'?' today-item':'';
+      var day=o.overdue?'OD':(o.day>0?o.day:'--');
+      return'<div class="cal-item'+cls+'"><div class="cal-date-badge"><div class="cal-day">'+day+'</div><div class="cal-mon">Jun</div></div><div class="cal-body"><div class="cal-desc">'+o.desc+'</div><div class="cal-cat">'+(o.overdue?'OVERDUE':o.due)+'</div></div><div class="cal-amount">'+fmt(o.amount)+'</div></div>';
+    }).join('');
+}
+
+function renderPressure(){
+  var totalObs=OBLIGATIONS_DATA.reduce(function(s,o){return s+o.amount;},0);
+  var totalCash=ACCOUNTS.filter(function(a){return a.type==='Business'||a.type==='Personal';}).reduce(function(s,a){return s+a.balance;},0);
+  var ps=Math.min(100,Math.round((totalObs/totalCash)*100));
+  var color=ps<40?'#22C55E':ps<70?'#F5A623':'#EF4444';
+  var status=ps<40?'Low Pressure':ps<70?'Moderate Pressure':'High Pressure';
+  var el;
+  el=qs('pressure-score');if(el){el.textContent=ps;el.style.color=color;}
+  el=qs('pressure-status');if(el){el.textContent=status;el.style.color=color;}
+  el=qs('pressure-fill');if(el){el.style.background=color;raf2(function(){el.style.width=ps+'%';});}
+  el=qs('pressure-mini');if(el)el.textContent='Pressure: '+status;
+  el=qs('pressure-items');
+  if(el)el.innerHTML=OBLIGATIONS_DATA.map(function(o){return'<div class="pressure-row"><span class="pressure-item-name">'+o.icon+' '+o.desc+'</span><span class="pressure-item-amt">'+fmt(o.amount)+'</span></div>';}).join('');
+  el=qs('pressure-total');if(el)el.textContent=fmt(totalObs);
+  el=qs('pressure-vs');
+  if(el)el.innerHTML='<div class="stat-card"><div class="stat-label">Available Cash</div><div class="stat-val" style="color:#22C55E;">'+fmt(totalCash)+'</div></div><div class="stat-card"><div class="stat-label">Obligations</div><div class="stat-val" style="color:#EF4444;">'+fmt(totalObs)+'</div></div>';
+}
+
+function renderCashDrop(){
+  var el=qs('drop-list');
+  if(el)el.innerHTML=DROPS.map(function(d){var up=d.change>0;return'<div class="drop-row"><span class="drop-cat">'+d.icon+' '+d.cat+'</span><span class="drop-change '+(up?'up':'down')+'">'+(up?'+':'')+fmt(d.change)+'</span></div>';}).join('');
+  var el2=qs('drop-chart');
+  var maxA=Math.max.apply(null,DROPS.map(function(d){return Math.abs(d.change);}));
+  if(el2)el2.innerHTML=DROPS.filter(function(d){return d.change>0;}).map(function(d,idx){
+    var w=Math.round((d.change/maxA)*100),c=CAT_COLORS[idx%CAT_COLORS.length];
+    return'<div class="cat-row"><div class="cat-top"><span class="cat-name">'+d.cat+'</span><span class="cat-val" style="color:'+c+';">+'+fmt(d.change)+'</span></div><div class="cat-track"><div class="cat-bar" style="background:'+c+';" data-p="'+w+'"></div></div></div>';
+  }).join('');
+  raf2(function(){document.querySelectorAll('.cat-bar').forEach(function(b){b.style.width=b.getAttribute('data-p')+'%';});});
+}
+
+function calcEMI(p,r,n){if(!r)return p/n;var mr=r/100/12;return p*(mr*Math.pow(1+mr,n))/(Math.pow(1+mr,n)-1);}
+function renderCapital(){
+  var tl=LOANS.reduce(function(s,l){return s+(l.principal-l.repaid);},0);
+  var ti=INJECTIONS.reduce(function(s,i){return s+i.amount;},0);
+  var mon=LOANS.reduce(function(s,l){return s+calcEMI(l.principal,l.rate,l.tenure);},0);
+  var cs=qs('cap-summary');
+  if(cs)cs.innerHTML=[{label:'Outstanding',val:fmt(tl),color:'#EF4444'},{label:'Total Injected',val:fmt(ti),color:'#22C55E'},{label:'Monthly Debt',val:fmt(mon),color:'#F5A623'},{label:'Active Loans',val:LOANS.length,color:'#3B82F6'}].map(function(s){return'<div class="stat-card"><div class="stat-label">'+s.label+'</div><div class="stat-val" style="color:'+s.color+';">'+s.val+'</div></div>';}).join('');
+  var ll=qs('loans-list');
+  if(ll)ll.innerHTML=LOANS.map(function(l){var bal=l.principal-l.repaid,p2=pct(l.repaid,l.principal),emi=calcEMI(l.principal,l.rate,l.tenure);return'<div class="loan-item"><div class="loan-top"><div><div class="loan-name">'+l.name+'</div><div class="loan-source">'+l.source+'</div></div><div style="text-align:right;"><div class="loan-balance">'+fmt(bal)+'</div><div class="loan-bal-label">Outstanding</div></div></div><div class="loan-fields"><div class="loan-field"><div class="loan-field-label">Principal</div><div class="loan-field-val">'+fmt(l.principal)+'</div></div><div class="loan-field"><div class="loan-field-label">Rate</div><div class="loan-field-val">'+l.rate+'% p.a.</div></div><div class="loan-field"><div class="loan-field-label">EMI</div><div class="loan-field-val">'+fmt(emi)+'</div></div><div class="loan-field"><div class="loan-field-label">Repaid</div><div class="loan-field-val" style="color:#22C55E;">'+p2+'%</div></div></div><div class="loan-progress-track"><div class="loan-progress-bar" data-w="'+p2+'"></div></div></div>';}).join('');
+  var il=qs('injections-list');
+  if(il)il.innerHTML=INJECTIONS.map(function(i){return'<div class="inject-item"><div class="inject-left"><div class="inject-name">'+i.name+'</div><div class="inject-meta">'+i.source+' | '+i.date+' | '+i.purpose+'</div></div><div class="inject-amount">+'+fmt(i.amount)+'</div></div>';}).join('');
+  raf2(function(){document.querySelectorAll('.loan-progress-bar').forEach(function(el){el.style.transition='width .9s ease';el.style.width=el.getAttribute('data-w')+'%';});});
+}
+
+function renderNetWorth(){
+  var ta=ACCOUNTS.reduce(function(s,a){return s+a.balance;},0);
+  var tl2=LOANS.reduce(function(s,l){return s+(l.principal-l.repaid);},0)+OBLIGATIONS_DATA.reduce(function(s,o){return s+o.amount;},0);
+  var nw=ta-tl2,nwc=nw>=0?'#22C55E':'#EF4444',goal=10000000,fi=Math.min(100,Math.round(nw/goal*100));
+  var el;
+  el=qs('nw-total');if(el){el.textContent=fmt(nw);el.style.color=nwc;}
+  el=qs('nw-change');if(el){el.textContent='Up +32,500 vs last month';el.style.color='#22C55E';}
+  el=qs('nw-assets');if(el)el.textContent=fmt(ta);
+  el=qs('nw-liabs');if(el)el.textContent=fmt(tl2);
+  el=qs('nw-assets-list');if(el)el.innerHTML=ACCOUNTS.map(function(a){return'<div class="nw-row"><div class="nw-row-label"><span>'+a.icon+'</span><span>'+a.label+'</span></div><div class="nw-row-val" style="color:#22C55E;">'+fmt(a.balance)+'</div></div>';}).join('');
+  el=qs('nw-liabs-list');if(el)el.innerHTML=LOANS.map(function(l){return'<div class="nw-row"><div class="nw-row-label"><span>&#127974;</span><span>'+l.name+'</span></div><div class="nw-row-val" style="color:#EF4444;">'+fmt(l.principal-l.repaid)+'</div></div>';}).join('');
+  el=qs('fi-pct-label');if(el)el.textContent=fi+'%';
+  el=qs('fi-bar');if(el)raf2(function(){el.style.width=fi+'%';});
+  el=qs('nw-trend');
+  if(el){var max=Math.max.apply(null,NW_TREND.map(function(t){return t.val;}));el.innerHTML=NW_TREND.map(function(t,i){var h=Math.round((t.val/max)*55)+8,c=i===NW_TREND.length-1?'#F5A623':'#3B82F6';return'<div class="nw-bar-wrap"><div class="nw-bar" style="height:'+h+'px;background:'+c+';"></div><div class="nw-bar-label">'+t.month+'</div></div>';}).join('');}
+}
+
+function renderAnalytics(){
+  var tin=items.filter(function(i){return i.type==='income'||i.type==='capital_injection';}).reduce(function(s,i){return s+i.amount;},0);
+  var tout=items.filter(function(i){return i.type==='expense';}).reduce(function(s,i){return s+i.amount;},0);
+  var el;
+  el=qs('ana-in');if(el)el.textContent=fmt(tin);
+  el=qs('ana-out');if(el)el.textContent=fmt(tout);
+  var cats={};items.filter(function(i){return i.type==='expense';}).forEach(function(i){cats[i.cat]=(cats[i.cat]||0)+i.amount;});
+  var sorted=Object.keys(cats).map(function(k){return[k,cats[k]];}).sort(function(a,b){return b[1]-a[1];});
+  var max=sorted.length?sorted[0][1]:1;
+  el=qs('cat-breakdown');
+  if(el)el.innerHTML=sorted.length?sorted.map(function(e,idx){var c=CAT_COLORS[idx%CAT_COLORS.length],p=Math.round(e[1]/max*100);return'<div class="cat-row"><div class="cat-top"><span class="cat-name">'+e[0]+'</span><span class="cat-val" style="color:'+c+';">'+fmt(e[1])+'</span></div><div class="cat-track"><div class="cat-bar" style="background:'+c+';" data-p="'+p+'"></div></div></div>';}).join(''):'<div style="color:var(--dim);text-align:center;padding:18px;">No expense data yet.</div>';
+  var vtot=VEHICLES.reduce(function(s,v){return s+vTotal(v);},0);
+  var unp=items.filter(function(i){return i.state==='Unprocessed';}).length;
+  var nr=items.filter(function(i){return i.state==='Needs Review';}).length;
+  var top=sorted.length?sorted[0][0]:'expenses';
+  el=qs('insights-list');
+  if(el)el.innerHTML=[
+    {icon:'&#128200;',text:top+' is your largest expense category this period.'},
+    {icon:'&#128663;',text:'Combined fleet costs: '+fmt(vtot)+'. FJR1300AE is most economical.'},
+    {icon:'&#9888;',  text:'Sportage Black at '+pct(55000,60000)+'% of monthly vehicle budget.'},
+    {icon:'&#128161;',text:(unp+nr)+' inbox entries need your attention.'},
+  ].map(function(ins){return'<div class="insight-row"><div class="insight-icon">'+ins.icon+'</div><div class="insight-text">'+ins.text+'</div></div>';}).join('');
+  raf2(function(){document.querySelectorAll('.cat-bar').forEach(function(b){b.style.width=b.getAttribute('data-p')+'%';});});
+}
+
+function analyzeOpp(){
+  var name=(qs('opp-name').value||'Opportunity').trim();
+  var amount=parseFloat(qs('opp-amount').value)||0;
+  var rate=parseFloat(qs('opp-rate').value)||0;
+  var tenure=parseFloat(qs('opp-tenure').value)||12;
+  var mRet=parseFloat(qs('opp-return').value)||0;
+  var risk=qs('opp-risk').value;
+  if(!amount){alert('Please enter the amount required.');return;}
+  var emi=calcEMI(amount,rate,tenure);
+  var totalInt=emi*tenure-amount;
+  var totalRet=mRet*tenure;
+  var netGain=totalRet-amount-totalInt;
+  var be=mRet>0?Math.ceil(amount/mRet):999;
+  var roi=amount>0?Math.round((netGain/amount)*100):0;
+  var rs=risk==='low'?20:risk==='medium'?50:75;
+  if(emi>mRet*0.8)rs=Math.min(100,rs+25);
+  if(be>tenure)rs=Math.min(100,rs+20);
+  var verdict,vc,vi;
+  if(netGain>0&&rs<50){verdict='ACCEPTABLE';vc='green';vi='OK';}
+  else if(netGain>0&&rs<75){verdict='NEEDS REVIEW';vc='amber';vi='?!';}
+  else{verdict='HIGH RISK';vc='red';vi='!!';}
+  var vEl=qs('opp-verdict');if(vEl)vEl.className='opp-verdict '+vc;
+  var el;
+  el=qs('verdict-icon');if(el)el.textContent=vi;
+  el=qs('verdict-label');if(el)el.textContent=verdict;
+  el=qs('verdict-sub');if(el)el.textContent=name+' -- '+fmt(amount)+' required';
+  var metrics=[
+    {label:'Monthly EMI',   val:fmt(emi),color:'#EF4444'},
+    {label:'Total Interest',val:fmt(totalInt),color:'#F5A623'},
+    {label:'Total Return',  val:fmt(totalRet),color:'#22C55E'},
+    {label:'Net Gain',      val:(netGain>=0?'+':'-')+fmt(Math.abs(netGain)),color:netGain>=0?'#22C55E':'#EF4444'},
+    {label:'Break-even',    val:be>tenure?'After tenure':'Month '+be,color:'#3B82F6'},
+    {label:'ROI',           val:roi+'%',color:roi>0?'#22C55E':'#EF4444'},
+  ];
+  el=qs('opp-metrics');if(el)el.innerHTML=metrics.map(function(m){return'<div class="opp-metric"><div class="opp-metric-label">'+m.label+'</div><div class="opp-metric-val" style="color:'+m.color+';">'+m.val+'</div></div>';}).join('');
+  var rc=rs<40?'#22C55E':rs<70?'#F5A623':'#EF4444',rl=rs<40?'Low':rs<70?'Moderate':'High';
+  el=qs('risk-label');if(el){el.textContent=rl;el.style.color=rc;}
+  el=qs('risk-pct');if(el){el.textContent=rs+'%';el.style.color=rc;}
+  el=qs('opp-risk-fill');if(el){el.style.background=rc;raf2(function(){el.style.width=rs+'%';});}
+  var adv=netGain>0&&be<=tenure?'Monthly return covers EMI. Break-even before tenure ends. Proceed cautiously.':'Monthly return may not cover repayment. Seek lower-rate financing.';
+  el=qs('opp-advice');if(el)el.textContent=adv;
+  el=qs('opp-result');if(el){el.className='opp-result show';setTimeout(function(){el.scrollIntoView({behavior:'smooth',block:'start'});},120);}
+}
+
+function exportCSV(){
+  var rows=[['Date','Time','Description','Category','Type','Amount','From','To','State']];
+  items.forEach(function(i){rows.push([i.date,i.time,'"'+i.desc+'"','"'+i.cat+'"',i.type,i.amount,i.fromAcct||'',i.toAcct||'',i.state]);});
+  var csv=rows.map(function(r){return r.join(',');}).join('\n');
+  dlFile('koboflow_'+getToday()+'.csv',csv,'text/csv');
+  showToast('CSV exported');
+}
+function exportJSON(){
+  var data={exported:new Date().toISOString(),version:'2.0',transactions:items,loans:LOANS,accounts:ACCOUNTS};
+  dlFile('koboflow_backup_'+getToday()+'.json',JSON.stringify(data,null,2),'application/json');
+  showToast('JSON backup exported');
+}
+function dlFile(name,content,mime){
+  var a=document.createElement('a');
+  a.href='data:'+mime+';charset=utf-8,'+encodeURIComponent(content);
+  a.download=name;a.style.display='none';document.body.appendChild(a);a.click();document.body.removeChild(a);
+}
+function importJSON(file){
+  var reader=new FileReader();
+  reader.onload=function(e){
+    try{
+      var data=JSON.parse(e.target.result);
+      if(data.transactions&&Array.isArray(data.transactions)){
+        items=data.transactions;
+        if(data.loans){LOANS.length=0;data.loans.forEach(function(l){LOANS.push(l);});}
+        if(data.accounts){data.accounts.forEach(function(a){var ex=ACCOUNTS.find(function(x){return x.id===a.id;});if(ex)ex.balance=a.balance;});}
+        nextId=Math.max.apply(null,items.map(function(i){return i.id||0;}))+1;
+        renderAll();showToast(items.length+' transactions imported');
+      }else{alert('Invalid backup file.');}
+    }catch(err){alert('Parse error: '+err.message);}
+  };
+  reader.readAsText(file);
+}
+function renderSettings(){var tc=qs('tx-count');if(tc)tc.textContent=items.length;}
+
+
+/* ═══════════════════════════════════════════════════════════════
+   V2.1 — CASH RUNWAY ENGINE
+═══════════════════════════════════════════════════════════════ */
+function calcRunway(){
+  // Available cash: all accounts except fixed_dep
+  var liquid = ACCOUNTS.filter(function(a){
+    return a.id !== 'fixed_dep';
+  }).reduce(function(s,a){return s+a.balance;},0);
+
+  // Monthly burn: last 90 days of expenses only
+  var now = new Date();
+  var day90 = new Date(now); day90.setDate(day90.getDate()-90);
+  var d90str = day90.toISOString().slice(0,10);
+  var burnItems = items.filter(function(i){
+    return i.type==='expense' && i.date >= d90str;
+  });
+  var totalBurn90 = burnItems.reduce(function(s,i){return s+i.amount;},0);
+  var monthlyBurn = totalBurn90 / 3; // 90 days = ~3 months
+  var dailyBurn = monthlyBurn / 30;
+  var runwayDays = dailyBurn > 0 ? Math.round(liquid / dailyBurn) : 999;
+
+  var color = runwayDays >= 180 ? '#22C55E' : runwayDays >= 90 ? '#F5A623' : '#EF4444';
+  var status = runwayDays >= 180 ? 'STRONG' : runwayDays >= 90 ? 'MODERATE' : 'CRITICAL';
+
+  var dEl = qs('runway-days');
+  if(dEl){ dEl.textContent = runwayDays > 999 ? '999+' : runwayDays; dEl.style.color = color; }
+  var sEl = qs('runway-status');
+  if(sEl){ sEl.textContent = status; sEl.style.color = color; }
+  var rc = qs('runway-card');
+  if(rc) rc.style.borderColor = color;
+  var mEl = qs('runway-meta');
+  if(mEl) mEl.innerHTML =
+    '<span><span style="font-size:9px;color:var(--muted);text-transform:uppercase;letter-spacing:.08em;">Available Cash</span><b>'+fmt(liquid)+'</b></span>'+
+    '<span><span style="font-size:9px;color:var(--muted);text-transform:uppercase;letter-spacing:.08em;">Monthly Burn</span><b>'+fmt(monthlyBurn)+'</b></span>'+
+    '<span><span style="font-size:9px;color:var(--muted);text-transform:uppercase;letter-spacing:.08em;">Daily Burn</span><b>'+fmt(dailyBurn)+'</b></span>';
+  return {liquid:liquid, monthlyBurn:monthlyBurn, dailyBurn:dailyBurn, runwayDays:runwayDays, color:color};
+}
+
+/* ═══════════════════════════════════════════════════════════════
+   V2.1 — MORNING FINANCIAL AUTOPILOT
+═══════════════════════════════════════════════════════════════ */
+function renderAutopilot(){
+  var runway = calcRunway();
+  var totalObs = OBLIGATIONS_DATA.reduce(function(s,o){return s+o.amount;},0);
+  var liquid   = runway.liquid;
+  var gap      = liquid - totalObs;
+
+  var now = new Date();
+  var monthStart = now.getFullYear()+'-'+(now.getMonth()+1<10?'0':'')+(now.getMonth()+1)+'-01';
+  var wdThisMonth = items.filter(function(i){
+    return i.type==='owner_withdrawal' && i.date>=monthStart;
+  }).reduce(function(s,i){return s+i.amount;},0);
+
+  var vCosts = VEHICLES.reduce(function(s,v){
+    return s+v.logs.filter(function(l){return l.date>=monthStart;}).reduce(function(s2,l){return s2+l.amount;},0);
+  },0);
+
+  var restock = items.filter(function(i){
+    return i.cat==='Restocking' && i.date>=monthStart;
+  }).reduce(function(s,i){return s+i.amount;},0);
+
+  // Largest obligation
+  var largest = OBLIGATIONS_DATA.slice().sort(function(a,b){return b.amount-a.amount;})[0];
+
+  // Health score
+  var liquidityScore  = Math.min(30, Math.round((liquid/totalObs)*15));
+  var runwayScore     = runway.runwayDays>=180?25:runway.runwayDays>=90?15:5;
+  var pressureScore   = totalObs<liquid?20:totalObs<liquid*1.5?10:0;
+  var wdRatio         = wdThisMonth/(items.filter(function(i){return i.type==='income'&&i.date>=monthStart;}).reduce(function(s,i){return s+i.amount;},0)||1);
+  var wdScore         = wdRatio<0.15?15:wdRatio<0.30?8:0;
+  var debtScore       = LOANS.length===0?10:Math.max(0,10-LOANS.length*2);
+  var health          = Math.min(100, liquidityScore+runwayScore+pressureScore+wdScore+debtScore);
+  var hColor2         = health>=75?'#22C55E':health>=50?'#F5A623':'#EF4444';
+
+  // Warnings
+  var warnings = [];
+  if(gap < 0) warnings.push('Cash deficit of '+fmt(Math.abs(gap))+' expected against upcoming obligations.');
+  if(runway.runwayDays < 90) warnings.push('Cash runway is critical — less than 90 days of burn covered.');
+  if(wdRatio > 0.30) warnings.push('Owner withdrawals exceed 30% of income — business may be underfunded.');
+  if(restock > liquid*0.5) warnings.push('Restocking pressure consuming more than 50% of available cash.');
+  var loanEMI = LOANS.reduce(function(s,l){return s+calcEMI(l.principal,l.rate,l.tenure);},0);
+  if(loanEMI > liquid*0.2) warnings.push('Loan repayments are high relative to available cash.');
+
+  var rows = [
+    {lbl:'Available Cash',   val:fmt(liquid),    color:liquid>totalObs?'#22C55E':'#EF4444'},
+    {lbl:'Upcoming Obligations',val:fmt(totalObs),color:'#EF4444'},
+    {lbl:'Projected Gap',    val:(gap>=0?'+':'')+fmt(gap), color:gap>=0?'#22C55E':'#EF4444'},
+    {lbl:'Largest Demand',   val:largest?largest.desc+' '+fmt(largest.amount):'--', color:'#F5A623'},
+    {lbl:'Owner W/D This Month',val:fmt(wdThisMonth), color:wdRatio>0.30?'#EF4444':wdRatio>0.15?'#F5A623':'#22C55E'},
+    {lbl:'Vehicle Spending', val:fmt(vCosts),    color:'#7A7880'},
+    {lbl:'Restocking',       val:fmt(restock),   color:'#7A7880'},
+    {lbl:'Financial Health', val:health+'/100',  color:hColor2},
+  ];
+
+  var body = qs('autopilot-body');
+  if(!body) return;
+  body.innerHTML =
+    rows.map(function(r){
+      return '<div class="autopilot-row"><span class="autopilot-lbl">'+r.lbl+'</span><span class="autopilot-val" style="color:'+r.color+';">'+r.val+'</span></div>';
+    }).join('') +
+    (warnings.length
+      ? '<div class="autopilot-warning">&#9888; '+warnings.join('<br>&#9888; ')+'</div>'
+      : '<div class="autopilot-ok">&#10003; All financial indicators are within acceptable ranges.</div>');
+}
+
+/* ═══════════════════════════════════════════════════════════════
+   V2.1 — OWNER WITHDRAWAL ANALYTICS
+═══════════════════════════════════════════════════════════════ */
+function renderOwnerImpact(){
+  var now = new Date();
+  var y   = now.getFullYear();
+  var m   = now.getMonth();
+
+  function monthStr(yr,mo){ return yr+'-'+(mo+1<10?'0':'')+(mo+1)+'-01'; }
+  var thisStart = monthStr(y,m);
+  var lastStart = monthStr(m===0?y-1:y, m===0?11:m-1);
+  var lastEnd   = thisStart;
+  var yearStart = y+'-01-01';
+
+  var wdThis  = items.filter(function(i){return i.type==='owner_withdrawal'&&i.date>=thisStart;}).reduce(function(s,i){return s+i.amount;},0);
+  var wdLast  = items.filter(function(i){return i.type==='owner_withdrawal'&&i.date>=lastStart&&i.date<lastEnd;}).reduce(function(s,i){return s+i.amount;},0);
+  var wdYTD   = items.filter(function(i){return i.type==='owner_withdrawal'&&i.date>=yearStart;}).reduce(function(s,i){return s+i.amount;},0);
+  var monthsElapsed = m+1;
+  var wdAvg   = Math.round(wdYTD / monthsElapsed);
+
+  var incThis = items.filter(function(i){return (i.type==='income'||i.type==='capital_injection')&&i.date>=thisStart;}).reduce(function(s,i){return s+i.amount;},0);
+  var ratio   = incThis > 0 ? Math.round((wdThis/incThis)*100) : 0;
+  var rColor  = ratio<15?'#22C55E':ratio<30?'#F5A623':'#EF4444';
+
+  var wdStats = qs('wd-stats');
+  if(wdStats) wdStats.innerHTML = [
+    {label:'This Month',  val:fmt(wdThis),  color:'#F0EDE8'},
+    {label:'Last Month',  val:fmt(wdLast),  color:'#7A7880'},
+    {label:'YTD Total',   val:fmt(wdYTD),   color:'#F5A623'},
+    {label:'Monthly Avg', val:fmt(wdAvg),   color:'#3B82F6'},
+  ].map(function(s){return'<div class="stat-card"><div class="stat-label">'+s.label+'</div><div class="stat-val" style="color:'+s.color+';">'+s.val+'</div></div>';}).join('');
+
+  var rPct = qs('wd-ratio-pct');
+  if(rPct){rPct.textContent=ratio+'%';rPct.style.color=rColor;}
+  var rFill = qs('wd-ratio-fill');
+  if(rFill){rFill.style.background=rColor;raf2(function(){rFill.style.width=Math.min(100,ratio)+'%';});}
+
+  // Auto-insights
+  var insights = [];
+  var momChange = wdLast>0 ? Math.round(((wdThis-wdLast)/wdLast)*100) : 0;
+  if(momChange>0) insights.push({icon:'&#128200;',text:'Owner withdrawals increased '+momChange+'% this month vs last month.'});
+  else if(momChange<0) insights.push({icon:'&#128994;',text:'Owner withdrawals decreased '+Math.abs(momChange)+'% vs last month — good discipline.'});
+  if(ratio>30) insights.push({icon:'&#128308;',text:'Withdrawals are consuming '+ratio+'% of income — above safe threshold of 30%.'});
+  else if(ratio>15) insights.push({icon:'&#129000;',text:'Owner withdrawals at '+ratio+'% of income — approaching warning zone.'});
+  else insights.push({icon:'&#128994;',text:'Withdrawal ratio of '+ratio+'% is healthy — below 15% threshold.'});
+  if(wdThis>wdLast && wdThis>wdAvg) insights.push({icon:'&#9888;',text:'Withdrawals are now your second-largest cash drain this month.'});
+  if(ratio>30) insights.push({icon:'&#9888;',text:'Withdrawal pressure may be underfunding business operations.'});
+
+  var wdIns = qs('wd-insights');
+  if(wdIns) wdIns.innerHTML = insights.map(function(ins){
+    return '<div class="insight-row"><div class="insight-icon">'+ins.icon+'</div><div class="insight-text">'+ins.text+'</div></div>';
+  }).join('');
+}
+
+/* ═══════════════════════════════════════════════════════════════
+   V2.1 — RESTOCK ROI ENGINE
+═══════════════════════════════════════════════════════════════ */
+function renderRestockROI(){
+  var now = new Date();
+  var y   = now.getFullYear();
+  var m   = now.getMonth();
+  function mStr(yr,mo){return yr+'-'+(mo+1<10?'0':'')+(mo+1)+'-01';}
+
+  // Build 6-month data
+  var months6 = [];
+  for(var i=5;i>=0;i--){
+    var mo = m-i; var yr = y;
+    if(mo<0){mo+=12;yr--;}
+    var start = mStr(yr,mo);
+    var nextMo = mo+1>11?0:mo+1; var nextYr = mo+1>11?yr+1:yr;
+    var end = mStr(nextYr,nextMo);
+    var mNames = ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'];
+    var restock = items.filter(function(it){return it.cat==='Restocking'&&it.date>=start&&it.date<end;}).reduce(function(s,it){return s+it.amount;},0);
+    var sales   = items.filter(function(it){return it.cat==='Pharmacy Sales'&&it.date>=start&&it.date<end;}).reduce(function(s,it){return s+it.amount;},0);
+    var roi     = restock>0 ? Math.round(((sales-restock)/restock)*100) : 0;
+    months6.push({label:mNames[mo], restock:restock, sales:sales, roi:roi, gain:sales-restock});
+  }
+
+  var current = months6[months6.length-1];
+  var roiColor = current.roi>=50?'#22C55E':current.roi>=20?'#F5A623':'#EF4444';
+
+  var rPct = qs('roi-pct');
+  if(rPct){rPct.textContent=current.roi+'%';rPct.style.color=roiColor;}
+
+  var rStats = qs('roi-stats');
+  if(rStats) rStats.innerHTML = [
+    {label:'Restocking Spend',val:fmt(current.restock),color:'#EF4444'},
+    {label:'Sales Generated', val:fmt(current.sales),  color:'#22C55E'},
+    {label:'Gross Gain',      val:fmt(current.gain),   color:current.gain>=0?'#22C55E':'#EF4444'},
+    {label:'Avg 6-Month ROI', val:Math.round(months6.reduce(function(s,m){return s+m.roi;},0)/6)+'%', color:'#F5A623'},
+  ].map(function(s){return'<div class="stat-card"><div class="stat-label">'+s.label+'</div><div class="stat-val" style="color:'+s.color+';">'+s.val+'</div></div>';}).join('');
+
+  var rDetail = qs('roi-detail');
+  if(rDetail) rDetail.innerHTML = [
+    {label:'Restock',val:fmt(current.restock),color:'#EF4444'},
+    {label:'Sales',  val:fmt(current.sales),  color:'#22C55E'},
+    {label:'ROI',    val:current.roi+'%',     color:roiColor},
+  ].map(function(s){return'<div class="stat-card"><div class="stat-label">'+s.label+'</div><div class="stat-val" style="color:'+s.color+';">'+s.val+'</div></div>';}).join('');
+
+  // Trend chart
+  var maxRoi = Math.max.apply(null, months6.map(function(m){return Math.abs(m.roi)||1;}));
+  var chart = qs('roi-trend-chart');
+  if(chart) chart.innerHTML = months6.map(function(m,i){
+    var h = Math.max(6, Math.round((Math.abs(m.roi)/Math.max(maxRoi,1))*55));
+    var c = m.roi>=50?'#22C55E':m.roi>=20?'#F5A623':'#EF4444';
+    var isCurrent = i===months6.length-1;
+    return'<div class="roi-bar-wrap"><div class="roi-bar-val" style="color:'+c+';font-size:8px;font-weight:700;">'+m.roi+'%</div><div class="roi-bar" style="height:'+h+'px;background:'+(isCurrent?c:c+'88')+';"></div><div class="roi-bar-label">'+m.label+'</div></div>';
+  }).join('');
+
+  // Auto-insights
+  var insights = [];
+  var improving = months6.slice(3).every(function(m,i,arr){return i===0||m.roi>=arr[i-1].roi;});
+  if(improving) insights.push({icon:'&#128200;',text:'ROI has improved for '+months6.slice(3).length+' consecutive months.'});
+  if(current.roi>=70) insights.push({icon:'&#128994;',text:'This month's restocking generated a '+current.roi+'% return — excellent efficiency.'});
+  else if(current.roi>=40) insights.push({icon:'&#128994;',text:'Current restocking efficiency at '+current.roi+'% — within healthy range.'});
+  else insights.push({icon:'&#128308;',text:'ROI of '+current.roi+'% is below target. Review supplier pricing or sales strategy.'});
+  var lastSales = months6[months6.length-2].sales||0;
+  if(current.sales>lastSales) insights.push({icon:'&#128200;',text:'Sales growth is outpacing inventory spending this month.'});
+  var avgROI = Math.round(months6.reduce(function(s,m){return s+m.roi;},0)/6);
+  if(current.roi>avgROI) insights.push({icon:'&#128994;',text:'Current ROI exceeds 6-month average of '+avgROI+'%.'});
+
+  var rIns = qs('roi-insights');
+  if(rIns) rIns.innerHTML = insights.map(function(ins){
+    return'<div class="insight-row"><div class="insight-icon">'+ins.icon+'</div><div class="insight-text">'+ins.text+'</div></div>';
+  }).join('');
+}
+
+/* ═══════════════════════════════════════════════════════════════
+   V2.1 — TRUE CASH FLOW STATEMENT
+═══════════════════════════════════════════════════════════════ */
+function renderCashFlow(){
+  var now = new Date();
+  var y   = now.getFullYear();
+  var m   = now.getMonth();
+  function mStr(yr,mo){return yr+'-'+(mo+1<10?'0':'')+(mo+1)+'-01';}
+  var thisStart = mStr(y,m);
+  var nextMo = m+1>11?0:m+1; var nextYr = m+1>11?y+1:y;
+  var thisEnd = mStr(nextYr,nextMo);
+
+  var monthItems = items.filter(function(i){return i.date>=thisStart&&i.date<thisEnd;});
+
+  // Classify transactions
+  var OPERATING_CATS = ['Pharmacy Sales','Restocking','Food','Household','Business Overhead','Utilities','Vehicle: FJR1300AE','Vehicle: Sportage Green','Vehicle: Sportage Black','Other'];
+  var INVESTING_CATS = ['Investment','Savings'];
+  var FINANCING_TYPES = ['capital_injection','owner_withdrawal'];
+  var LOAN_CATS = ['Loan'];
+
+  function buildSection(filterFn){
+    var cats = {};
+    monthItems.filter(filterFn).forEach(function(i){
+      cats[i.cat] = (cats[i.cat]||0) + (i.type==='income'||i.type==='capital_injection'?i.amount:-i.amount);
+    });
+    return cats;
+  }
+
+  var opItems = monthItems.filter(function(i){
+    return (OPERATING_CATS.indexOf(i.cat)>=0 || i.type==='expense'||i.type==='income') &&
+           FINANCING_TYPES.indexOf(i.type)<0 && i.type!=='transfer' && i.type!=='investment';
+  });
+  var invItems = monthItems.filter(function(i){return i.type==='investment'||INVESTING_CATS.indexOf(i.cat)>=0;});
+  var finItems = monthItems.filter(function(i){return FINANCING_TYPES.indexOf(i.type)>=0||LOAN_CATS.indexOf(i.cat)>=0;});
+
+  function sumSection(arr){
+    return arr.reduce(function(s,i){
+      return s + (i.type==='income'||i.type==='capital_injection'?i.amount:-i.amount);
+    },0);
+  }
+  function renderRows(arr, elId){
+    var cats = {};
+    arr.forEach(function(i){cats[i.cat]=(cats[i.cat]||0)+(i.type==='income'||i.type==='capital_injection'?i.amount:-i.amount);});
+    var el = qs(elId);
+    if(!el) return;
+    if(!Object.keys(cats).length){el.innerHTML='<div style="color:var(--dim);font-size:12px;padding:6px 0;">No transactions this month.</div>';return;}
+    el.innerHTML = Object.keys(cats).map(function(k){return[k,cats[k]];}).map(function(e){
+      var pos = e[1]>=0;
+      return'<div class="cf-row"><span class="cf-cat">'+e[0]+'</span><span class="cf-amt" style="color:'+(pos?'#22C55E':'#EF4444')+';">'+(pos?'+':'')+fmt(e[1])+'</span></div>';
+    }).join('');
+  }
+
+  renderRows(opItems,'cf-operating');
+  renderRows(invItems,'cf-investing');
+  renderRows(finItems,'cf-financing');
+
+  var opTotal  = sumSection(opItems);
+  var invTotal = sumSection(invItems);
+  var finTotal = sumSection(finItems);
+  var netTotal = opTotal+invTotal+finTotal;
+
+  function setTotal(id,val){
+    var el=qs(id);
+    if(el){el.textContent=(val>=0?'+':'')+fmt(val);el.style.color=val>=0?'#22C55E':'#EF4444';}
+  }
+  setTotal('cf-op-total',opTotal);
+  setTotal('cf-inv-total',invTotal);
+  setTotal('cf-fin-total',finTotal);
+
+  // Summary grid
+  var sg = qs('cf-summary-grid');
+  if(sg) sg.innerHTML = [
+    {label:'Operating',  val:opTotal,  color:opTotal>=0?'#22C55E':'#EF4444'},
+    {label:'Investing',  val:invTotal, color:invTotal>=0?'#22C55E':'#EF4444'},
+    {label:'Financing',  val:finTotal, color:finTotal>=0?'#22C55E':'#EF4444'},
+  ].map(function(s){return'<div class="stat-card"><div class="stat-label">'+s.label+'</div><div class="stat-val" style="color:'+s.color+';">'+(s.val>=0?'+':'')+fmt(s.val)+'</div></div>';}).join('');
+
+  // 6-month trend (operating cf)
+  var months6cf = [];
+  var mNames2 = ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'];
+  for(var ci=5;ci>=0;ci--){
+    var cmo=m-ci; var cyr=y;
+    if(cmo<0){cmo+=12;cyr--;}
+    var cs=mStr(cyr,cmo);
+    var cnm=cmo+1>11?0:cmo+1; var cny=cmo+1>11?cyr+1:cyr;
+    var ce=mStr(cny,cnm);
+    var mop=items.filter(function(i){return i.date>=cs&&i.date<ce&&(i.type==='expense'||i.type==='income')&&i.type!=='transfer';});
+    var mopVal=sumSection(mop);
+    months6cf.push({label:mNames2[cmo],val:mopVal});
+  }
+  var maxCf=Math.max.apply(null,months6cf.map(function(m){return Math.abs(m.val)||1;}));
+  var cfChart=qs('cf-trend-chart');
+  if(cfChart) cfChart.innerHTML=months6cf.map(function(m,i){
+    var h=Math.max(6,Math.round((Math.abs(m.val)/maxCf)*55));
+    var c=m.val>=0?'#22C55E':'#EF4444';
+    var isCurrent=i===months6cf.length-1;
+    return'<div class="roi-bar-wrap"><div class="roi-bar-val" style="color:'+c+';font-size:8px;">'+( m.val>=0?'+':'-')+'</div><div class="roi-bar" style="height:'+h+'px;background:'+(isCurrent?c:c+'88')+';"></div><div class="roi-bar-label">'+m.label+'</div></div>';
+  }).join('');
+
+  // Auto-insights
+  var cfIns=qs('cf-insights');
+  var cfInsights=[];
+  if(opTotal>0) cfInsights.push({icon:'&#128994;',text:'Operations generated positive cash flow of '+fmt(opTotal)+' this month.'});
+  else cfInsights.push({icon:'&#128308;',text:'Operating activities consumed '+fmt(Math.abs(opTotal))+' — review expense levels.'});
+  if(finTotal>0) cfInsights.push({icon:'&#128200;',text:'Growth was supported by financing activities (loans/capital injections).'});
+  if(netTotal>0) cfInsights.push({icon:'&#128994;',text:'Business is net cash-flow positive at '+fmt(netTotal)+' this month.'});
+  else cfInsights.push({icon:'&#128308;',text:'Net cash outflow of '+fmt(Math.abs(netTotal))+' — monitor carefully.'});
+  var prevOp=months6cf[months6cf.length-2]?months6cf[months6cf.length-2].val:0;
+  if(opTotal>prevOp) cfInsights.push({icon:'&#128200;',text:'Cash generation has improved month-over-month.'});
+
+  if(cfIns) cfIns.innerHTML=cfInsights.map(function(ins){
+    return'<div class="insight-row"><div class="insight-icon">'+ins.icon+'</div><div class="insight-text">'+ins.text+'</div></div>';
+  }).join('');
+}
+
+function renderAll(){
+  renderDashboard();renderTimeline();renderInbox();
+  renderVehicles();renderCalendar();renderPressure();
+  renderCashDrop();renderCapital();renderNetWorth();
+  renderAnalytics();renderSettings();
+  renderAutopilot();renderOwnerImpact();renderRestockROI();renderCashFlow();
+}
+
+var capInput=qs('capture-input'),capWrap=qs('capture-wrap'),capPreview=qs('capture-preview');
+if(capInput){
+  capInput.addEventListener('input',function(){
+    var val=capInput.value.trim();
+    if(!val){capWrap.classList.remove('active');capPreview.classList.remove('show');return;}
+    var parts=val.split(/\s+/);
+    if(parts.length>=2&&!isNaN(parseFloat(parts[0]))){
+      var e=parseEntry(val),ss2=SS['AI Categorized'];
+      var tc2=(e.type==='income'||e.type==='capital_injection')?'#22C55E':e.type==='transfer'?'#3B82F6':e.type==='owner_withdrawal'?'#A855F7':'#EF4444';
+      var tbg=(e.type==='income'||e.type==='capital_injection')?'#0D2E1A':e.type==='transfer'?'#0D1A2E':e.type==='owner_withdrawal'?'#1E0A3C':'#2E0D0D';
+      capWrap.classList.add('active');capPreview.classList.add('show');
+      var pt=qs('preview-type'),pc=qs('preview-cat'),pa=qs('preview-acct');
+      if(pt){pt.textContent=e.type.replace(/_/g,' ');pt.style.background=tbg;pt.style.color=tc2;}
+      if(pc){pc.textContent=e.cat;pc.style.background=ss2.bg;pc.style.color=ss2.color;}
+      if(pa&&e.fromAcct){pa.textContent=(e.fromAcct+(e.toAcct?' > '+e.toAcct:'')).replace(/_/g,' ');}
+    }else{capWrap.classList.remove('active');capPreview.classList.remove('show');}
+  });
+  capInput.addEventListener('keydown',function(e){if(e.key==='Enter')doCapture();});
+}
+function doCapture(){
+  var val=capInput.value.trim();if(!val)return;
+  var e=parseEntry(val);if(!e.amount)return;
+  var item={amount:e.amount,desc:e.desc,cat:e.cat,type:e.type,vehicle:e.vehicle,fromAcct:e.fromAcct,toAcct:e.toAcct,state:e.state,id:nextId++,date:getToday(),time:getNow()};
+  items.unshift(item);
+  db.transactions.add({amount:item.amount,desc:item.desc,cat:item.cat,type:item.type,vehicle:item.vehicle,fromAcct:item.fromAcct,toAcct:item.toAcct,state:item.state,date:item.date,time:item.time}).catch(function(){});
+  capInput.value='';capWrap.classList.remove('active');capPreview.classList.remove('show');
+  var btn=qs('capture-btn');
+  if(btn){btn.textContent='SAVED';btn.classList.add('saved');setTimeout(function(){btn.textContent='SAVE';btn.classList.remove('saved');},1100);}
+  showToast(e.desc+' -- '+fmt(e.amount));
+  renderAll();
+}
+var capBtn=qs('capture-btn');if(capBtn)capBtn.addEventListener('click',doCapture);
+
+document.querySelectorAll('.nav-btn').forEach(function(btn){
+  btn.addEventListener('click',function(){
+    var sc=btn.getAttribute('data-screen');
+    document.querySelectorAll('.screen').forEach(function(s){s.classList.remove('active');});
+    var t=qs('screen-'+sc);if(t)t.classList.add('active');
+    document.querySelectorAll('.nav-btn').forEach(function(b){b.classList.remove('active');});
+    btn.classList.add('active');
+    setTimeout(function(){
+      document.querySelectorAll('.budget-bar').forEach(function(el){el.style.width=el.getAttribute('data-pct')+'%';});
+      document.querySelectorAll('.cat-bar').forEach(function(el){el.style.width=el.getAttribute('data-p')+'%';});
+      document.querySelectorAll('.loan-progress-bar').forEach(function(el){el.style.width=el.getAttribute('data-w')+'%';});
+    },60);
+  });
+});
+var snb=qs('settings-nav-btn');
+if(snb)snb.addEventListener('click',function(){
+  document.querySelectorAll('.screen').forEach(function(s){s.classList.remove('active');});
+  var t=qs('screen-settings');if(t)t.classList.add('active');
+  document.querySelectorAll('.nav-btn').forEach(function(b){b.classList.remove('active');});
+});
+
+var fr2=qs('filter-row');
+if(fr2)fr2.addEventListener('click',function(e){var b=e.target.closest('.filter-btn');if(b){activeFilter=b.getAttribute('data-state');renderInbox();}});
+var il2=qs('inbox-list');
+if(il2)il2.addEventListener('click',function(e){
+  var ab=e.target.closest('[data-approve]'),db2=e.target.closest('[data-dismiss]');
+  if(ab){var id=parseInt(ab.getAttribute('data-approve'));items=items.map(function(i){if(i.id===id){var n={}; for(var k in i)n[k]=i[k]; n.state='Linked'; return n;} return i;});renderAll();}
+  if(db2){var id2=parseInt(db2.getAttribute('data-dismiss'));items=items.map(function(i){if(i.id===id2){var n2={}; for(var k2 in i)n2[k2]=i[k2]; n2.state='Archived'; return n2;} return i;});renderAll();}
+});
+
+var tlSel=qs('tl-search');if(tlSel)tlSel.addEventListener('input',function(){tlSearch=tlSel.value;renderTimeline();});
+var tlFR=qs('tl-filter-row');
+if(tlFR)tlFR.addEventListener('click',function(e){var b=e.target.closest('.tl-filter-btn');if(b){tlFilter=b.getAttribute('data-f');document.querySelectorAll('.tl-filter-btn').forEach(function(x){x.classList.remove('active');});b.classList.add('active');renderTimeline();}});
+
+var vtabs=qs('vehicle-tabs');
+if(vtabs)vtabs.addEventListener('click',function(e){
+  var btn=e.target.closest('.vtab');if(!btn)return;
+  activeVehicle=btn.getAttribute('data-vid');
+  document.querySelectorAll('.vtab').forEach(function(b){b.classList.remove('active');});btn.classList.add('active');
+  document.querySelectorAll('.vehicle-panel').forEach(function(p){p.classList.remove('active');});
+  var pan=document.querySelector('[data-panel="'+activeVehicle+'"]');if(pan)pan.classList.add('active');
+  raf2(function(){document.querySelectorAll('.budget-bar').forEach(function(b){b.style.width=b.getAttribute('data-pct')+'%';});});
+});
+var vpanels=qs('vehicle-panels');
+if(vpanels)vpanels.addEventListener('click',function(e){
+  var btn=e.target.closest('.add-vlog-btn');if(!btn)return;
+  var vid=btn.getAttribute('data-vid');
+  var v=VEHICLES.find(function(x){return x.id===vid;});if(!v)return;
+  var mt=qs('vlog-modal-title');if(mt)mt.textContent='LOG -- '+v.name;
+  qs('vlog-modal-overlay').setAttribute('data-vid',vid);
+  qs('vlog-modal-overlay').classList.add('open');
+  setTimeout(function(){var el=qs('vlog-amount');if(el)el.focus();},100);
+});
+
+var addBtn=qs('add-btn');if(addBtn)addBtn.addEventListener('click',function(){qs('modal-overlay').classList.add('open');setTimeout(function(){var el=qs('modal-amount');if(el)el.focus();},100);});
+qs('modal-close-btn').addEventListener('click',function(){qs('modal-overlay').classList.remove('open');});
+qs('modal-overlay').addEventListener('click',function(e){if(e.target===qs('modal-overlay'))qs('modal-overlay').classList.remove('open');});
+document.querySelectorAll('.type-chip').forEach(function(btn){btn.addEventListener('click',function(){modalType=btn.getAttribute('data-type');document.querySelectorAll('.type-chip').forEach(function(b){b.classList.remove('active');});btn.classList.add('active');});});
+qs('modal-save-btn').addEventListener('click',function(){
+  var amt=parseFloat(qs('modal-amount').value);
+  var desc=(qs('modal-desc').value||'').trim();
+  var cat=qs('modal-cat').value;
+  var from=qs('modal-from').value,to=qs('modal-to').value;
+  if(!amt||!desc){alert('Please enter amount and description.');return;}
+  items.unshift({id:nextId++,amount:amt,desc:desc,cat:cat,type:modalType,state:'AI Categorized',date:getToday(),time:getNow(),fromAcct:from,toAcct:to});
+  qs('modal-overlay').classList.remove('open');
+  qs('modal-amount').value='';qs('modal-desc').value='';
+  showToast('Entry saved');renderAll();
+});
+
+var alb=qs('add-loan-btn');if(alb)alb.addEventListener('click',function(){qs('loan-modal-overlay').classList.add('open');});
+qs('loan-modal-close').addEventListener('click',function(){qs('loan-modal-overlay').classList.remove('open');});
+qs('loan-modal-overlay').addEventListener('click',function(e){if(e.target===qs('loan-modal-overlay'))qs('loan-modal-overlay').classList.remove('open');});
+qs('loan-save-btn').addEventListener('click',function(){
+  var n2=(qs('ln-name').value||'').trim(),src=(qs('ln-source').value||'').trim();
+  var pr=parseFloat(qs('ln-principal').value)||0,rt=parseFloat(qs('ln-rate').value)||0;
+  var tn=parseFloat(qs('ln-tenure').value)||12,rp=parseFloat(qs('ln-repaid').value)||0;
+  if(!n2||!pr){alert('Please enter loan name and principal.');return;}
+  LOANS.push({id:nextLoanId++,name:n2,source:src||'Unknown',principal:pr,rate:rt,tenure:tn,repaid:rp});
+  qs('loan-modal-overlay').classList.remove('open');
+  ['ln-name','ln-source','ln-principal','ln-rate','ln-tenure','ln-repaid'].forEach(function(id){var el=qs(id);if(el)el.value='';});
+  showToast('Loan added');renderCapital();
+});
+
+qs('vlog-modal-close').addEventListener('click',function(){qs('vlog-modal-overlay').classList.remove('open');});
+qs('vlog-modal-overlay').addEventListener('click',function(e){if(e.target===qs('vlog-modal-overlay'))qs('vlog-modal-overlay').classList.remove('open');});
+qs('vlog-save-btn').addEventListener('click',function(){
+  var vid=qs('vlog-modal-overlay').getAttribute('data-vid');
+  var v=VEHICLES.find(function(x){return x.id===vid;});if(!v)return;
+  var amt=parseFloat(qs('vlog-amount').value)||0;
+  var cat=qs('vlog-cat').value;
+  var desc=(qs('vlog-desc').value||'').trim()||cat;
+  if(!amt){alert('Please enter an amount.');return;}
+  v.logs.unshift({id:nextVlogId++,cat:cat,amount:amt,desc:desc,date:getToday(),time:getNow()});
+  items.unshift({id:nextId++,amount:amt,desc:desc+' ('+v.name+')',cat:'Vehicle: '+v.name,type:'expense',state:'AI Categorized',date:getToday(),time:getNow(),fromAcct:'pers_cash',toAcct:'',vehicle:vid});
+  qs('vlog-modal-overlay').classList.remove('open');
+  qs('vlog-amount').value='';qs('vlog-desc').value='';
+  showToast(v.name+' -- '+fmt(amt));renderAll();
+});
+
+var ocb=qs('opp-calc-btn');if(ocb)ocb.addEventListener('click',analyzeOpp);
+qs('export-csv-btn').addEventListener('click',exportCSV);
+qs('export-json-btn').addEventListener('click',exportJSON);
+qs('import-json-btn').addEventListener('click',function(){qs('import-file-input').click();});
+qs('import-file-input').addEventListener('change',function(e){var f=e.target.files[0];if(f)importJSON(f);e.target.value='';});
+qs('clear-data-btn').addEventListener('click',function(){
+  if(!confirm('Clear ALL KoboFlow data? Cannot be undone.'))return;
+  items=[];db.transactions.clear().catch(function(){});
+  showToast('All data cleared');renderAll();
+});
+
+db.transactions.toArray().then(function(rows){
+  if(rows&&rows.length>0){
+    rows.forEach(function(r){var ex=items.find(function(i){return i.id===r.id;});if(!ex)items.unshift(r);});
+    nextId=Math.max.apply(null,items.map(function(i){return i.id||0;}))+1;
+    renderAll();
+  }
+}).catch(function(){});
+
+renderAll();
+});
+</script>
+</body>
+</html>
