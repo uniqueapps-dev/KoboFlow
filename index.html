@@ -1550,7 +1550,7 @@ function renderRestockROI(){
   var insights = [];
   var improving = months6.slice(3).every(function(m,i,arr){return i===0||m.roi>=arr[i-1].roi;});
   if(improving) insights.push({icon:'&#128200;',text:'ROI has improved for '+months6.slice(3).length+' consecutive months.'});
-  if(current.roi>=70) insights.push({icon:'&#128994;',text:'This month's restocking generated a '+current.roi+'% return — excellent efficiency.'});
+  if(current.roi>=70) insights.push({icon:'&#128994;',text:'This month restocking generated '+current.roi+'% return — excellent efficiency.'});
   else if(current.roi>=40) insights.push({icon:'&#128994;',text:'Current restocking efficiency at '+current.roi+'% — within healthy range.'});
   else insights.push({icon:'&#128308;',text:'ROI of '+current.roi+'% is below target. Review supplier pricing or sales strategy.'});
   var lastSales = months6[months6.length-2].sales||0;
