@@ -1,25 +1,42 @@
 #!/usr/bin/env node
-// Builds koboflow-test.html from koboflow.html for device acceptance testing.
+// Builds the KoboFlow TEST app from the production candidate, for device
+// acceptance testing. Production files are only read, never changed.
+//
 // The test build is hard-wired to the separate "KoboFlowDB-test" database and
 // cannot open, upgrade, read, write, list or delete the live "KoboFlowDB".
-// koboflow.html itself is only read, never changed.
+// It has its own manifest identity, icons, service worker and cache namespace
+// ("koboflow-test-"), so it installs and caches separately from production.
 //
-//   node scripts/build-test-file.js            → writes koboflow-test.html
-//   node scripts/build-test-file.js --check    → exits 1 if koboflow-test.html is stale
+//   node scripts/build-test-file.js               → writes koboflow-test.html (single file, for local use)
+//   node scripts/build-test-file.js --check       → exits 1 if koboflow-test.html is stale
+//   node scripts/build-test-file.js --site <dir>  → writes the complete test site (for the test repository)
+//
+// The site build is reproducible: the same source commit produces the same bytes.
+// SOURCE.json records the source commit and SHA-256 checksums of every input and output.
 const fs = require('fs');
 const path = require('path');
+const crypto = require('crypto');
+const { execFileSync } = require('child_process');
 
 const ROOT = path.join(__dirname, '..');
 const SRC = path.join(ROOT, 'koboflow.html');
 const OUT = path.join(ROOT, 'koboflow-test.html');
 const TEST_DB = 'KoboFlowDB-test';
 const LIVE_DB = 'KoboFlowDB';
+const PROD_PREFIX = 'koboflow-prod-';
+const TEST_PREFIX = 'koboflow-test-';
+const TEST_THEME = '#7E22CE';
+
+// Production inputs (read only) and where each lands in the test site.
+const INPUTS = ['koboflow.html', 'manifest.json', 'sw.js', 'icons/test-icon-192.png', 'icons/test-icon-512.png', 'package.json', 'scripts/build-test-file.js'];
 
 function replaceOnce(s, from, to, what) {
   const n = s.split(from).length - 1;
-  if (n !== 1) throw new Error(`build-test-file: expected exactly one ${what} in koboflow.html, found ${n}`);
+  if (n !== 1) throw new Error(`build-test-file: expected exactly one ${what}, found ${n}`);
   return s.replace(from, () => to);
 }
+const sha256 = buf => crypto.createHash('sha256').update(buf).digest('hex');
+const read = rel => fs.readFileSync(path.join(ROOT, rel));
 
 function build(src) {
   let s = src;
@@ -66,19 +83,121 @@ function build(src) {
   s = replaceOnce(s, "dlFile('koboflow_backup_'+getToday()+'.json'", "dlFile('koboflow_TEST_backup_'+getToday()+'.json'", 'JSON filename');
   s = replaceOnce(s, "var data={app:'KoboFlow',version:'3.2',", "var data={app:'KoboFlow',testDatabase:" + JSON.stringify(TEST_DB) + ",version:'3.2',", 'backup header');
 
-  // Sanity: the only remaining mention of the live name is inside the guard.
+  // 5. Separate PWA identity: test manifest, test icons, test service worker.
+  //    Distinct file names mean a test page can never register the production worker.
+  s = replaceOnce(s, '<meta name="theme-color" content="#0A0A0B"/>', `<meta name="theme-color" content="${TEST_THEME}"/>`, 'theme colour');
+  s = replaceOnce(s, '<link rel="manifest" href="./manifest.json"/>', '<link rel="manifest" href="./test-manifest.json"/>', 'manifest link');
+  s = replaceOnce(s, '<link rel="icon" type="image/png" sizes="192x192" href="./icons/icon-192.png"/>', '<link rel="icon" type="image/png" sizes="192x192" href="./icons/test-icon-192.png"/>', 'icon link');
+  s = replaceOnce(s, '<link rel="apple-touch-icon" href="./icons/icon-192.png"/>', '<link rel="apple-touch-icon" href="./icons/test-icon-192.png"/>', 'touch icon link');
+  s = replaceOnce(s, "var SW_URL='./sw.js';", "var SW_URL='./test-sw.js';", 'service-worker registration');
+
+  // Sanity: the only remaining mention of the live name is inside the guard,
+  // and nothing still points at production PWA files.
   const live = s.match(/['"]KoboFlowDB['"]/g) || [];
   if (live.length !== 1) throw new Error('build-test-file: unexpected reference to the live database name');
+  if (/\.\/sw\.js|\.\/manifest\.json|icons\/icon-\d+\.png/.test(s)) throw new Error('build-test-file: test page still references a production PWA file');
   return s;
 }
 
-const out = build(fs.readFileSync(SRC, 'utf8'));
-if (process.argv.includes('--check')) {
-  const cur = fs.existsSync(OUT) ? fs.readFileSync(OUT, 'utf8') : '';
-  if (cur !== out) { console.error('koboflow-test.html is missing or stale: run node scripts/build-test-file.js'); process.exit(1); }
-  console.log('koboflow-test.html is up to date');
-} else {
-  fs.writeFileSync(OUT, out);
-  console.log('wrote', path.relative(ROOT, OUT), out.length, 'bytes');
+function buildManifest(prodJson) {
+  const m = JSON.parse(prodJson);
+  m.name = 'KoboFlow TEST — test database only';
+  m.short_name = 'KoboFlow TEST';
+  m.description = 'TEST build of KoboFlow. Uses the separate KoboFlowDB-test database. Fictional data only.';
+  m.theme_color = TEST_THEME;
+  m.icons = [
+    { src: './icons/test-icon-192.png', sizes: '192x192', type: 'image/png', purpose: 'any' },
+    { src: './icons/test-icon-512.png', sizes: '512x512', type: 'image/png', purpose: 'any' },
+    { src: './icons/test-icon-512.png', sizes: '512x512', type: 'image/png', purpose: 'maskable' },
+  ];
+  return JSON.stringify(m, null, 2) + '\n';
 }
-module.exports = { build };
+
+function buildServiceWorker(prodSw) {
+  let s = prodSw;
+  s = replaceOnce(s, "/* KoboFlow service worker (production).", "/* KoboFlow TEST service worker — generated by scripts/build-test-file.js. Do not edit by hand.", 'service-worker header');
+  s = replaceOnce(s, `var APP_PREFIX = '${PROD_PREFIX}';`, `var APP_PREFIX = '${TEST_PREFIX}';`, 'cache prefix');
+  s = replaceOnce(s, "var SHELL = ['./', './index.html', './manifest.json', './icons/icon-192.png', './icons/icon-512.png'];",
+    "var SHELL = ['./', './index.html', './test-manifest.json', './icons/test-icon-192.png', './icons/test-icon-512.png'];", 'app shell list');
+  s = replaceOnce(s, "'KoboFlow is offline and not cached yet. Open it once while online.'", "'KoboFlow TEST is offline and not cached yet. Open it once while online.'", 'offline message');
+  if (s.includes(PROD_PREFIX)) throw new Error('build-test-file: test service worker still mentions the production cache prefix');
+  return s;
+}
+
+function swVersion(sw) {
+  const m = /var VERSION = '([^']+)';/.exec(sw);
+  if (!m) throw new Error('build-test-file: VERSION not found in sw.js');
+  return m[1];
+}
+
+function git(args) {
+  try { return execFileSync('git', args, { cwd: ROOT, encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] }).trim(); }
+  catch (e) { return null; }
+}
+
+// Returns the complete test site as an ordered list of [relativePath, Buffer].
+function buildTestSite() {
+  const prodSw = read('sw.js').toString('utf8');
+  const version = JSON.parse(read('package.json')).version;
+  if (swVersion(prodSw) !== version) throw new Error(`build-test-file: sw.js VERSION ${swVersion(prodSw)} does not match package.json ${version}`);
+  const files = [
+    ['index.html', Buffer.from(build(read('koboflow.html').toString('utf8')))],
+    ['test-manifest.json', Buffer.from(buildManifest(read('manifest.json').toString('utf8')))],
+    ['test-sw.js', Buffer.from(buildServiceWorker(prodSw))],
+    ['icons/test-icon-192.png', read('icons/test-icon-192.png')],
+    ['icons/test-icon-512.png', read('icons/test-icon-512.png')],
+  ];
+  const dirty = git(['status', '--porcelain', '--', ...INPUTS]);
+  const source = {
+    app: 'KoboFlow TEST',
+    purpose: 'Device acceptance testing with fictional data. Not production.',
+    sourceRepository: 'uniqueapps-dev/KoboFlow',
+    sourceCommit: git(['rev-parse', 'HEAD']) || 'unknown',
+    sourceInputsCommitted: dirty === '',
+    version,
+    database: TEST_DB,
+    cacheNamespace: TEST_PREFIX,
+    inputs: Object.fromEntries(INPUTS.map(p => [p, sha256(read(p))])),
+    files: Object.fromEntries(files.map(([p, b]) => [p, sha256(b)])),
+  };
+  files.push(['SOURCE.json', Buffer.from(JSON.stringify(source, null, 2) + '\n')]);
+  return files;
+}
+
+function writeSite(dir) {
+  const target = path.resolve(dir);
+  if (target === ROOT || target.startsWith(ROOT + path.sep) && !target.startsWith(path.join(ROOT, 'dist') + path.sep))
+    throw new Error('build-test-file: write the test site outside the source tree (or under dist/)');
+  if (fs.existsSync(target) && fs.readdirSync(target).length && !fs.existsSync(path.join(target, 'SOURCE.json')))
+    throw new Error(`build-test-file: ${target} is not empty and was not created by this script; refusing to overwrite`);
+  const files = buildTestSite();
+  for (const [rel, buf] of files) {
+    const p = path.join(target, rel);
+    fs.mkdirSync(path.dirname(p), { recursive: true });
+    fs.writeFileSync(p, buf);
+  }
+  return files;
+}
+
+module.exports = { build, buildManifest, buildServiceWorker, buildTestSite, writeSite, TEST_PREFIX, PROD_PREFIX };
+
+if (require.main === module) {
+  const args = process.argv.slice(2);
+  if (args.includes('--site')) {
+    const dir = args[args.indexOf('--site') + 1];
+    if (!dir) { console.error('usage: node scripts/build-test-file.js --site <dir>'); process.exit(2); }
+    const files = writeSite(dir);
+    const src = JSON.parse(files.find(f => f[0] === 'SOURCE.json')[1]);
+    console.log(`wrote test site to ${dir}: ${files.length} files, source ${src.sourceCommit}${src.sourceInputsCommitted ? '' : ' (WITH UNCOMMITTED CHANGES)'}`);
+  } else {
+    const out = build(fs.readFileSync(SRC, 'utf8'));
+    if (args.includes('--check')) {
+      const cur = fs.existsSync(OUT) ? fs.readFileSync(OUT, 'utf8') : '';
+      if (cur !== out) { console.error('koboflow-test.html is missing or stale: run node scripts/build-test-file.js'); process.exit(1); }
+      console.log('koboflow-test.html is up to date');
+    } else {
+      fs.writeFileSync(OUT, out);
+      console.log('wrote', path.relative(ROOT, OUT), out.length, 'bytes');
+    }
+  }
+}

@@ -1,6 +1,6 @@
 {
   "name": "koboflow",
-  "version": "3.1.0",
+  "version": "3.2.0",
   "private": true,
   "description": "KoboFlow offline-first personal & business finance PWA (single file: koboflow.html)",
   "scripts": {
@@ -8,6 +8,8 @@
     "test:engine": "node --test tests/engine.test.js",
     "test:e2e": "node --test tests/e2e.test.js",
     "build:test-file": "node scripts/build-test-file.js",
-    "test:test-file": "node --test tests/test-build.test.js"
+    "test:test-file": "node --test tests/test-build.test.js",
+    "build:test-site": "node scripts/build-test-file.js --site dist/koboflow-test",
+    "test:pwa": "node --test tests/pwa.test.js"
   }
 }
