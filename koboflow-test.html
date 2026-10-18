@@ -42,10 +42,10 @@
       var F = w && w.IDBFactory, P = F && F.prototype;
       if (!P || Object.prototype.hasOwnProperty.call(P, '__kfGuard')) return;
       var open = P.open, del = P.deleteDatabase, list = P.databases;
-      function wrap(fn, op){ return function(name){ var n = String(name); if (n === LIVE) refuse(op + ' the live database'); var a = Array.prototype.slice.call(arguments); a[0] = n; return fn.apply(this, a); }; }
+      function wrap(fn, op){ return function(name){ var n = String(name); if (n === LIVE || n.indexOf(LIVE + '-pre-v4-') === 0) refuse(op + ' the live database or its safety copy'); var a = Array.prototype.slice.call(arguments); a[0] = n; return fn.apply(this, a); }; }
       lock(P, 'open', wrap(open, 'open'));
       lock(P, 'deleteDatabase', wrap(del, 'delete'));
-      if (typeof list === 'function') lock(P, 'databases', function(){ return list.apply(this, arguments).then(function(d){ return d.filter(function(x){ return x.name !== LIVE; }); }); });
+      if (typeof list === 'function') lock(P, 'databases', function(){ return list.apply(this, arguments).then(function(d){ return d.filter(function(x){ return x.name !== LIVE && x.name.indexOf(LIVE + '-pre-v4-') !== 0; }); }); });
       lock(P, '__kfGuard', true);
     } catch (e) {}
   }
@@ -117,11 +117,18 @@
 })(window);
 </script>
 <script>
-/* KoboFlow IDB Shim v3 — fully offline, no CDN, Android-safe.
-   v2 → v3 upgrade is additive only: existing stores and records are never
-   touched; new stores for financial agreements are created alongside. */
+/* KoboFlow IDB Shim v4 — fully offline, no CDN, Android-safe.
+   Every upgrade is additive only: existing stores and records are never touched; new stores
+   are created alongside (v3: financial agreements; v4: bills).
+   Before any upgrade of a database that holds records, a complete copy of it is written to a
+   separate database with the SAME older layout ("<name>-pre-v4-<timestamp>"), read back and
+   compared record by record. Only a verified copy lets the upgrade go ahead; otherwise nothing
+   is changed and the app stops with an explanation. An older KoboFlow cannot open a v4
+   database, but it can open the copy (?db=pre-v4-<timestamp>), and the copy can also be
+   downloaded as a normal backup file (Settings → Storage Check). Copies are never deleted
+   automatically. See docs/bills-and-database-v4.md. */
 (function(g){
-  var DB_VERSION  = 3;
+  var DB_VERSION  = 4;
   var STORES = ['transactions','loans','vlogs','ownerAnalytics','cashFlowSnapshots','roiSnapshots','runwaySnapshots'];
   /* v3 stores use stable string IDs supplied by the app (no autoIncrement) */
   var V3_STORES = {
@@ -132,15 +139,163 @@
     opportunities:   ['status'],
     meta:            []
   };
+  /* v4: bills (one-time and recurring). Occurrences are derived, never stored. */
+  var V4_STORES = { bills: ['status'] };
 
   var _db = null, _opening = null, _err = null;
   var DB_NAME = "KoboFlowDB-test", TEST_DB = 'test'; // TEST BUILD: fixed, cannot be changed
   g.__kfDbName = DB_NAME; g.__kfTestDb = TEST_DB;
 
+  /* ── Pre-upgrade safety copy ── */
+  var _upgrade = null;
+  function slice(list) { return Array.prototype.slice.call(list || []); }
+  function stamp() { var d = new Date(), p = function(n){ return (n < 10 ? '0' : '') + n; };
+    return d.getUTCFullYear() + p(d.getUTCMonth() + 1) + p(d.getUTCDate()) + p(d.getUTCHours()) + p(d.getUTCMinutes()) + p(d.getUTCSeconds()); }
+  /* Content fingerprint of a copy (FNV-1a over its layout and records, stores in name order).
+     For detecting an incomplete or later-edited copy, not for security. */
+  function fingerprint(meta, data) {
+    var str = JSON.stringify(Object.keys(data).sort().map(function(n){ return [n, meta && meta[n], data[n]]; })), h = 0x811c9dc5;
+    for (var i = 0; i < str.length; i++) { h ^= str.charCodeAt(i); h = Math.imul(h, 0x01000193) >>> 0; }
+    return ('0000000' + h.toString(16)).slice(-8) + ':' + str.length;
+  }
+  /* Register of verified copies, kept outside the database being upgraded (so the original is
+     not modified before its upgrade). If browser storage refuses it, copies are still found by
+     name, shown as "not verified". */
+  var REG_KEY = 'kfRecoveryCopies:' + DB_NAME;
+  function registry() { try { var r = JSON.parse(g.localStorage.getItem(REG_KEY) || '[]'); return Array.isArray(r) ? r : []; } catch (x) { return []; } }
+  function register(entry) { try { var r = registry().filter(function(e){ return e.name !== entry.name; }); r.push(entry); g.localStorage.setItem(REG_KEY, JSON.stringify(r)); return true; } catch (x) { return false; } }
+  function readAll(database, names, cb) {
+    try {
+      var tx = database.transaction(names, 'readonly'), out = {}, meta = {};
+      names.forEach(function(n){
+        var st = tx.objectStore(n);
+        meta[n] = { keyPath: st.keyPath, autoIncrement: st.autoIncrement,
+          indexes: slice(st.indexNames).map(function(ix){ var i = st.index(ix); return { name: i.name, keyPath: i.keyPath, unique: i.unique, multiEntry: i.multiEntry }; }) };
+        var r = st.getAll(); r.onsuccess = function(){ out[n] = r.result; };
+      });
+      tx.oncomplete = function(){ cb(null, out, meta); };
+      tx.onerror = tx.onabort = function(){ cb(tx.error || new Error('read failed')); };
+    } catch (err) { cb(err); }
+  }
+  /* Writes the copy into a database this call has just CREATED. If the name is already taken
+     (e.g. two attempts in the same second), the next name is tried; an existing database is never
+     written to, overwritten or deleted. Only a half-made copy created here is removed. */
+  function writeCopy(version, meta, data, cb, attempt, ts) {
+    attempt = attempt || 1; ts = ts || stamp();
+    var name = DB_NAME + '-pre-v4-' + ts + (attempt > 1 ? '-' + attempt : ''), names = Object.keys(meta), req, created = false;
+    // A half-made copy created here is removed before the failure is reported (so it is never
+    // mistaken for a usable copy). If removal is refused it is left, and listed as "not verified".
+    function fail(err) {
+      var e = err || new Error('the copy could not be written');
+      if (!created) { cb(e); return; }
+      var settled = false, del; function done(){ if (!settled) { settled = true; cb(e); } }
+      try { del = indexedDB.deleteDatabase(name); del.onsuccess = del.onerror = del.onblocked = done; } catch (x) { done(); }
+    }
+    function taken() { if (attempt >= 9) { cb(new Error('no free name for the copy')); return; } writeCopy(version, meta, data, cb, attempt + 1, ts); }
+    if (names.some(function(n){ return typeof meta[n].keyPath !== 'string'; })) { cb(new Error('a store without an inline key cannot be copied safely')); return; }
+    try { req = indexedDB.open(name, version); } catch (ex) { cb(ex); return; }
+    req.onupgradeneeded = function(e) {
+      if (e.oldVersion !== 0) { try { e.target.transaction.abort(); } catch (x) {} return; } // exists already: not ours
+      created = true;
+      var bd = e.target.result;
+      names.forEach(function(n){ var m = meta[n], st = bd.createObjectStore(n, { keyPath: m.keyPath, autoIncrement: m.autoIncrement });
+        m.indexes.forEach(function(ix){ st.createIndex(ix.name, ix.keyPath, { unique: ix.unique, multiEntry: ix.multiEntry }); }); });
+    };
+    req.onsuccess = function(e) {
+      var bd = e.target.result;
+      if (!created) { bd.close(); taken(); return; }
+      try {
+        var tx = bd.transaction(names, 'readwrite');
+        tx.onerror = tx.onabort = function(){ bd.close(); fail(tx.error); };
+        try { names.forEach(function(n){ var st = tx.objectStore(n); data[n].forEach(function(r){ st.put(r); }); }); }
+        catch (werr) { tx.onerror = tx.onabort = null; try { tx.abort(); } catch (x) {} bd.close(); fail(werr); return; }
+        tx.oncomplete = function() {
+          readAll(bd, names, function(err, back, backMeta) {
+            bd.close();
+            if (err) { fail(err); return; }
+            // Same stores, same keys and indexes, same records, in the same order.
+            var sameLayout = JSON.stringify(names.map(function(n){ return backMeta[n]; })) === JSON.stringify(names.map(function(n){ return meta[n]; }));
+            var same = sameLayout && names.every(function(n){ return JSON.stringify(back[n]) === JSON.stringify(data[n]); });
+            if (!same) { fail(new Error('the copy did not match when read back')); return; }
+            var counts = {}; names.forEach(function(n){ counts[n] = data[n].length; });
+            var fp = fingerprint(meta, data);
+            register({ name: name, version: version, at: new Date().toISOString(), counts: counts, fingerprint: fp, verified: true });
+            cb(null, name, fp);
+          });
+        };
+      } catch (err) { bd.close(); fail(err); }
+    };
+    req.onerror = function(e) {
+      if (e && e.preventDefault) e.preventDefault();
+      if (!created && e.target.error && (e.target.error.name === 'AbortError' || e.target.error.name === 'VersionError')) { taken(); return; }
+      fail(e.target.error);
+    };
+  }
+  /* Looks at the database as it is (no upgrade). Fresh install: nothing to protect. Already
+     current: nothing to do. Older with records: copy, verify, then allow the upgrade. */
+  function preUpgrade(cb) {
+    var probe, fresh = false;
+    try { probe = indexedDB.open(DB_NAME); } catch (ex) { cb(ex); return; }
+    probe.onupgradeneeded = function(e) { if (e.oldVersion === 0) { fresh = true; try { e.target.transaction.abort(); } catch (x) {} } };
+    probe.onsuccess = function(e) {
+      var d = e.target.result, v = d.version, names = slice(d.objectStoreNames);
+      if (v >= DB_VERSION || !names.length) { d.close(); cb(null); return; }
+      readAll(d, names, function(err, data, meta) {
+        d.close();
+        if (err) { cb(err); return; }
+        var counts = {}, total = 0;
+        names.forEach(function(n){ counts[n] = data[n].length; total += data[n].length; });
+        if (!total) { cb(null); return; }
+        g.__kfPreUpgradeData = { version: v, data: data };
+        writeCopy(v, meta, data, function(err2, copyName, fp) {
+          if (err2) { cb(err2, v, 'copy'); return; }
+          _upgrade = { id: 'dbUpgradeV4', from: v, to: DB_VERSION, at: new Date().toISOString(), copyDb: copyName, fingerprint: fp, counts: counts, verified: true };
+          cb(null);
+        });
+      });
+    };
+    probe.onerror = function(e) { if (fresh) { if (e && e.preventDefault) e.preventDefault(); cb(null); return; } cb(e.target.error); };
+    probe.onblocked = function() { cb(new Error('KoboFlow is open in another tab. Close other tabs and reload.')); };
+  }
+  /* After the upgrade: every record that was copied must still be in the upgraded database
+     (otherwise stop: that would be loss). Records added or edited in the meantime (e.g. by an
+     older KoboFlow tab before it let go of the database) are kept and reported: the copy then
+     holds the data as it was just before, and is a little older than the upgraded database. */
+  function checkAfterUpgrade(database, done) {
+    if (!_upgrade) { done(null); return; }
+    var names = Object.keys(_upgrade.counts), before = (g.__kfPreUpgradeData || {}).data || {};
+    readAll(database, names, function(err, data) {
+      if (err) { done(err); return; }
+      var lost = [], changed = 0;
+      names.forEach(function(n){
+        var now = {}; (data[n] || []).forEach(function(r){ now[JSON.stringify(r.id)] = JSON.stringify(r); });
+        (before[n] || []).forEach(function(r){ var k = JSON.stringify(r.id); if (!(k in now)) lost.push(n); else if (now[k] !== JSON.stringify(r)) changed++; });
+        if ((data[n] || []).length !== (before[n] || []).length) changed++;
+      });
+      if (lost.length) { done(new Error('records copied before the upgrade are missing from ' + lost.filter(function(x, i){ return lost.indexOf(x) === i; }).join(', '))); return; }
+      _upgrade.copyMatchesUpgraded = !changed;
+      g.__kfUpgradeInfo = _upgrade;
+      try { var tx = database.transaction(['meta'], 'readwrite'); tx.objectStore('meta').put(_upgrade); tx.oncomplete = function(){ done(null); }; tx.onerror = tx.onabort = function(){ done(null); }; }
+      catch (x) { done(null); }
+    });
+  }
+
   function openDB(cb) {
     if (_db) { cb(_db); return; }
     if (_opening) { _opening.push(cb); return; }
     _opening = [cb];
+    preUpgrade(function(perr, fromV, stage) {
+      // Opening or reading the existing database failed: a genuine storage failure, reported as such.
+      if (perr && stage !== 'copy') { _err = perr; console.error('KoboFlow IDB open error:', _err); flush(null); return; }
+      if (perr) {
+        _err = new Error('Upgrade paused: KoboFlow could not make a verified safety copy of ' + DB_NAME + ' before upgrading it to version ' + DB_VERSION + ' (' + (perr.message || perr) + '). Nothing was changed: your data is still in version ' + (fromV || 'its current version') + '. Free some storage space, close other KoboFlow tabs, or download a copy of your data, then reload.');
+        g.__kfUpgradePaused = true;
+        flush(null); return;
+      }
+      openCurrent();
+    });
+  }
+  function openCurrent() {
     var req;
     try { req = indexedDB.open(DB_NAME, DB_VERSION); }
     catch (ex) { _err = ex; flush(null); return; }
@@ -157,24 +312,33 @@
           }
         }
       }
-      for (var name in V3_STORES) {
-        if (!database.objectStoreNames.contains(name)) {
-          var st = database.createObjectStore(name, {keyPath:'id'});
-          V3_STORES[name].forEach(function(ix){ st.createIndex(ix, ix, {unique:false}); });
+      [V3_STORES, V4_STORES].forEach(function(group){
+        for (var name in group) {
+          if (!database.objectStoreNames.contains(name)) {
+            var st = database.createObjectStore(name, {keyPath:'id'});
+            group[name].forEach(function(ix){ st.createIndex(ix, ix, {unique:false}); });
+          }
         }
-      }
+      });
     };
     req.onblocked = function() {
       _err = new Error('KoboFlow is open in another tab. Close other tabs to finish the upgrade.');
       if (g.__kfOnBlocked) g.__kfOnBlocked(_err);
     };
     req.onsuccess = function(e) {
-      _db = e.target.result;
-      _db.onversionchange = function(){ _db.close(); _db = null; };
-      flush(_db);
+      var database = e.target.result;
+      checkAfterUpgrade(database, function(cerr) {
+        if (cerr) { database.close(); _err = new Error('After upgrading, KoboFlow could not confirm every record is present (' + cerr.message + '). Do not enter new data. Your safety copy is ' + (_upgrade && _upgrade.copyDb) + '.'); flush(null); return; }
+        _db = database;
+        _db.onversionchange = function(){ _db.close(); _db = null; };
+        flush(_db);
+      });
     };
     req.onerror = function(e) {
       _err = e.target.error;
+      // An upgrade that fails part-way is rolled back by IndexedDB as a whole: nothing is half-changed.
+      if (_upgrade && _err && _err.name !== 'VersionError') _err = new Error('The upgrade to database version ' + DB_VERSION + ' did not complete (' + (_err.message || _err.name) + '). IndexedDB rolled it back, so your data is unchanged (still version ' + _upgrade.from + '). A verified safety copy was kept in ' + _upgrade.copyDb + '. Reload to try again.');
+      if (_err && _err.name === 'VersionError') _err = new Error('This database (' + DB_NAME + ') was created by a newer KoboFlow version. This version cannot open it. Nothing was changed. Use the newer KoboFlow, or see the recovery steps for older versions.');
       console.error('KoboFlow IDB open error:', _err);
       flush(null);
     };
@@ -249,12 +413,51 @@
     });
   }
 
+  /* Reads a pre-upgrade copy for download. Never creates or changes a database. */
+  function readCopy(name) {
+    return new Promise(function(resolve, reject) {
+      var req, created = false;
+      try { req = indexedDB.open(name); } catch (ex) { reject(ex); return; }
+      req.onupgradeneeded = function(e) { if (e.oldVersion === 0) { created = true; try { e.target.transaction.abort(); } catch (x) {} } };
+      req.onsuccess = function(e) { var d = e.target.result, names = slice(d.objectStoreNames);
+        readAll(d, names, function(err, data, meta) { var v = d.version; d.close(); if (err) reject(err); else resolve({ name: name, version: v, data: data, fingerprint: fingerprint(meta, data) }); }); };
+      req.onerror = function(e) { if (e && e.preventDefault) e.preventDefault(); reject(created ? new Error('No copy named ' + name + ' exists on this device.') : e.target.error); };
+    });
+  }
+
+  /* Every pre-upgrade copy of this database on the device: those in the register and any other
+     database with the copy prefix (e.g. left by a closed tab). Each is read (never changed) and
+     given a status: verified (unchanged since it was verified), changed (edited since, e.g. opened
+     in an older KoboFlow), unverified (no record that it was completed), or missing. */
+  function listCopies(known) {
+    // `known`: verified copies recorded elsewhere (the upgrade record in the upgraded database).
+    var reg = registry().concat((known || []).filter(function(k){ return k && k.name && k.fingerprint; })), prefix = DB_NAME + '-pre-v4-';
+    reg = reg.filter(function(e, i){ return reg.findIndex(function(x){ return x.name === e.name; }) === i; });
+    var names = reg.map(function(e){ return e.name; }).filter(function(n){ return n.indexOf(prefix) === 0; });
+    var listing = (g.indexedDB && typeof indexedDB.databases === 'function') ? indexedDB.databases().catch(function(){ return null; }) : Promise.resolve(null);
+    return listing.then(function(dbs) {
+      var present = dbs ? dbs.filter(function(d){ return d.name.indexOf(prefix) === 0; }).map(function(d){ return d.name; }) : null;
+      (present || []).forEach(function(n){ if (names.indexOf(n) < 0) names.push(n); });
+      names.sort();
+      return Promise.all(names.map(function(n) {
+        var r = reg.find(function(e){ return e.name === n; }) || null;
+        if (present && present.indexOf(n) < 0) return { name: n, status: 'missing', registered: r };
+        return readCopy(n).then(function(c) {
+          var total = Object.keys(c.data).reduce(function(t, k){ return t + c.data[k].length; }, 0);
+          return { name: n, version: c.version, records: total, registered: r, status: !r ? 'unverified' : r.fingerprint === c.fingerprint ? 'verified' : 'changed' };
+        }, function() { return { name: n, status: r ? 'missing' : 'unreadable', registered: r }; });
+      })).then(function(list){ return { copies: list, listedByName: !!present }; });
+    });
+  }
+
   function KoboDB() {
     var self = this;
-    STORES.concat(Object.keys(V3_STORES)).forEach(function(n){ self[n] = makeTable(n); });
+    STORES.concat(Object.keys(V3_STORES), Object.keys(V4_STORES)).forEach(function(n){ self[n] = makeTable(n); });
     this.atomic  = atomic;
     this.info    = info;
     this.snapshot= snapshot;
+    this.readCopy= readCopy;
+    this.listCopies = listCopies;
     this.verno   = DB_VERSION;
     this.name    = DB_NAME;
     this.testName= TEST_DB;
@@ -618,7 +821,8 @@ var LEGACY_ACCOUNTS={pharma_cash:'Pharmacy Cash',pharma_bank:'Pharmacy Bank',per
    are "restricted" by default. A per-account access setting ('immediate'|'restricted')
    overrides the default either way. Restricted money is still an asset (net worth).
    Earmarks are reported, never subtracted from a balance: "unearmarked" is what is left in
-   available accounts after earmarks, never below zero per account; any account whose earmarks
+   available accounts after earmarks, never below zero per account unless the balance itself is
+   negative (that counts in full, so free-to-use never exceeds Cash Now); any account whose earmarks
    exceed its balance is listed in overEarmarked. */
 var AVAILABLE_KINDS={cash:1,bank:1,wallet:1};
 function accountAccess(a){
@@ -636,7 +840,9 @@ function cashPosition(accounts,buckets){
   var earAv=0,earRe=0,freeK=0,over=[],out={};
   Object.keys(by).forEach(function(id){
     var p=by[id];
-    if(p.access==='immediate'){earAv+=p.earK;freeK+=Math.max(0,p.balanceK-p.earK);}else earRe+=p.earK;
+    // Over-earmarking never makes free money negative (an earmark is not debt), but a negative
+    // balance does: free-to-use can never exceed Cash Now.
+    if(p.access==='immediate'){earAv+=p.earK;freeK+=p.balanceK<0?p.balanceK:Math.max(0,p.balanceK-p.earK);}else earRe+=p.earK;
     if(p.earK>0&&p.earK>p.balanceK)over.push({id:id,label:p.label,balance:fromK(p.balanceK),earmarked:fromK(p.earK),shortBy:fromK(p.earK-p.balanceK)});
     out[id]={access:p.access,balance:fromK(p.balanceK),earmarked:fromK(p.earK)};
   });
@@ -648,10 +854,185 @@ function cashPosition(accounts,buckets){
    so Pressure, Calendar, Autopilot and Opportunity Analysis never imply more spendable money than
    exists. Gross Cash Now and the earmarked amount are returned for display only. Earmarks and
    obligations are each subtracted once; an earmark is not linked to a particular obligation. */
-function cashCover(position,due){
-  var p=position||{},freeK=toK(p.unearmarked),dueK=toK(due);
+function cashCover(position,due,covered){
+  var p=position||{},freeK=toK(p.unearmarked),dueK=toK(due),covK=Math.min(dueK,Math.max(0,toK(covered||0))),unK=dueK-covK;
   return{cashNow:fromK(toK(p.available)),earmarked:fromK(toK(p.earmarked)),freeToUse:fromK(freeK),due:fromK(dueK),
-    leftAfter:fromK(freeK-dueK),pressure:freeK>0?Math.min(100,Math.round(dueK/freeK*100)):dueK>0?100:0};
+    covered:fromK(covK),uncovered:fromK(unK),leftAfter:fromK(freeK-unK),pressure:freeK>0?Math.min(100,Math.round(unK/freeK*100)):unK>0?100:0};
+}
+/* Reservations: an earmark is either general-purpose or linked to one obligation source
+   (reservedFor 'agr:<agreementId>' for a loan's unpaid instalments, or 'bill:<billId>' for a
+   bill's unpaid occurrences). Nothing here is stored; it is
+   recomputed from the saved earmarks, balances and instalment states every time:
+   - A linked earmark reserves at most what is still owed on its target (several earmarks for the
+     same target share that limit), so once an instalment is paid its reservation stops counting
+     automatically: never released twice, never left behind as a phantom deduction.
+   - Within each account, earmarks are funded in the order saved, up to the account balance.
+   - Only funded money in an immediately available account covers an obligation; it is applied to
+     the target's instalments by due date. Covered amounts are already outside free-to-use cash
+     (earmarked), so cashCover subtracts only the uncovered part of an obligation: nothing twice.
+   Statuses: general, linked, no_outstanding (target fully paid/settled/unknown), restricted_source. */
+function reservationPlan(accounts,buckets,obligations){
+  var acc={},byT={},oblLeft={},tLeft={},coverage={},out=[];
+  (accounts||[]).forEach(function(a){acc[a.id]={access:accountAccess(a),leftK:Math.max(0,toK(a.balance!==undefined?a.balance:a.opening))};});
+  (obligations||[]).forEach(function(o){
+    var k=o&&(o.target||(o.agreementId?'agr:'+o.agreementId:''));
+    if(!k||!(toK(o.remaining)>0))return;(byT[k]=byT[k]||[]).push(o);oblLeft[o.id]=toK(o.remaining);tLeft[k]=(tLeft[k]||0)+toK(o.remaining);
+  });
+  Object.keys(byT).forEach(function(k){byT[k].sort(function(a,b){return a.dueDate<b.dueDate?-1:a.dueDate>b.dueDate?1:0;});});
+  (buckets||[]).forEach(function(b){
+    var amtK=Math.max(0,toK(b.amount)),rf=String(b.reservedFor||''),effK=amtK,status='general',fundedK=0,covK=0,a=acc[b.parentId];
+    if(rf){var left=tLeft[rf]||0;effK=Math.min(amtK,left);tLeft[rf]=left-effK;status=effK>0?'linked':'no_outstanding';}
+    if(a&&a.access==='immediate'){fundedK=Math.min(effK,a.leftK);a.leftK-=fundedK;}
+    if(status==='linked'){
+      if(!a||a.access!=='immediate')status='restricted_source';
+      else{var pool=fundedK;(byT[rf]||[]).forEach(function(o){var take=Math.min(pool,oblLeft[o.id]);if(take>0){oblLeft[o.id]-=take;pool-=take;covK+=take;coverage[o.id]=fromK(toK(coverage[o.id]||0)+take);}});}
+    }
+    out.push({id:b.id,label:b.label,parentId:b.parentId,reservedFor:rf,status:status,amount:fromK(amtK),effective:fromK(effK),funded:fromK(fundedK),covers:fromK(covK)});
+  });
+  return{buckets:out,effective:out.map(function(x){return{id:x.id,label:x.label,parentId:x.parentId,amount:x.effective};}),coverage:coverage};
+}
+/* ── Bills (database v4) ──
+   A bill record is the definition: {id, name, cat, amount, firstDue, repeat, until?, status,
+   cancelledFrom?, amountChanges:[{from, amount}], overrides:{dueDate:{skipped, reason, at}}}.
+   Occurrences are DERIVED from it, never stored: occurrence id = billId + '@' + dueDate, so a
+   reload, restart or retry can never create a second copy. A payment is an ordinary recorded
+   transaction ("Bill paid", type obligation) carrying billId and billOcc; what is paid on an
+   occurrence is the sum of its non-voided payments. A bill falling due is not a cash outflow;
+   only the recorded payment is. Rules:
+   - monthly/quarterly/yearly dates keep the first due day, clamped to the month's last day
+     (31 Jan → 28/29 Feb → 31 Mar); weekly adds 7 days;
+   - an amount change applies from its date onward; earlier occurrences keep their amount;
+   - cancelling stops occurrences due on/after cancelledFrom; earlier unpaid ones stay owed
+     (an individual occurrence can be marked "not owed" (skipped), with a reason);
+   - once a bill has a payment, its first due date and repeat cannot change (payments would
+     lose their occurrence). */
+var BILL_REPEAT={none:'One-time',weekly:'Weekly',monthly:'Monthly',quarterly:'Every 3 months',yearly:'Yearly'};
+function billDueDates(b,until){
+  var out=[],f=parseDate(b&&b.firstDue);if(!f)return out;
+  var rep=BILL_REPEAT[b.repeat]?b.repeat:'none',end=b.until&&b.until<until?b.until:until,day=f.getDate();
+  for(var i=0;i<600;i++){
+    var d;
+    if(rep==='none'){if(i>0)break;d=String(b.firstDue).slice(0,10);}
+    else if(rep==='weekly')d=addDays(b.firstDue,7*i);
+    else{var step=rep==='monthly'?1:rep==='quarterly'?3:12,tm=f.getMonth()+step*i,y=f.getFullYear()+Math.floor(tm/12),m=tm%12;
+      d=fmtDate(new Date(y,m,Math.min(day,new Date(y,m+1,0).getDate())));}
+    if(d>end)break;out.push(d);
+  }
+  return out;
+}
+function billAmountOn(b,due){
+  var amt=num(b.amount)||0;
+  (b.amountChanges||[]).slice().sort(function(x,y){return x.from<y.from?-1:1;}).forEach(function(c){if(c.from<=due&&num(c.amount)>0)amt=num(c.amount);});
+  return amt;
+}
+function billPaid(txns,billId,occId){return sum((txns||[]).filter(function(t){return t&&!t.voided&&!t.demo&&t.billId===billId&&t.billOcc===occId;}),function(t){return toK(t.amount);});}
+function billOccurrences(b,txns,opts){
+  opts=opts||{};var td=opts.today||today(),until=opts.until||addDays(td,90),ov=b.overrides||{};
+  return billDueDates(b,until).map(function(due){
+    var id=b.id+'@'+due,amtK=toK(billAmountOn(b,due)),paidK=billPaid(txns,b.id,id),remK=Math.max(0,amtK-paidK),d=daysBetween(td,due),status;
+    if(ov[due]&&ov[due].skipped){status='skipped';remK=0;}
+    else if(b.status==='cancelled'&&b.cancelledFrom&&due>=b.cancelledFrom){status='cancelled';remK=0;}
+    else if(remK<=0)status='paid';
+    else if(d<0)status='overdue';
+    else if(d===0)status='due_today';
+    else if(paidK>0)status='partial';
+    else if(d<=7)status='due_soon';
+    else status='upcoming';
+    return{id:id,billId:b.id,label:b.name,cat:b.cat||'',dueDate:due,days:d,amount:fromK(amtK),paid:fromK(paidK),remaining:fromK(remK),overpaid:fromK(Math.max(0,paidK-amtK)),status:status};
+  });
+}
+/* Unpaid occurrences of every bill, due up to `until`, as obligation entries (same shape as loan
+   instalments; target 'bill:<id>' for linked earmarks). */
+function billObligations(bills,txns,opts){
+  var out=[];
+  (bills||[]).forEach(function(b){billOccurrences(b,txns,opts).forEach(function(o){
+    if(o.remaining>0)out.push({id:o.id,dueDate:o.dueDate,remaining:o.remaining,label:o.label,kind:'bill',billId:o.billId,target:'bill:'+o.billId,status:o.status,source:'Bill'});
+  });});
+  return out;
+}
+/* Payments that point at a bill or occurrence that does not exist (e.g. a deleted schedule). */
+function billUnmatchedPayments(bills,txns,opts){
+  var ids={};(bills||[]).forEach(function(b){billOccurrences(b,txns,{today:(opts||{}).today,until:'9999-12-31'}).forEach(function(o){ids[o.id]=1;});});
+  return(txns||[]).filter(function(t){return t&&!t.voided&&!t.demo&&t.billId&&!ids[t.billOcc];});
+}
+function validateBill(b,opts){
+  opts=opts||{};var errors=[];b=b||{};
+  if(!String(b.name||'').trim())errors.push('Give the bill a name.');
+  if(!(num(b.amount)>0))errors.push('Enter the amount (more than 0).');
+  if(!parseDate(b.firstDue))errors.push('Choose the first due date.');
+  if(!BILL_REPEAT[b.repeat])errors.push('Choose how often it repeats.');
+  if(b.until&&(!parseDate(b.until)||(parseDate(b.firstDue)&&b.until<b.firstDue)))errors.push('The end date must be on or after the first due date.');
+  (b.amountChanges||[]).forEach(function(c){if(!parseDate(c.from)||!(num(c.amount)>0))errors.push('Each amount change needs a date and an amount above 0.');});
+  var prev=opts.previous;
+  if(prev&&opts.hasPayments&&(prev.firstDue!==b.firstDue||prev.repeat!==b.repeat))errors.push('This bill already has payments, so its first due date and repeat cannot change. Cancel it and add a new bill instead.');
+  return{ok:!errors.length,errors:errors};
+}
+function coveredAmount(obligations,coverage){return fromK(sum(obligations||[],function(o){return Math.min(toK(o.remaining),toK((coverage||{})[o.id]||0));}));}
+/* Records that can distort recommendations. Never rewrites anything; each item says what to check. */
+function dataQuality(o){
+  o=o||{};var td=o.today||today(),ids={},al=o.aliases||{},out=[],live=(o.txns||[]).filter(function(t){return t&&!t.demo&&!t.voided;});
+  (o.accountIds||[]).forEach(function(id){ids[id]=1;});
+  function res(x){var r=al[x]!==undefined&&al[x]!==null?al[x]:x;return r;}
+  function add(key,severity,list,text){if(list.length)out.push({key:key,severity:severity,count:list.length,ids:list.map(function(t){return t.id;}),text:text(list.length)});}
+  add('needs_review','high',live.filter(function(t){return t.state==='Needs Review';}),function(n){return n+' entr'+(n>1?'ies need':'y needs')+' review: the category or account may be wrong.';});
+  add('future_dated','medium',live.filter(function(t){return(t.date||'')>td;}),function(n){return n+' entr'+(n>1?'ies are':'y is')+' dated in the future. Future-dated entries already move balances; check the dates.';});
+  add('unmapped_account','high',live.filter(function(t){var bad=false;[t.fromAcct,t.toAcct].forEach(function(x){if(x){var r=res(x);if(!r||!ids[r])bad=true;}});return bad;}),function(n){return n+' entr'+(n>1?'ies use':'y uses')+' an account that is not set up or is set to "Not used": '+(n>1?'they move':'it moves')+' no balance.';});
+  add('missing_account','high',live.filter(function(t){var c=classifyTxn(t);return(c.cashIn>0&&!t.toAcct)||((c.cashOut>0||c.ownerOut>0)&&!t.fromAcct);}),function(n){return n+' entr'+(n>1?'ies have':'y has')+' no account, so '+(n>1?'they are':'it is')+' not in any balance.';});
+  var g={};live.forEach(function(t){if(t.agreementId)return;var k=[t.date,toK(t.amount),t.type,String(t.desc||'').trim().toLowerCase(),t.fromAcct||'',t.toAcct||''].join('|');(g[k]=g[k]||[]).push(t);});
+  var dups=[];Object.keys(g).forEach(function(k){if(g[k].length>1)dups=dups.concat(g[k].slice(1));});
+  add('possible_duplicates','medium',dups,function(n){return n+' entr'+(n>1?'ies look':'y looks')+' like a repeat of another (same date, amount, type, description and accounts). Check before relying on the totals.';});
+  if(parseDate(o.baselineDate))add('pre_baseline','info',live.filter(function(t){return(t.date||'')<o.baselineDate;}),function(n){return n+' entr'+(n>1?'ies are':'y is')+' dated before your baseline: kept in history, not in balances.';});
+  return out;
+}
+/* Monthly budgets the user configured. Expenses only (bills paid count as expenses); voided excluded. */
+function budgetProgress(budgets,txns,from,to){
+  return(budgets||[]).map(function(b){
+    var usedK=sum((txns||[]).filter(function(t){return t&&!t.demo&&!t.voided&&t.cat===b.cat&&(t.date||'')>=from&&(t.date||'')<=to;}),function(t){return toK(classifyTxn(t).expense);});
+    var amtK=toK(b.amount);return{id:b.id,cat:b.cat,amount:fromK(amtK),used:fromK(usedK),left:fromK(amtK-usedK),pct:amtK>0?Math.round(usedK/amtK*100):0};
+  });
+}
+/* Daily Money Director. Inputs are figures the shared engine already produced; nothing is
+   estimated. Ranking: overdue first (already late), then a shortfall against known payments,
+   then payments due within 7 days, then payments due within 30 days that are not yet reserved,
+   then the working-capital floor, over-earmarking, records that distort the figures, and setup
+   gaps. No percentage split is ever applied: money left after all of that is reported as free. */
+function naira(k){return'\u20A6'+Math.round(fromK(k)).toLocaleString('en-NG');}
+var DIRECTOR_ORDER=['overdue','shortfall','due_soon','reserve','floor_breach','over_earmark','stale_reservation','data_quality','set_floor','free'];
+function directorPlan(o){
+  o=o||{};var td=o.today||today(),freeK=toK(o.freeToUse),runK=freeK,actions=[],obls=[];
+  (o.obligations||[]).slice().sort(function(a,b){return a.dueDate<b.dueDate?-1:a.dueDate>b.dueDate?1:0;}).forEach(function(x){
+    var remK=toK(x.remaining),covK=Math.min(remK,toK(x.covered||0)),gapK=remK-covK,fromFreeK=Math.min(gapK,Math.max(0,runK));runK-=gapK;
+    obls.push({id:x.id,label:x.label,dueDate:x.dueDate,days:daysBetween(td,x.dueDate),agreementId:x.agreementId||null,billId:x.billId||null,remaining:fromK(remK),covered:fromK(covK),gap:fromK(gapK),
+      fromFree:fromK(fromFreeK),short:fromK(gapK-fromFreeK),funding:covK>=remK?'funded':covK>0?'partly':'unfunded'});
+  });
+  var dueK=sum(obls,function(x){return toK(x.remaining);}),covK=sum(obls,function(x){return toK(x.covered);}),gapK=dueK-covK,afterK=freeK-gapK;
+  var floorSet=o.floor!==null&&o.floor!==undefined&&num(o.floor)!==null&&num(o.floor)>0,floorK=floorSet?toK(o.floor):0,safeK=Math.max(0,afterK-floorK);
+  function lnk(x){return x.agreementId?{agreementId:x.agreementId}:x.billId?{screen:'bills'}:null;}
+  function act(kind,title,amount,why,consequence,link){actions.push({kind:kind,title:title,amount:amount===null?null:fromK(amount),why:why,consequence:consequence,link:link||null});}
+  obls.forEach(function(x){if(x.days<0&&toK(x.gap)>0)act('overdue','Pay '+x.label+': '+(-x.days)+' day'+(x.days<-1?'s':'')+' overdue',toK(x.gap),
+    'Overdue payments come first: they are already late and can add charges.',toK(x.short)>0?'Free cash does not cover all of it: '+naira(toK(x.short))+' is still missing.':'Free cash covers it; spending that money elsewhere leaves this payment late.',lnk(x));});
+  if(afterK<0){var first=obls.find(function(x){return toK(x.short)>0;});
+    act('shortfall','Shortfall of '+naira(-afterK)+' against payments due in 30 days',-afterK,
+      'Known payments not covered by reservations exceed your free-to-use cash.'+(first?' The first payment that cannot be met in full is '+first.label+' on '+first.dueDate+'.':''),
+      'Any discretionary spending now makes the shortfall bigger. Restricted money (coop, fixed deposit) is not counted as available.',null);}
+  obls.forEach(function(x){if(x.days>=0&&x.days<=7&&toK(x.gap)>0)act('due_soon','Set aside '+naira(toK(x.gap))+' for '+x.label+' due '+x.dueDate,toK(x.gap),
+    'Due within 7 days'+(x.funding==='partly'?'; a reservation already covers '+naira(toK(x.covered))+'.':'.'),toK(x.short)>0?'Free cash covers only part of it.':'Free cash covers it if nothing else is spent first.',lnk(x));});
+  obls.forEach(function(x){if(x.days>7&&toK(x.gap)>0)act('reserve','Reserve '+naira(toK(x.gap))+' for '+x.label+' due '+x.dueDate,toK(x.gap),
+    'Due within 30 days and not yet reserved. A linked earmark (Settings → Accounts) keeps the money from being spent.',toK(x.short)>0?'Free cash does not cover it at present.':'Without a reservation this money still counts as spendable until the due date approaches.',lnk(x));});
+  if(floorSet&&afterK<floorK)act('floor_breach','Protect pharmacy working capital: '+naira(floorK-Math.max(0,afterK))+' below your floor',floorK-Math.max(0,afterK),
+    'You set a working-capital floor of '+naira(floorK)+' to keep money for restocking. Free cash after known payments is '+naira(afterK)+'.','Spending below the floor uses money meant for stock.',null);
+  (o.overEarmarked||[]).forEach(function(e){act('over_earmark','Earmarks in '+e.label+' exceed its balance by '+naira(toK(e.shortBy)),toK(e.shortBy),'An earmark cannot reserve money the account does not hold, so part of it is not real.','Reduce the earmark or move money into '+e.label+'.',{screen:'settings'});});
+  (o.staleReservations||[]).forEach(function(b){act('stale_reservation','Earmark "'+b.label+'" is no longer needed',null,'Its loan has nothing left to pay, so it no longer reserves any money.','Remove it in Settings → Accounts to tidy up; it is already ignored in the figures.',{screen:'settings'});});
+  (o.quality||[]).forEach(function(q){if(q.severity==='high')act('data_quality',q.text,null,'These records affect the figures above: until they are fixed, the figures may be wrong.','Recommendations stay qualified until this is fixed.',{screen:q.key==='needs_review'?'inbox':'timeline'});});
+  if(!floorSet)act('set_floor','Set a working-capital floor',null,'No floor is set, so nothing protects pharmacy restocking money in these figures.','Until you set one, "free to allocate" includes money you may need for stock.',{screen:'settings'});
+  if(safeK>0&&afterK>=0)act('free',naira(safeK)+' can go to other purposes',safeK,
+    'This is free-to-use cash after every known payment due in 30 days'+(floorSet?' and your working-capital floor.':'. No working-capital floor is set.'),'Payments due after 30 days, and income you have not recorded, are not included.',null);
+  actions.sort(function(a,b){return DIRECTOR_ORDER.indexOf(a.kind)-DIRECTOR_ORDER.indexOf(b.kind);});
+  actions.forEach(function(a,i){a.rank=i+1;});
+  var qualified=!floorSet||(o.quality||[]).some(function(q){return q.severity==='high';});
+  return{figures:{cashNow:fromK(toK(o.cashNow)),restricted:fromK(toK(o.restricted)),earmarkedGeneral:fromK(toK(o.earmarkedGeneral)),reservedLinked:fromK(toK(o.reservedLinked)),
+      freeToUse:fromK(freeK),due:fromK(dueK),covered:fromK(covK),uncovered:fromK(gapK),freeAfterCommitments:fromK(afterK),floor:floorSet?fromK(floorK):null,safeToAllocate:fromK(afterK<0?0:safeK)},
+    obligations:obls,actions:actions,qualified:qualified};
 }
 /* Spending runway = available cash / average daily spending, where spending is expenses plus loan
    interest and fees (owner withdrawals, transfers and loan principal are not spending).
@@ -706,6 +1087,21 @@ function validateSetup(s,txns,todayStr){
     if(!String(b.label||'').trim())errors.push('Every earmark needs a name.');
     if(!ids[b.parentId])errors.push('Earmark "'+(b.label||'')+'" must sit inside one of your accounts.');
     if(!(num(b.amount)>=0))errors.push('Earmark "'+(b.label||'')+'" needs an amount (0 or more).');
+    if(b.reservedFor&&!/^(agr|bill):.+/.test(String(b.reservedFor)))errors.push('Earmark "'+(b.label||'')+'" is linked to something KoboFlow does not recognise. Choose what it is for again.');
+  });
+  // Optional planning targets: only what the user enters; blank means "not set", never a default.
+  var pl=s.planning||{};
+  [['workingCapitalFloor','The working-capital floor'],['netWorthGoal','The net-worth goal']].forEach(function(f){
+    var v=pl[f[0]];if(v===''||v===null||v===undefined)return;
+    if(!(num(v)>0))errors.push(f[1]+' must be more than 0, or left blank.');
+  });
+  var bcats={};
+  (s.budgets||[]).forEach(function(b,i){
+    var c=String(b.cat||'').trim();
+    if(!c)errors.push('Budget '+(i+1)+' needs a category.');
+    else if(bcats[c])errors.push('There are two budgets for "'+c+'".');
+    bcats[c]=1;
+    if(!(num(b.amount)>0))errors.push('The budget for "'+(c||'budget '+(i+1))+'" needs a monthly amount above 0.');
   });
   var al=s.aliases||{},live=(txns||[]).filter(function(t){return !t.demo&&!t.voided;});
   Object.keys(LEGACY_ACCOUNTS).forEach(function(k){
@@ -865,6 +1261,22 @@ function analyzeOpportunity(o,ctx){
   res.tiedDays=(rep.datesKnown||conv!==null)?daysBetween(receipt,lastDate>convEnd?lastDate:convEnd):null;
   var free=num(ctx.freeCash);
   res.freeCash=free;
+  /* Working-capital floor: applied once, here, the same way as the Daily Money Director
+     ("free to allocate" = free cash after known 30-day payments − floor). Before the commitment
+     = free cash today; after = the lowest point if other cash has to bridge the repayments.
+     Loan proceeds are never added as income: they are already inside the coverage timeline. */
+  var floorGiven=Object.prototype.hasOwnProperty.call(ctx,'floor'),floor=num(ctx.floor);
+  if(floor!==null&&!(floor>0))floor=null;
+  res.floor=floorGiven?floor:undefined;
+  res.before=free===null?null:{freeAfterCommitments:free,aboveFloor:floor===null?null:Math.round((free-floor)*100)/100};
+  /* Other known payments due after the 30-day window (already outside `free` only if within 30
+     days) also draw on free cash during the repayment period: at each repayment date the need is
+     this funding's shortfall plus those payments due by then (their unreserved part, from ctx). */
+  var later=(ctx.laterObligations||[]).filter(function(x){return x&&parseDate(x.dueDate)&&num(x.amount)>0;});
+  var worst=maxShort,laterTotal=0;
+  if(timingKnown&&later.length){coverage.forEach(function(c){var due=sum(later.filter(function(x){return x.dueDate<=c.date;}),function(x){return toK(x.amount);})/K;if(c.shortfall+due>worst)worst=c.shortfall+due;if(due>laterTotal)laterTotal=due;});}
+  worst=Math.round(worst*100)/100;res.otherPaymentsInPeriod=Math.round(laterTotal*100)/100;
+  res.after=(free===null||!timingKnown)?null:{lowestFree:Math.round((free-worst)*100)/100,aboveFloor:floor===null?null:Math.round((free-worst-floor)*100)/100};
 
   /* verdict */
   var verdict='good';
@@ -879,12 +1291,18 @@ function analyzeOpportunity(o,ctx){
   }
   if(profit===null&&!isEquity){worse('review');reasons.push('No profit estimate entered, so the result after settlement cannot be determined yet.');}
   if(timingKnown&&maxShort>0){
-    if(free!==null&&free>=maxShort){worse('review');reasons.push('Repayments fall due before enough cash comes back. You would need up to '+fmtN(maxShort)+' from other cash (you currently have about '+fmtN(free)+' not already committed).');}
+    var otherTxt=res.otherPaymentsInPeriod>0?' while your other known payments of '+fmtN(res.otherPaymentsInPeriod)+' also fall due in that period':'';
+    if(free!==null&&free<worst&&free>=maxShort){worse('bad');reasons.push('Repayments fall due before enough cash comes back: up to '+fmtN(maxShort)+' from other cash'+otherTxt+'. Together that is more than your free cash of about '+fmtN(free)+'.');}
+    else if(free!==null&&free>=worst&&floor!==null&&free-worst<floor){worse('bad');reasons.push('Repayments fall due before enough cash comes back. Covering up to '+fmtN(maxShort)+' from other cash'+otherTxt+' would take your free cash to about '+fmtN(free-worst)+', below your working-capital floor of '+fmtN(floor)+'.');}
+    else if(free!==null&&free>=maxShort&&floor!==null&&free-maxShort<floor){worse('bad');reasons.push('Repayments fall due before enough cash comes back. Covering up to '+fmtN(maxShort)+' from other cash would take your free cash to about '+fmtN(free-maxShort)+', below your working-capital floor of '+fmtN(floor)+'.');}
+    else if(free!==null&&free>=maxShort){worse('review');reasons.push('Repayments fall due before enough cash comes back. You would need up to '+fmtN(maxShort)+' from other cash'+otherTxt+' (you currently have about '+fmtN(free)+' not already committed'+(floor!==null?', which stays above your working-capital floor of '+fmtN(floor):'')+').');}
     else{worse('bad');reasons.push('Repayments fall due before enough cash comes back: shortfall of up to '+fmtN(maxShort)+(free!==null?', more than your uncommitted cash of about '+fmtN(free):'')+'.');}
   }else if(!timingKnown&&!isEquity){worse('review');reasons.push('Payment dates or cash-conversion time are unknown, so repayment timing cannot be checked.');}
   if(flags.cashAfterFinal){worse('review');reasons.push('The stock/money is expected to turn back into cash only after the final repayment date, so repayments depend on sales keeping pace the whole time.');}
   if(recv!=='cash')reasons.push('Stock is not cash: only sales can pay the lender. Value received in stock: '+fmtN(res.stockValue)+'.');
   if(use==='spend')reasons.push('The money will be spent, so every repayment must come from your other income.');
+  if(floorGiven&&floor===null)reasons.push('No working-capital floor is set, so this check does not protect money you need for restocking.');
+  if(floor!==null&&free!==null&&free<floor){worse('review');reasons.push('Even before this commitment, your free cash after known payments ('+fmtN(free)+') is below your working-capital floor ('+fmtN(floor)+').');}
   res.verdict=verdict;res.reasons=reasons;
 
   /* CFO detail — only what the inputs can defend */
@@ -938,7 +1356,7 @@ var API={toK:toK,fromK:fromK,num:num,fmtDate:fmtDate,parseDate:parseDate,today:t
   isDebt:isDebt,cashReceived:function(t){return fromK(cashReceivedK(t));},buildSchedule:buildSchedule,termsSummary:termsSummary,
   instalmentStates:instalmentStates,agreementBalances:agreementBalances,allocatePayment:allocatePayment,settlementPlan:settlementPlan,
   classifyTxn:classifyTxn,accountDeltas:accountDeltas,accountBalances:accountBalances,upcomingObligations:upcomingObligations,cashForecast:cashForecast,
-  buildReminders:buildReminders,xirr:xirr,ACCOUNT_KINDS:ACCOUNT_KINDS,LEGACY_ACCOUNTS:LEGACY_ACCOUNTS,bucketSummary:bucketSummary,accountAccess:accountAccess,cashPosition:cashPosition,cashCover:cashCover,spendingRunway:spendingRunway,validateSetup:validateSetup,cashFlowSummary:cashFlowSummary,oppRepayments:oppRepayments,analyzeOpportunity:analyzeOpportunity,oppToTerms:oppToTerms,parseManualRows:parseManualRows};
+  buildReminders:buildReminders,xirr:xirr,ACCOUNT_KINDS:ACCOUNT_KINDS,LEGACY_ACCOUNTS:LEGACY_ACCOUNTS,bucketSummary:bucketSummary,accountAccess:accountAccess,cashPosition:cashPosition,cashCover:cashCover,reservationPlan:reservationPlan,coveredAmount:coveredAmount,BILL_REPEAT:BILL_REPEAT,billDueDates:billDueDates,billAmountOn:billAmountOn,billOccurrences:billOccurrences,billObligations:billObligations,billUnmatchedPayments:billUnmatchedPayments,validateBill:validateBill,dataQuality:dataQuality,budgetProgress:budgetProgress,directorPlan:directorPlan,spendingRunway:spendingRunway,validateSetup:validateSetup,cashFlowSummary:cashFlowSummary,oppRepayments:oppRepayments,analyzeOpportunity:analyzeOpportunity,oppToTerms:oppToTerms,parseManualRows:parseManualRows};
 root.KoboFin=API;
 if(typeof module!=='undefined'&&module.exports)module.exports=API;
 })(typeof window!=='undefined'?window:this);
@@ -1373,6 +1791,7 @@ body.kf-live .sample-tag{display:inline-block;}
         <div class="screen-title">FINANCIAL BRIEFING</div>
       </div>
       <div id="mode-note"></div>
+      <div id="director-teaser"></div>
       <div class="card">
         <div id="score-wrap">
           <div class="score-ring-wrap">
@@ -1424,6 +1843,21 @@ body.kf-live .sample-tag{display:inline-block;}
       <div class="bucket-line" id="bucket-list"></div>
       <div class="card"><div class="card-label">Upcoming Obligations</div><div id="ob-list"></div></div>
       <div class="card"><div class="card-label">Budget Status</div><div id="budget-list"></div></div>
+    </div>
+
+    <div class="screen" id="screen-director">
+      <div class="screen-title">DAILY MONEY DIRECTOR</div>
+      <div class="screen-sub">What to do with your money now, worked out from your recorded balances, earmarks and payments due</div>
+      <div id="director-body"></div>
+    </div>
+
+    <div class="screen" id="screen-bills">
+      <div class="screen-title">BILLS</div>
+      <div class="screen-sub">Payments you must prepare for. A bill falling due is not money spent: only a payment you record is.</div>
+      <div id="bills-mode-note"></div>
+      <button class="dashed-btn" id="bill-add-btn" style="margin-bottom:12px;">+ Add a bill</button>
+      <div class="card"><div class="card-label">Overdue and due in the next 60 days</div><div id="bills-due"></div></div>
+      <div class="card"><div class="card-label">All bills</div><div id="bills-list"></div></div>
     </div>
 
     <div class="screen" id="screen-timeline">
@@ -1814,8 +2248,10 @@ body.kf-live .sample-tag{display:inline-block;}
 
   <nav id="nav">
     <button class="nav-btn active" data-screen="home"><div class="nav-icon">&#9678;</div><div class="nav-label">Brief</div><div class="nav-dot"></div></button>
+    <button class="nav-btn" data-screen="director"><div class="nav-icon">&#10148;</div><div class="nav-label">Director</div><div class="nav-dot"></div></button>
     <button class="nav-btn" data-screen="timeline"><div class="nav-icon">&#8803;</div><div class="nav-label">History</div><div class="nav-dot"></div></button>
     <button class="nav-btn" data-screen="inbox"><div class="nav-icon">&#9636;</div><div class="nav-label">Inbox</div><div class="nav-dot"></div></button>
+    <button class="nav-btn" data-screen="bills"><div class="nav-icon">&#128196;</div><div class="nav-label">Bills</div><div class="nav-dot"></div></button>
     <button class="nav-btn" data-screen="loans"><div class="nav-icon">&#8358;</div><div class="nav-label">Loans</div><div class="nav-dot"></div></button>
     <button class="nav-btn" data-screen="vehicles"><div class="nav-icon">&#128663;</div><div class="nav-label">Vehicles</div><div class="nav-dot"></div></button>
     <button class="nav-btn" data-screen="calendar"><div class="nav-icon">&#128197;</div><div class="nav-label">Calendar</div><div class="nav-dot"></div></button>
@@ -1844,6 +2280,7 @@ body.kf-live .sample-tag{display:inline-block;}
         <button class="type-chip" data-type="obligation">Bill paid</button>
       </div>
       <div class="muted-note" id="type-chip-hint" style="display:none;margin:-4px 0 8px;">Bill paid records money already paid. Upcoming bills are added separately.</div>
+      <div id="modal-bill-wrap" style="display:none;margin-bottom:8px;"><select id="modal-bill" class="modal-input" aria-label="Which bill is this payment for?" style="margin-bottom:0;"></select></div>
       <input id="modal-amount" class="modal-input" type="number" inputmode="numeric" placeholder="Amount"/>
       <input id="modal-desc" class="modal-input" type="text" placeholder="Description"/>
       <select id="modal-cat" class="modal-input">
@@ -1950,6 +2387,15 @@ body.kf-live .sample-tag{display:inline-block;}
       <div class="hint">An earmark sets money aside <i>inside</i> an account (e.g. Rent inside Opay). It is not extra money and is never added to totals.</div>
       <div id="setup-buckets"></div>
       <button class="dashed-btn" id="setup-add-bucket" style="margin-bottom:12px;">+ Add an earmark</button>
+      <div class="card-label">PLANNING TARGETS (optional)</div>
+      <div class="hint">Leave blank if you have not decided. KoboFlow never fills these in for you.</div>
+      <div class="form-group"><label>Pharmacy working-capital floor (&#8358;)</label><input id="setup-wc-floor" class="form-input" type="number" inputmode="decimal" placeholder="Not set"/></div>
+      <div class="hint">Money you want to keep for restocking and running the pharmacy. The Director will not suggest spending below it. It is your own figure, not a calculated requirement, and it is applied once: only to what the Director says is free to allocate.</div>
+      <div class="form-group"><label>Net-worth goal (&#8358;)</label><input id="setup-nw-goal" class="form-input" type="number" inputmode="decimal" placeholder="Not set"/></div>
+      <div class="card-label">MONTHLY BUDGETS (optional)</div>
+      <div class="hint">A monthly limit for one spending category. Progress counts expenses and bills paid in that category this month.</div>
+      <div id="setup-budgets"></div>
+      <button class="dashed-btn" id="setup-add-budget" style="margin-bottom:12px;">+ Add a budget</button>
       <div class="card-label">WHERE DO QUICK-CAPTURE ENTRIES GO?</div>
       <div class="hint">The quick-capture bar and older entries use built-in account names. Choose the real account each one means. Nothing is assumed.</div>
       <div id="setup-aliases"></div>
@@ -1957,6 +2403,46 @@ body.kf-live .sample-tag{display:inline-block;}
       <div id="setup-confirm" style="display:none;"></div>
       <div id="setup-result"></div>
       <button class="modal-save" id="setup-save-btn">REVIEW &amp; SAVE</button>
+    </div>
+  </div>
+
+  <div class="modal-overlay" id="bill-modal">
+    <div class="modal-box">
+      <div class="modal-head"><div class="modal-title" id="bill-modal-title">ADD A BILL</div><button class="modal-close" data-close="bill-modal">&#215;</button></div>
+      <div class="hint">A bill is a payment you must prepare for, such as rent or electricity. Saving it moves no money: only a payment you record does.</div>
+      <div class="form-group"><label>Name</label><input id="bill-name" class="form-input" type="text" placeholder="Shop rent"/></div>
+      <div class="form-group"><label>Category</label><select id="bill-cat" class="form-input"></select></div>
+      <div class="grid2" style="margin-bottom:0;">
+        <div class="form-group"><label>Amount (&#8358;)</label><input id="bill-amount" class="form-input" type="number" inputmode="decimal"/></div>
+        <div class="form-group"><label>First due date</label><input id="bill-first" class="form-input" type="date"/></div>
+      </div>
+      <div class="grid2" style="margin-bottom:0;">
+        <div class="form-group"><label>Repeats</label><select id="bill-repeat" class="form-input"><option value="none">One-time</option><option value="weekly">Weekly</option><option value="monthly">Monthly</option><option value="quarterly">Every 3 months</option><option value="yearly">Yearly</option></select></div>
+        <div class="form-group"><label>Ends on (optional)</label><input id="bill-until" class="form-input" type="date"/></div>
+      </div>
+      <div class="hint">For a bill you already pay, enter the NEXT date it is due. Earlier months are not tracked.</div>
+      <div data-bill-edit="1" style="display:none;">
+        <div class="form-group"><label>A changed amount applies from</label><input id="bill-amount-from" class="form-input" type="date"/></div>
+        <div class="hint">Occurrences due before this date keep their amount.</div>
+      </div>
+      <div id="bill-form-msg"></div>
+      <button class="modal-save" id="bill-save-btn">SAVE BILL</button>
+    </div>
+  </div>
+
+  <div class="modal-overlay" id="bill-pay-modal">
+    <div class="modal-box">
+      <div class="modal-head"><div class="modal-title">RECORD BILL PAYMENT</div><button class="modal-close" data-close="bill-pay-modal">&#215;</button></div>
+      <div id="bill-pay-info"></div>
+      <div id="bill-pay-candidates"></div>
+      <div class="grid2" style="margin-bottom:0;">
+        <div class="form-group"><label>Amount paid (&#8358;)</label><input id="bill-pay-amount" class="form-input" type="number" inputmode="decimal"/></div>
+        <div class="form-group"><label>Date paid</label><input id="bill-pay-date" class="form-input" type="date"/></div>
+      </div>
+      <div class="form-group"><label>From account</label><select id="bill-pay-account" class="form-input"></select></div>
+      <div class="hint">This records money that has already left the account. Pay less than the full amount to record a part payment.</div>
+      <div id="bill-pay-msg"></div>
+      <button class="modal-save" id="bill-pay-save-btn">RECORD PAYMENT</button>
     </div>
   </div>
 
@@ -2213,13 +2699,16 @@ function pill(text,bg,color){return'<span class="pill" style="background:'+bg+';
 })();
 
 function renderScore(){
-  if(isLive()){ // the score was built from sample budgets: never show it as a live result
+  var lb=liveBudgets(),prog=null;
+  if(isLive()&&lb.length){prog=F.budgetProgress(lb,items,monthStartISO(),getToday());}
+  else if(isLive()){ // the score was built from sample budgets: never show it as a live result
     var a0=qs('score-arc');if(a0){a0.style.transition='none';a0.setAttribute('stroke','#4A4858');a0.setAttribute('stroke-dasharray','213.6 213.6');a0.setAttribute('stroke-dashoffset','213.6');}
     var n0=qs('score-num');if(n0){n0.textContent='--';n0.style.color='#7A7880';}
     var m0=qs('score-msg');if(m0)m0.textContent='Not available: no budgets set yet.';
     return;
   }
-  var avg=BUDGETS.reduce(function(s,b){return s+pct(b.used,b.total);},0)/BUDGETS.length;
+  var src=prog?prog.map(function(b){return{used:b.used,total:b.amount};}):BUDGETS;
+  var avg=src.reduce(function(s,b){return s+pct(b.used,b.total);},0)/src.length;
   var score=Math.max(0,Math.round(100-avg*0.8));
   var color=score>70?'#22C55E':score>50?'#F5A623':'#EF4444';
   var circ=213.6;
@@ -2232,7 +2721,7 @@ function renderScore(){
     raf2(function(){arc.style.transition='stroke-dashoffset 1.2s ease';arc.setAttribute('stroke-dashoffset',circ-(score/100)*circ);});
   }
   var num=qs('score-num');if(num){num.textContent=score;num.style.color=color;}
-  var msg=qs('score-msg');if(msg)msg.textContent=score>70?'Spending well controlled.':score>50?'Some categories trending high.':'Overspending detected. Review budgets.';
+  var msg=qs('score-msg');if(msg)msg.textContent=prog?'From '+prog.length+' budget'+(prog.length>1?'s':'')+' you set, this month so far (rule-of-thumb score).':score>70?'Spending well controlled.':score>50?'Some categories trending high.':'Overspending detected. Review budgets.';
 }
 
 
@@ -2253,7 +2742,10 @@ function renderInbox(){
     var icCls='inbox-icon'+(isIn(i.type)?' income':i.type==='transfer'?' transfer':i.type==='owner_withdrawal'?' owner_withdrawal':'');
     var icCh=isIn(i.type)?'+':i.type==='transfer'?'~':i.type==='owner_withdrawal'?'v':'-';
     var acts=i.state==='Needs Review'?'<div class="action-btns"><button class="act-btn act-approve" data-approve="'+esc(i.id)+'">OK</button><button class="act-btn act-dismiss" data-dismiss="'+esc(i.id)+'">X</button></div>':'';
-    return'<div class="inbox-item'+(i.state==='Needs Review'?' needs-review':'')+'"><div class="'+icCls+'">'+icCh+'</div><div class="inbox-mid"><div style="display:flex;align-items:center;gap:6px;margin-bottom:3px;flex-wrap:wrap;"><span class="inbox-desc-txt">'+esc(i.desc)+'</span>'+pill(i.state,ss2.bg,ss2.color)+pill(typeLabel(i.type),'#222228','#7A7880')+'</div><div class="inbox-meta">'+esc(dateLabel(i.date))+' &middot; '+esc(i.time)+' &middot; '+esc(i.cat)+'</div></div><div class="inbox-right"><div class="amount-badge '+cls(i.type)+'">'+sign+fmt(i.amount)+'</div>'+acts+'</div></div>';
+    // An uncertain spending entry can be given its real category (e.g. which vehicle the fuel was for).
+    var fix=i.state==='Needs Review'&&(i.type==='expense'||i.type==='obligation')?'<div class="reclass-row" style="display:flex;gap:6px;margin-top:6px;"><select class="form-input" data-reclass-sel="'+esc(i.id)+'" aria-label="Correct category" style="padding:6px;font-size:12px;"><option value="">Correct the category&hellip;</option>'
+      +budgetCats().map(function(c){return'<option>'+esc(c)+'</option>';}).join('')+'</select><button class="act-btn act-approve" data-reclass="'+esc(i.id)+'">SAVE</button></div>':'';
+    return'<div class="inbox-item'+(i.state==='Needs Review'?' needs-review':'')+'"><div class="'+icCls+'">'+icCh+'</div><div class="inbox-mid"><div style="display:flex;align-items:center;gap:6px;margin-bottom:3px;flex-wrap:wrap;"><span class="inbox-desc-txt">'+esc(i.desc)+'</span>'+pill(i.state,ss2.bg,ss2.color)+pill(typeLabel(i.type),'#222228','#7A7880')+'</div><div class="inbox-meta">'+esc(dateLabel(i.date))+' &middot; '+esc(i.time)+' &middot; '+esc(i.cat)+'</div>'+fix+'</div><div class="inbox-right"><div class="amount-badge '+cls(i.type)+'">'+sign+fmt(i.amount)+'</div>'+acts+'</div></div>';
   }).join('');
 }
 
@@ -2454,7 +2946,13 @@ function recalcBalances(){var b=F.accountBalances(ACCOUNTS,items,isLive()?{basel
 /* Every screen uses the same cash rule (engine cashPosition): available = cash, bank and wallet
    accounts unless marked restricted; coop and investment accounts are restricted unless marked
    available. Earmarks are reported separately and never reduce a balance. */
-function cashNow(){return F.cashPosition(ACCOUNTS,isLive()&&SETUP&&SETUP.buckets?SETUP.buckets:[]);}
+function cashNow(){return F.cashPosition(ACCOUNTS,reservations().effective);}
+/* Earmarks with their link to an obligation resolved against current instalment states (engine
+   reservationPlan). Recomputed on every call, never stored: paying an instalment releases its
+   reservation automatically, exactly once. */
+function allObligations(){return billEntries().concat(loanEntries());}
+function reservations(){return F.reservationPlan(ACCOUNTS,isLive()&&SETUP&&SETUP.buckets?SETUP.buckets:[],allObligations());}
+function staleReservations(){return reservations().buckets.filter(function(b){return b.reservedFor&&b.status==='no_outstanding';});}
 function liquidCash(){return cashNow().available;}
 function spendableCash(){return cashNow().available;}
 function acctLabel(id){var r=resolveAcct(id),a=ACCOUNTS.find(function(x){return x.id===r;});return a?a.label:(id?(F.LEGACY_ACCOUNTS[id]||id)+(isLive()?' (not mapped)':''):'');}
@@ -2476,7 +2974,8 @@ function newTxnId(){return nextId++;}
 
 /* One financial action = one IndexedDB transaction across all stores it touches.
    Memory is only updated after the write succeeds, so a failed save changes nothing. */
-var STORE_ARR={agreements:function(){return AGR;},instalments:function(){return INST;},allocations:function(){return ALLOC;},agreementEvents:function(){return EVENTS;},opportunities:function(){return OPPS;}};
+var BILLS=[];
+var STORE_ARR={bills:function(){return BILLS;},agreements:function(){return AGR;},instalments:function(){return INST;},allocations:function(){return ALLOC;},agreementEvents:function(){return EVENTS;},opportunities:function(){return OPPS;}};
 function commit(ops){
   return db.atomic(ops).then(function(){
     // The write is durable from here on. A failure while updating the screen must not be
@@ -2533,20 +3032,21 @@ function statusOps(agr,post,why){
 
 /* ── Forecast inputs: scheduled amounts are plans, never subtracted from balances ── */
 function billEntries(){
+  if(isLive())return F.billObligations(BILLS,items,{today:getToday(),until:F.addDays(getToday(),365)}).map(function(o){o.icon='&#128196;';return o;});
   if(!sampleBillsActive())return[];
   var td=getToday();
-  return OBLIGATIONS_DATA.map(function(o){return{dueDate:F.addDays(td,o.day),remaining:o.amount,label:o.desc,kind:'bill',icon:o.icon,source:o.source||'Bill (sample)'};});
+  return OBLIGATIONS_DATA.map(function(o,i){return{id:'bill_sample_'+i,dueDate:F.addDays(td,o.day),remaining:o.amount,label:o.desc,kind:'bill',icon:o.icon,source:o.source||'Bill (sample)'};});
 }
 function loanEntries(){
   var out=[];
   activeDebtViews().forEach(function(v){v.bal.states.forEach(function(s){
-    if(s.remaining>0)out.push({dueDate:s.dueDate,remaining:s.remaining,label:v.agr.name+' #'+s.seq,kind:'loan',icon:'&#8358;',agreementId:v.agr.id,status:s.status,source:'Loan repayment'});
+    if(s.remaining>0)out.push({id:s.id,dueDate:s.dueDate,remaining:s.remaining,label:v.agr.name+' #'+s.seq,kind:'loan',icon:'&#8358;',agreementId:v.agr.id,status:s.status,source:'Loan repayment'});
   });});
   return out;
 }
 function obligationsWithin(days){return F.upcomingObligations(billEntries().concat(loanEntries()),getToday(),days);}
 function sumRem(list){return list.reduce(function(s,e){return s+e.remaining;},0);}
-function cashCoverFor(obs){return F.cashCover(cashNow(),sumRem(obs));}
+function cashCoverFor(obs){var r=reservations();return F.cashCover(F.cashPosition(ACCOUNTS,r.effective),sumRem(obs),F.coveredAmount(obs,r.coverage));}
 function freeCash(){return cashCoverFor(obligationsWithin(30)).leftAfter;}
 function unlinkedLoanReceipts(){return items.filter(function(t){return !t.demo&&!t.agreementId&&F.classifyTxn(t).loanProceeds>0;});}
 function dueText(iso){var d=F.daysBetween(getToday(),iso);return d<0?'Overdue '+(-d)+'d':d===0?'Today':d===1?'Tomorrow':'In '+d+' days';}
@@ -3093,7 +3593,9 @@ function oppSync(){
 function analyzeOpp(){
   var o=readOpp();
   if(!o.valueReceived){alert('Enter the value you will receive.');return;}
-  var r=F.analyzeOpportunity(o,{freeCash:Math.round(freeCash())});
+  var rv=reservations(),cut=F.addDays(getToday(),30);
+  var later=allObligations().filter(function(x){return x.dueDate>cut;}).map(function(x){return{dueDate:x.dueDate,amount:Math.max(0,x.remaining-(rv.coverage[x.id]||0))};});
+  var r=F.analyzeOpportunity(o,{freeCash:Math.round(freeCash()),floor:planning().workingCapitalFloor,laterObligations:later});
   oppCtx.last={input:o,result:r};
   renderOppResult(o,r);
   var res=qs('opp-result');if(res){res.className='opp-result show';setTimeout(function(){res.scrollIntoView({behavior:'smooth',block:'start'});},80);}
@@ -3118,6 +3620,17 @@ function renderOppResult(o,r){
     +kv('Can cash flow meet them?',cover)
     +kv('Money tied up for',r.tiedDays===null?unknown:r.tiedDays+' days')
     +'</div>';
+  // Affordability uses the same figures as the Daily Money Director: free cash after known 30-day
+  // payments, then your working-capital floor, applied once. Loan proceeds are not counted as income.
+  function signedF(v){return(v<0?'-':'')+fmt(v);}
+  h+='<div class="card" id="opp-afford"><div class="card-label">Can you afford it?</div>'
+    +kv('Free cash after known payments due in 30 days (before this commitment)',r.before?signedF(r.before.freeAfterCommitments):unknown)
+    +kv('Working-capital floor (your setting)',r.floor===null||r.floor===undefined?'Not set':fmt(r.floor))
+    +kv('Free to allocate before this commitment',r.before?(r.before.aboveFloor===null?signedF(r.before.freeAfterCommitments)+' (no floor set)':signedF(Math.max(0,r.before.aboveFloor))):unknown)
+    +kv('Your other known payments due after 30 days, during the repayment period',r.after?fmt(r.otherPaymentsInPeriod||0):unknown)
+    +kv('Lowest free cash while repaying (after this commitment)',r.after?signedF(r.after.lowestFree):unknown)
+    +kv('Compared with your floor',r.after&&r.after.aboveFloor!==null?(r.after.aboveFloor>=0?fmt(r.after.aboveFloor)+' above':fmt(-r.after.aboveFloor)+' below'):(r.floor===null||r.floor===undefined?'Not set':unknown))
+    +'<div class="muted-note" style="margin-bottom:0;">Money received from this funding is not income: it only counts as it comes back through sales or as cash you hold. Your other known payments (bills, loan instalments) during the repayment period are included in the lowest free cash; income you have not recorded is not.</div></div>';
   h+='<div class="card"><div class="card-label">Why</div>'+r.reasons.map(function(x){return'<div class="insight-row"><div class="insight-icon">&#8226;</div><div class="insight-text">'+esc(x)+'</div></div>';}).join('')+(o.notes?'<div class="insight-row"><div class="insight-icon">&#9888;</div><div class="insight-text">Your note: '+esc(o.notes)+'</div></div>':'')+'</div>';
   var c=r.cfo;
   h+='<details class="kf-adv card"><summary>&#9660; Show CFO Analysis</summary>'
@@ -3277,22 +3790,49 @@ function renderPersistOut(){
   var el=qs('persist-out');if(!el)return;
   persistenceState().then(function(ps){el.innerHTML='Status: '+esc(ps.text)+'<br>'+lastRequestText();});
 }
+function upgradeText(u){
+  if(!u||!u.copyDb)return'';
+  var total=Object.keys(u.counts||{}).reduce(function(t,k){return t+u.counts[k];},0);
+  return'<br>Upgraded from database v'+u.from+' to v'+u.to+' on '+esc(String(u.at).slice(0,10))+', after making a verified safety copy ('+total+' records) in <b>'+esc(u.copyDb)+'</b>.'
+    +(u.copyMatchesUpgraded===false?' <span style="color:var(--amber);">Some records were added or changed while upgrading (another KoboFlow tab?). They are in the upgraded database but not in the copy: export a current backup too.</span>':'');
+}
+/* Every pre-upgrade copy on this device, with what is known about each. Copies are never deleted. */
+var COPY_STATUS={verified:['Verified, unchanged since it was made','var(--green)'],changed:['Changed since it was made (opened and edited elsewhere?)','var(--amber)'],
+  unverified:['Not verified: no record that it was completed (it may be incomplete)','var(--red)'],missing:['Recorded, but no longer on this device','var(--red)'],
+  unreadable:['Could not be read: it may be incomplete or being removed','var(--red)']};
+function copyTime(name){var m=/-pre-v4-(\d{4})(\d{2})(\d{2})(\d{2})(\d{2})(\d{2})/.exec(name);return m?m[1]+'-'+m[2]+'-'+m[3]+' '+m[4]+':'+m[5]+':'+m[6]+' UTC':'unknown time';}
+function copiesText(list,u){
+  if(!list||!list.copies.length)return'';
+  return'<div data-copies="1"><br><b>Pre-upgrade safety copies on this device ('+list.copies.length+'):</b>'+list.copies.map(function(c){
+    var st=COPY_STATUS[c.status],sfx=String(c.name).replace(/^KoboFlowDB-/,''),used=u&&u.copyDb===c.name;
+    var oldOpen=c.status!=='missing'&&c.status!=='unreadable'&&!window.__kfTestBuild&&/^[a-z0-9-]{1,24}$/.test(sfx)?' Older KoboFlow: add <b>?db='+esc(sfx)+'</b> to its address.':'';
+    return'<div class="muted-note" data-copy="'+esc(c.name)+'" data-copy-status="'+c.status+'" style="margin:6px 0;"><b>'+esc(c.name)+'</b>'+(used?' &middot; <b>used for the upgrade</b>':'')
+      +'<br>Made '+copyTime(c.name)+(c.version?' &middot; database v'+c.version:'')+(c.records!==undefined?' &middot; '+c.records+' records':'')
+      +'<br><span style="color:'+st[1]+';">'+st[0]+'</span>.'+oldOpen
+      +(c.status!=='missing'&&c.status!=='unreadable'?' <button class="act-btn act-approve" data-dl-copy="'+esc(c.name)+'">DOWNLOAD AS BACKUP FILE</button>':'')+'</div>';
+  }).join('')+(list.listedByName?'':'<div class="muted-note">This browser cannot list databases, so only copies KoboFlow recorded are shown.</div>')+'</div>';
+}
 function storageCheck(){
   var out=qs('storage-check-out');out.textContent='Checking…';
   var loc=String(location.protocol)+'//'+String(location.host||'')+String(location.pathname||'');
   function fail(msg){out.innerHTML='<span style="color:var(--red);">'+msg+'</span>';}
   return db.info().then(function(info){
-    return Promise.all([db.meta.get('ledgerSetup'),db.transactions.toArray(),db.agreements.toArray(),persistenceState()]).then(function(r){
+    return Promise.all([db.meta.get('ledgerSetup'),db.transactions.toArray(),db.agreements.toArray(),persistenceState(),db.meta.get('dbUpgradeV4'),db.bills.toArray(),db.meta.get('dbUpgradeV4').then(function(u){return db.listCopies(u?[{name:u.copyDb,fingerprint:u.fingerprint}]:[]);}).catch(function(){return null;})]).then(function(r){
       var st=r[0],tx=r[1],rev=tx.filter(function(t){return !!(t&&t.voided);}).length;
       // A malformed stored record must not stop the diagnostic itself (it would hang on "Checking…").
       var setupTxt=!st?'no':Array.isArray(st.accounts)?'yes, '+st.accounts.filter(function(a){return a&&!a.removed;}).length+' account(s), baseline '+esc(st.baselineDate):'yes, but the record is malformed (no account list)';
       out.innerHTML='Storage: <b style="color:var(--green);">available</b><br>Database: <b>'+esc(info.name)+'</b> (v'+info.version+')<br>Opened from: '+esc(loc)
         +'<br>Account setup saved: <b>'+setupTxt+'</b>'
         +'<br>Stored entries: '+tx.length+' ('+(tx.length-rev)+' active &middot; '+rev+' reversed) &middot; agreements: '+r[2].length
-        +'<br>Persistent storage: '+esc(r[3].text)+'<br>'+lastRequestText();
+        +' &middot; bills: '+r[5].length
+        +'<br>Persistent storage: '+esc(r[3].text)+'<br>'+lastRequestText()
+        +upgradeText(r[4])+copiesText(r[6],r[4]);
     },function(e){fail('Storage QUERY FAILED: database '+esc(info.name)+' opened, but reading it failed ('+esc(e&&e.message?e.message:e)+'). Entries cannot be counted. Do not assume the database is empty.');})
     .catch(function(e){fail('Storage: available (database '+esc(info.name)+' was read), but the summary could not be built ('+esc(errText(e))+'). A stored record may be malformed.');});
-  },function(e){fail('Storage NOT available: could not open database '+esc(db.name)+' ('+esc(e&&e.message?e.message:e)+'). Nothing can be saved in this browser view.');});
+  },function(e){fail('Storage NOT available: could not open database '+esc(db.name)+' ('+esc(e&&e.message?e.message:e)+'). Nothing can be saved in this browser view.'
+    +(window.__kfPreUpgradeData?' <button class="act-btn act-approve" data-dl-paused="1">DOWNLOAD A COPY OF YOUR DATA</button>':''));
+    // Copies live in their own databases, so they can still be listed and downloaded.
+    return db.listCopies().then(function(list){var h=copiesText(list,null);if(h)out.insertAdjacentHTML('beforeend',h);},function(){});});
 }
 /* Closing the form (× or tapping outside) does not silently throw edits away: reopening
    brings them back, clearly marked as NOT saved, with an explicit Discard. A draft is only
@@ -3304,6 +3844,7 @@ function openSetup(fresh){
   var restore=fresh!==true&&setupDraft&&setupDirty&&setupDraftBase===setupBaseKey();
   if(!restore){
     setupDraft=SETUP?clone(SETUP):{mode:'live',baselineDate:getToday(),accounts:[{id:'acc_opay',label:'Opay',institution:'Opay',kind:'wallet',use:'business',primary:true,opening:''}],buckets:[],aliases:{},history:[]};
+    setupDraft.budgets=setupDraft.budgets||[];setupDraft.planning=setupDraft.planning||{workingCapitalFloor:null,netWorthGoal:null};
     setupDirty=false;setupDraftBase=setupBaseKey();
   }
   setVal('setup-baseline',setupDraft.baselineDate);
@@ -3327,6 +3868,23 @@ function acctRowHTML(a,i){
     +'<div style="display:flex;justify-content:space-between;align-items:center;"><label class="check-row" style="margin:0;"><input type="radio" name="setup-primary" data-f="primary"'+(a.primary?' checked':'')+'/> Primary operating account</label>'
     +(used?'<span class="muted-note" style="margin:0;">Has entries &mdash; cannot remove</span>':'<button class="act-btn act-dismiss" data-remove-acct="'+i+'">REMOVE</button>')+'</div></div>';
 }
+/* Setup helpers for planning fields. Blank means "not set": never a default or an estimate. */
+function planNum(v){if(v===''||v===null||v===undefined)return null;var n=F.num(v);return n!==null&&n>0?n:null;}
+function planning(){var p=isLive()&&SETUP&&SETUP.planning||{};return{workingCapitalFloor:planNum(p.workingCapitalFloor),netWorthGoal:planNum(p.netWorthGoal)};}
+function liveBudgets(){return isLive()&&SETUP&&Array.isArray(SETUP.budgets)?SETUP.budgets.filter(function(b){return b&&b.cat&&F.num(b.amount)>0;}):[];}
+// Spending categories offered for budgets and for fixing an entry: the Add Entry list, minus income/financing ones.
+function budgetCats(){var el=qs('modal-cat');return el?Array.prototype.map.call(el.options,function(o){return o.textContent;}).filter(function(c){return['Pharmacy Sales','Loan','Savings'].indexOf(c)<0;}):[];}
+// What an earmark can be reserved for: an active loan (its unpaid instalments) or a bill (its unpaid occurrences). A link to a loan
+// that is no longer active stays selectable so it is shown honestly rather than silently dropped.
+function reservedForLabel(rf){
+  if(/^bill:/.test(String(rf||''))){var bid=String(rf).slice(5),bl=BILLS.find(function(x){return x.id===bid;});return bl?'Bill: '+bl.name+(bl.status==='cancelled'?' (cancelled)':''):'a bill that no longer exists';}
+  var id=String(rf||'').replace(/^agr:/,''),a=AGR.find(function(x){return x.id===id;});return a?'Loan: '+a.name+(a.status==='active'?'':' ('+(F.STATUSES[a.status]||a.status).toLowerCase()+')'):'a loan that no longer exists';}
+function reservedForOptions(cur){
+  var opts=AGR.filter(function(a){return a.status==='active'&&F.isDebt(a.terms);}).map(function(a){return'agr:'+a.id;})
+    .concat(BILLS.filter(function(b){return b.status!=='cancelled';}).map(function(b){return'bill:'+b.id;}));
+  if(cur&&opts.indexOf(cur)<0)opts.push(cur);
+  return'<option value=""'+(cur?'':' selected')+'>General purpose</option>'+opts.map(function(v){return'<option value="'+esc(v)+'"'+(v===cur?' selected':'')+'>'+esc(reservedForLabel(v))+'</option>';}).join('');
+}
 function renderSetupRows(){
   var s=setupDraft,accts=s.accounts.filter(function(a){return !a.removed;});
   qs('setup-accounts').innerHTML=s.accounts.map(function(a,i){return a.removed?'':acctRowHTML(a,i);}).join('');
@@ -3335,8 +3893,16 @@ function renderSetupRows(){
     return'<div class="setup-row" data-bucket-row="'+i+'"><div class="grid3" style="margin-bottom:0;"><div class="form-group"><label>Name</label><input class="form-input" data-f="label" value="'+esc(b.label)+'" placeholder="Rent"/></div>'
       +'<div class="form-group"><label>Inside</label><select class="form-input" data-f="parentId"><option value="">Choose&hellip;</option>'+popts.replace('value="'+esc(b.parentId)+'"','value="'+esc(b.parentId)+'" selected')+'</select></div>'
       +'<div class="form-group"><label>Amount</label><input class="form-input" data-f="amount" type="number" inputmode="decimal" value="'+esc(b.amount)+'"/></div></div>'
+      +'<div class="form-group"><label>Reserved for</label><select class="form-input" data-f="reservedFor">'+reservedForOptions(b.reservedFor)+'</select></div>'
       +'<button class="act-btn act-dismiss" data-remove-bucket="'+i+'">REMOVE</button></div>';
   }).join('');
+  qs('setup-budgets').innerHTML=(s.budgets||[]).map(function(b,i){
+    return'<div class="setup-row" data-budget-row="'+i+'"><div class="grid2" style="margin-bottom:0;"><div class="form-group"><label>Category</label><select class="form-input" data-f="cat"><option value="">Choose&hellip;</option>'
+      +budgetCats().map(function(c){return'<option'+(c===b.cat?' selected':'')+'>'+esc(c)+'</option>';}).join('')+'</select></div>'
+      +'<div class="form-group"><label>Monthly limit</label><input class="form-input" data-f="amount" type="number" inputmode="decimal" value="'+esc(b.amount)+'"/></div></div>'
+      +'<button class="act-btn act-dismiss" data-remove-budget="'+i+'">REMOVE</button></div>';
+  }).join('');
+  var pl=s.planning||{};setVal('setup-wc-floor',pl.workingCapitalFloor===null||pl.workingCapitalFloor===undefined?'':pl.workingCapitalFloor);setVal('setup-nw-goal',pl.netWorthGoal===null||pl.netWorthGoal===undefined?'':pl.netWorthGoal);
   qs('setup-aliases').innerHTML=Object.keys(F.LEGACY_ACCOUNTS).map(function(k){
     var cur=s.aliases[k],used=items.filter(function(t){return !t.demo&&(t.fromAcct===k||t.toAcct===k);}).length;
     return'<div class="form-group"><label>"'+F.LEGACY_ACCOUNTS[k]+'"'+(used?' &mdash; '+used+' recorded entr'+(used>1?'ies':'y'):'')+'</label><select class="form-input" data-alias="'+k+'">'
@@ -3369,7 +3935,13 @@ function readSetupForm(){
   document.querySelectorAll('#setup-buckets [data-bucket-row]').forEach(function(row){
     var b=s.buckets[+row.getAttribute('data-bucket-row')];
     b.label=row.querySelector('[data-f="label"]').value.trim();b.parentId=row.querySelector('[data-f="parentId"]').value;b.amount=row.querySelector('[data-f="amount"]').value;
+    var rf=row.querySelector('[data-f="reservedFor"]');b.reservedFor=rf?rf.value:(b.reservedFor||'');
   });
+  s.budgets=s.budgets||[];
+  document.querySelectorAll('#setup-budgets [data-budget-row]').forEach(function(row){
+    var b=s.budgets[+row.getAttribute('data-budget-row')];b.cat=row.querySelector('[data-f="cat"]').value;b.amount=row.querySelector('[data-f="amount"]').value;
+  });
+  s.planning={workingCapitalFloor:val('setup-wc-floor'),netWorthGoal:val('setup-nw-goal')};
   document.querySelectorAll('#setup-aliases [data-alias]').forEach(function(sel){var v=sel.value;if(v==='__unset')delete s.aliases[sel.getAttribute('data-alias')];else s.aliases[sel.getAttribute('data-alias')]=v;});
   return s;
 }
@@ -3406,11 +3978,18 @@ function saveSetup(){
     // Earmarks, matched by id: added, removed, or changed (name, account or amount).
     var pb=prev.buckets||[],nb=s.buckets||[];
     nb.forEach(function(b){var o=pb.find(function(x){return x.id===b.id;});
-      var now={label:b.label,parentId:b.parentId,amount:F.num(b.amount)||0};
+      var now={label:b.label,parentId:b.parentId,amount:F.num(b.amount)||0,reservedFor:b.reservedFor||''};
       if(!o)changes.push({field:'earmark_added',to:now});
-      else{var was={label:o.label,parentId:o.parentId,amount:F.num(o.amount)||0};
-        if(was.label!==now.label||was.parentId!==now.parentId||was.amount!==now.amount)changes.push({field:'earmark',from:was,to:now});}});
-    pb.forEach(function(o){if(!nb.some(function(b){return b.id===o.id;}))changes.push({field:'earmark_removed',from:{label:o.label,parentId:o.parentId,amount:F.num(o.amount)||0}});});
+      else{var was={label:o.label,parentId:o.parentId,amount:F.num(o.amount)||0,reservedFor:o.reservedFor||''};
+        if(was.label!==now.label||was.parentId!==now.parentId||was.amount!==now.amount||was.reservedFor!==now.reservedFor)changes.push({field:'earmark',from:was,to:now});}});
+    pb.forEach(function(o){if(!nb.some(function(b){return b.id===o.id;}))changes.push({field:'earmark_removed',from:{label:o.label,parentId:o.parentId,amount:F.num(o.amount)||0,reservedFor:o.reservedFor||''}});});
+    // Planning targets and budgets: blank and missing both mean "not set".
+    var pp=prev.planning||{},np=s.planning||{};
+    ['workingCapitalFloor','netWorthGoal'].forEach(function(k){var f=planNum(pp[k]),t=planNum(np[k]);if(f!==t)changes.push({field:'planning',key:k,from:f,to:t});});
+    var pbg=prev.budgets||[],nbg=s.budgets||[];
+    nbg.forEach(function(b){var o=pbg.find(function(x){return x.id===b.id;}),now={cat:b.cat,amount:F.num(b.amount)||0};
+      if(!o)changes.push({field:'budget_added',to:now});else if(o.cat!==now.cat||(F.num(o.amount)||0)!==now.amount)changes.push({field:'budget',from:{cat:o.cat,amount:F.num(o.amount)||0},to:now});});
+    pbg.forEach(function(o){if(!nbg.some(function(b){return b.id===o.id;}))changes.push({field:'budget_removed',from:{cat:o.cat,amount:F.num(o.amount)||0}});});
     // Quick-capture mapping, compared value by value (not by object key order).
     var pa=prev.aliases||{},na=s.aliases||{},keys={};
     Object.keys(F.LEGACY_ACCOUNTS).concat(Object.keys(pa),Object.keys(na)).forEach(function(k){keys[k]=1;});
@@ -3418,7 +3997,7 @@ function saveSetup(){
   }
   function acctName(id){var a=s.accounts.find(function(x){return x.id===id;})||(prev&&prev.accounts.find(function(x){return x.id===id;}));return a?(a.label||'(unnamed)'):'?';}
   function target(v){return v===null?'not chosen':v===''?'Not used':acctName(v);}
-  function bucketText(b){return esc(b.label||'(unnamed)')+' '+fmt(b.amount)+' inside '+esc(acctName(b.parentId));}
+  function bucketText(b){return esc(b.label||'(unnamed)')+' '+fmt(b.amount)+' inside '+esc(acctName(b.parentId))+(b.reservedFor?' for '+esc(reservedForLabel(b.reservedFor)):'');}
   function changeLine(c){
     if(c.field==='baselineDate')return'Baseline date: '+fmtD(c.from)+' &rarr; <b>'+fmtD(c.to)+'</b>';
     if(c.field==='label')return'Renamed: '+esc(c.from)+' &rarr; <b>'+esc(c.to)+'</b>';
@@ -3429,6 +4008,10 @@ function saveSetup(){
     if(c.field==='earmark_added')return'New earmark: <b>'+bucketText(c.to)+'</b>';
     if(c.field==='earmark_removed')return'Removed earmark: <b>'+bucketText(c.from)+'</b>';
     if(c.field==='earmark')return'Earmark: '+bucketText(c.from)+' &rarr; <b>'+bucketText(c.to)+'</b>';
+    if(c.field==='planning')return(c.key==='workingCapitalFloor'?'Working-capital floor':'Net-worth goal')+': '+(c.from===null?'not set':fmt(c.from))+' &rarr; <b>'+(c.to===null?'not set':fmt(c.to))+'</b>';
+    if(c.field==='budget_added')return'New budget: <b>'+esc(c.to.cat)+' '+fmt(c.to.amount)+' a month</b>';
+    if(c.field==='budget_removed')return'Removed budget: <b>'+esc(c.from.cat)+'</b>';
+    if(c.field==='budget')return'Budget: '+esc(c.from.cat)+' '+fmt(c.from.amount)+' &rarr; <b>'+esc(c.to.cat)+' '+fmt(c.to.amount)+'</b>';
     if(c.field==='mapping')return'Quick-capture "'+esc(F.LEGACY_ACCOUNTS[c.key]||c.key)+'": '+esc(target(c.from))+' &rarr; <b>'+esc(target(c.to))+'</b>';
     return esc(c.field);
   }
@@ -3438,7 +4021,10 @@ function saveSetup(){
   var acc=s.accounts.filter(function(a){return !a.removed;});
   qs('setup-confirm').innerHTML='<div class="card" style="background:var(--surf2);border-color:var(--amber);"><div class="card-label">Confirm '+(prev?'changes':'live setup')+' &mdash; as at the start of '+fmtD(s.baselineDate)+'</div>'
     +acc.map(function(a){return kv((a.primary?'&#9733; ':'')+esc(a.label),fmt(F.num(a.opening)||0));}).join('')
-    +s.buckets.map(function(b){return kv('Earmark '+esc(b.label)+' (inside '+esc((acc.find(function(x){return x.id===b.parentId;})||{}).label||'?')+')',fmt(F.num(b.amount)||0),'var(--muted)');}).join('')
+    +s.buckets.map(function(b){return kv('Earmark '+esc(b.label)+' (inside '+esc((acc.find(function(x){return x.id===b.parentId;})||{}).label||'?')+(b.reservedFor?', for '+esc(reservedForLabel(b.reservedFor)):'')+')',fmt(F.num(b.amount)||0),'var(--muted)');}).join('')
+    +(planNum((s.planning||{}).workingCapitalFloor)!==null?kv('Working-capital floor',fmt(planNum(s.planning.workingCapitalFloor)),'var(--muted)'):'')
+    +(planNum((s.planning||{}).netWorthGoal)!==null?kv('Net-worth goal',fmt(planNum(s.planning.netWorthGoal)),'var(--muted)'):'')
+    +(s.budgets||[]).map(function(b){return kv('Budget '+esc(b.cat)+' (a month)',fmt(F.num(b.amount)||0),'var(--muted)');}).join('')
     +'<div class="muted-note">'+Object.keys(F.LEGACY_ACCOUNTS).map(function(k){var t=s.aliases[k];return esc(F.LEGACY_ACCOUNTS[k])+' &rarr; '+(t?esc((acc.find(function(x){return x.id===t;})||{}).label||t):'Not used');}).join(' &middot; ')+'</div>'
     +changeBox
     +(changes.some(function(c){return c.field==='opening'||c.field==='baselineDate';})?'<div class="muted-note">Opening balance or baseline changes are recorded in the setup history.</div>':'')
@@ -3457,7 +4043,9 @@ function confirmSetup(){if(saving){setupResult(SETUP_BUSY_MSG);return;}guard(fun
   s.id='ledgerSetup';s.mode='live';s.updatedAt=now;s.createdAt=(prev&&prev.createdAt)||now;
   s.history=hist.concat(changes.length||!prev?[{at:now,changes:prev?changes:[{field:'created',to:s.baselineDate}]}]:[]);
   s.accounts=s.accounts.map(function(a){return{id:a.id,label:a.label,institution:a.institution,kind:a.kind,use:a.use,primary:!!a.primary,opening:F.num(a.opening)||0,removed:!!a.removed,access:a.access==='immediate'||a.access==='restricted'?a.access:''};});
-  s.buckets=s.buckets.map(function(b){return{id:b.id,label:b.label,parentId:b.parentId,amount:F.num(b.amount)||0};});
+  s.buckets=s.buckets.map(function(b){return{id:b.id,label:b.label,parentId:b.parentId,amount:F.num(b.amount)||0,reservedFor:b.reservedFor||''};});
+  s.planning={workingCapitalFloor:planNum((s.planning||{}).workingCapitalFloor),netWorthGoal:planNum((s.planning||{}).netWorthGoal)};
+  s.budgets=(s.budgets||[]).map(function(b){return{id:b.id,cat:b.cat,amount:F.num(b.amount)||0};});
   var btn=qs('setup-confirm-btn'),written=false;setupLock(true);setupSaving=true;if(btn)btn.textContent='SAVING…';
   return db.atomic([{store:'meta',put:s}]).then(function(){written=true;return db.meta.get('ledgerSetup');}).then(function(back){
     if(!back||JSON.stringify(back)!==JSON.stringify(s))throw new Error('Reading the setup back from '+db.name+' did not match what you entered.');
@@ -3492,9 +4080,11 @@ function renderDashboard(){
   el=qs('accounts-scroll');
   if(el)el.innerHTML=ACCOUNTS.map(function(a){return'<div class="acct-card"><div class="acct-name">'+a.icon+' '+esc(a.label)+'</div><div class="acct-bal">'+fmt(a.balance)+'</div><div class="acct-type">'+esc(a.type)+'</div></div>';}).join('');
   el=qs('ob-list');
-  if(el){var obs=obligationsWithin(14);el.innerHTML=obs.length?obs.map(function(o){var od=o.dueDate<getToday();return'<div class="ob-item'+(od?' overdue':'')+'"'+(o.agreementId?' data-open-agr="'+esc(o.agreementId)+'" style="cursor:pointer;"':'')+'><div class="ob-left"><span>'+o.icon+'</span><div><div class="ob-desc">'+esc(o.label)+'</div><div class="ob-due">'+dueText(o.dueDate)+' &middot; '+esc(o.source)+'</div></div></div><div class="ob-amount">'+fmt(o.remaining)+'</div></div>';}).join(''):'<div class="muted-note">Nothing due in the next 14 days.</div>';}
+  if(el){var obs=obligationsWithin(14);el.innerHTML=obs.length?obs.map(function(o){var od=o.dueDate<getToday();return'<div class="ob-item'+(od?' overdue':'')+'"'+(o.agreementId?' data-open-agr="'+esc(o.agreementId)+'" style="cursor:pointer;"':o.billId?' data-nav="bills" style="cursor:pointer;"':'')+'><div class="ob-left"><span>'+o.icon+'</span><div><div class="ob-desc">'+esc(o.label)+'</div><div class="ob-due">'+dueText(o.dueDate)+' &middot; '+esc(o.source)+'</div></div></div><div class="ob-amount">'+fmt(o.remaining)+'</div></div>';}).join(''):'<div class="muted-note">Nothing due in the next 14 days.</div>';}
   el=qs('budget-list');
-  if(el&&isLive())el.innerHTML='<div class="muted-note" data-live-na="budgets">No budgets set yet.</div>';
+  var lbg=liveBudgets();
+  if(el&&isLive()&&lbg.length)el.innerHTML=F.budgetProgress(lbg,items,monthStartISO(),getToday()).map(function(b){var c=hColor(b.pct);return'<div class="budget-row" data-budget="'+esc(b.cat)+'"><div class="budget-top"><div class="budget-cat">'+esc(b.cat)+'</div><div class="budget-right"><span class="budget-fig">'+fmt(b.used)+' of '+fmt(b.amount)+'</span><span class="budget-pct" style="color:'+c+'">'+b.pct+'%</span></div></div><div class="budget-track"><div class="budget-bar" data-pct="'+Math.min(100,b.pct)+'" style="background:'+c+';"></div></div></div>';}).join('')+'<div class="muted-note">Budgets you set in Settings &rarr; Accounts. This month so far.</div>';
+  else if(el&&isLive())el.innerHTML='<div class="muted-note" data-live-na="budgets">No budgets set yet.</div>';
   else if(el){
     el.innerHTML=BUDGETS.map(function(b){var p=pct(b.used,b.total),c=hColor(p);return'<div class="budget-row"><div class="budget-top"><div class="budget-cat"><span>'+b.icon+'</span> '+b.cat+'</div><div class="budget-right"><span class="budget-fig">'+fmt(b.used)+' of '+fmt(b.total)+'</span><span class="budget-pct" style="color:'+c+'">'+p+'%</span></div></div><div class="budget-track"><div class="budget-bar" style="background:'+c+';" data-pct="'+p+'"></div></div></div>';}).join('');
     raf2(function(){document.querySelectorAll('.budget-bar').forEach(function(b){b.style.width=b.getAttribute('data-pct')+'%';});});
@@ -3530,7 +4120,7 @@ function renderCalendar(){
   var obs=obligationsWithin(60),cc=cashCoverFor(obs),totalObs=cc.due;
   var surplus=cc.leftAfter;
   var cs=qs('cal-summary');
-  if(cs)cs.innerHTML='<div class="grid3" style="margin-bottom:0;"><div class="stat-card"><div class="stat-label">Due (60 days)</div><div class="stat-val" style="color:#EF4444;">'+fmt(totalObs)+'</div></div><div class="stat-card"><div class="stat-label">Free to Use</div><div class="stat-val" style="color:#22C55E;">'+fmt(cc.freeToUse)+'</div></div><div class="stat-card"><div class="stat-label">'+(surplus>=0?'Left After':'Gap')+'</div><div class="stat-val" style="color:'+(surplus>=0?'#22C55E':'#EF4444')+';">'+(surplus>=0?'+':'-')+fmt(Math.abs(surplus))+'</div></div></div><div class="muted-note" style="margin-bottom:0;">Free to use = Cash Now '+fmt(cc.cashNow)+' less '+fmt(cc.earmarked)+' earmarked. Planned amounts only &mdash; balances change when a payment is actually recorded. Expected income is not included.</div>';
+  if(cs)cs.innerHTML='<div class="grid3" style="margin-bottom:0;"><div class="stat-card"><div class="stat-label">Due (60 days)</div><div class="stat-val" style="color:#EF4444;">'+fmt(totalObs)+'</div></div><div class="stat-card"><div class="stat-label">Free to Use</div><div class="stat-val" style="color:#22C55E;">'+fmt(cc.freeToUse)+'</div></div><div class="stat-card"><div class="stat-label">'+(surplus>=0?'Left After':'Gap')+'</div><div class="stat-val" style="color:'+(surplus>=0?'#22C55E':'#EF4444')+';">'+(surplus>=0?'+':'-')+fmt(Math.abs(surplus))+'</div></div></div><div class="muted-note" style="margin-bottom:0;">Free to use = Cash Now '+fmt(cc.cashNow)+' less '+fmt(cc.earmarked)+' earmarked.'+(cc.covered>0?' '+fmt(cc.covered)+' of the amount due is already covered by linked earmarks, so only the rest is taken from free cash.':'')+' Planned amounts only &mdash; balances change when a payment is actually recorded. Expected income is not included.</div>';
   var cl=qs('calendar-list');if(!cl)return;
   var MON=['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'],FULL=['January','February','March','April','May','June','July','August','September','October','November','December'];
   var lastM='',td=getToday(),h='';
@@ -3538,7 +4128,7 @@ function renderCalendar(){
     var d=F.parseDate(o.dueDate),mk=d.getFullYear()+'-'+d.getMonth(),od=o.dueDate<td;
     var head=od?'OVERDUE':FULL[d.getMonth()]+' '+d.getFullYear();
     if(head!==lastM){h+='<div class="cal-month-header">'+head+'</div>';lastM=head;}
-    h+='<div class="cal-item'+(od?' overdue-item':o.dueDate===td?' today-item':'')+'"'+(o.agreementId?' data-open-agr="'+esc(o.agreementId)+'" style="cursor:pointer;"':'')+'><div class="cal-date-badge"><div class="cal-day">'+d.getDate()+'</div><div class="cal-mon">'+MON[d.getMonth()]+'</div></div><div class="cal-body"><div class="cal-desc">'+esc(o.label)+'</div><div class="cal-cat">'+dueText(o.dueDate)+' &middot; '+esc(o.source)+'</div></div><div class="cal-amount">'+fmt(o.remaining)+'</div></div>';
+    h+='<div class="cal-item'+(od?' overdue-item':o.dueDate===td?' today-item':'')+'"'+(o.agreementId?' data-open-agr="'+esc(o.agreementId)+'" style="cursor:pointer;"':o.billId?' data-nav="bills" style="cursor:pointer;"':'')+'><div class="cal-date-badge"><div class="cal-day">'+d.getDate()+'</div><div class="cal-mon">'+MON[d.getMonth()]+'</div></div><div class="cal-body"><div class="cal-desc">'+esc(o.label)+'</div><div class="cal-cat">'+dueText(o.dueDate)+' &middot; '+esc(o.source)+'</div></div><div class="cal-amount">'+fmt(o.remaining)+'</div></div>';
   });
   cl.innerHTML=h||'<div class="empty-state">Nothing due in the next 60 days.</div>';
 }
@@ -3557,7 +4147,7 @@ function renderPressure(){
   if(el)el.innerHTML=obs.map(function(o){return'<div class="pressure-row"><span class="pressure-item-name">'+o.icon+' '+esc(o.label)+' <span style="color:var(--muted);font-size:10px;">'+dueText(o.dueDate)+'</span></span><span class="pressure-item-amt">'+fmt(o.remaining)+'</span></div>';}).join('')||'<div class="muted-note">Nothing due.</div>';
   el=qs('pressure-total');if(el)el.textContent=fmt(totalObs);
   el=qs('pressure-vs');
-  if(el)el.innerHTML='<div class="stat-card"><div class="stat-label">Cash Now (gross)</div><div class="stat-val" style="color:#7A7880;">'+fmt(cc.cashNow)+'</div></div><div class="stat-card"><div class="stat-label">Free to Use (after earmarks)</div><div class="stat-val" style="color:#22C55E;">'+fmt(cc.freeToUse)+'</div></div><div class="stat-card"><div class="stat-label">Obligations</div><div class="stat-val" style="color:#EF4444;">'+fmt(totalObs)+'</div></div><div class="stat-card"><div class="stat-label">Left After</div><div class="stat-val" style="color:'+(cc.leftAfter>=0?'#22C55E':'#EF4444')+';">'+(cc.leftAfter<0?'-':'+')+fmt(cc.leftAfter)+'</div></div>';
+  if(el)el.innerHTML='<div class="stat-card"><div class="stat-label">Cash Now (gross)</div><div class="stat-val" style="color:#7A7880;">'+fmt(cc.cashNow)+'</div></div><div class="stat-card"><div class="stat-label">Free to Use (after earmarks)</div><div class="stat-val" style="color:#22C55E;">'+fmt(cc.freeToUse)+'</div></div><div class="stat-card"><div class="stat-label">Obligations</div><div class="stat-val" style="color:#EF4444;">'+fmt(totalObs)+'</div></div><div class="stat-card"><div class="stat-label">Left After</div><div class="stat-val" style="color:'+(cc.leftAfter>=0?'#22C55E':'#EF4444')+';">'+(cc.leftAfter<0?'-':'+')+fmt(cc.leftAfter)+'</div></div><div class="stat-card"><div class="stat-label">Covered by Linked Earmarks</div><div class="stat-val" style="color:#7A7880;">'+fmt(cc.covered)+'</div></div>';
 }
 
 function renderCapital(){
@@ -3577,7 +4167,9 @@ function renderCapital(){
 function renderNetWorth(){
   var ta=ACCOUNTS.reduce(function(s,a){return s+a.balance;},0);
   var loans=activeDebtViews(),un=unlinkedLoanReceipts();
-  var tl2=loans.reduce(function(s,v){return s+v.bal.outstanding.total;},0)+un.reduce(function(s,t){return s+t.amount;},0)+(isLive()?0:OBLIGATIONS_DATA.reduce(function(s,o){return s+o.amount;},0));
+  // Overdue bills are owed now, so they are liabilities; bills not yet due are future payments, not debts.
+  var ob=isLive()?billEntries().filter(function(o){return o.dueDate<getToday();}):[],obT=ob.reduce(function(s,o){return s+o.remaining;},0);
+  var tl2=loans.reduce(function(s,v){return s+v.bal.outstanding.total;},0)+un.reduce(function(s,t){return s+t.amount;},0)+obT+(isLive()?0:OBLIGATIONS_DATA.reduce(function(s,o){return s+o.amount;},0));
   var nw=ta-tl2,nwc=nw>=0?'#22C55E':'#EF4444',goal=10000000,fi=Math.max(0,Math.min(100,Math.round(nw/goal*100)));
   var el;
   el=qs('nw-total');if(el){el.textContent=(nw<0?'-':'')+fmt(nw);el.style.color=nwc;}
@@ -3587,11 +4179,13 @@ function renderNetWorth(){
   el=qs('nw-assets-list');if(el)el.innerHTML=ACCOUNTS.map(function(a){return'<div class="nw-row"><div class="nw-row-label"><span>'+a.icon+'</span><span>'+esc(a.label)+'</span></div><div class="nw-row-val" style="color:#22C55E;">'+fmt(a.balance)+'</div></div>';}).join('');
   el=qs('nw-liabs-list');if(el)el.innerHTML=loans.map(function(v){return'<div class="nw-row" data-open-agr="'+esc(v.agr.id)+'"><div class="nw-row-label"><span>&#127974;</span><span>'+esc(v.agr.name)+'</span></div><div class="nw-row-val" style="color:#EF4444;">'+fmt(v.bal.outstanding.total)+'</div></div>';}).join('')
     +un.map(function(t){return'<div class="nw-row"><div class="nw-row-label"><span>&#9888;</span><span>'+esc(t.desc)+' (terms not recorded, at least)</span></div><div class="nw-row-val" style="color:#EF4444;">'+fmt(t.amount)+'</div></div>';}).join('')
+    +ob.map(function(o){return'<div class="nw-row" data-nav="bills"><div class="nw-row-label"><span>&#128196;</span><span>'+esc(o.label)+' (overdue bill, due '+fmtD(o.dueDate)+')</span></div><div class="nw-row-val" style="color:#EF4444;">'+fmt(o.remaining)+'</div></div>';}).join('')
     +(isLive()?[]:OBLIGATIONS_DATA).map(function(o){return'<div class="nw-row"><div class="nw-row-label"><span>'+o.icon+'</span><span>'+o.desc+' (bill)</span></div><div class="nw-row-val" style="color:#EF4444;">'+fmt(o.amount)+'</div></div>';}).join('');
-  if(isLive())fi=0; // the ₦10M goal is a sample: no target is set in live mode
+  var ng=planning().netWorthGoal;
+  if(isLive())fi=ng?Math.max(0,Math.min(100,Math.round(nw/ng*100))):0; // the ₦10M goal is a sample: live uses only the goal you set
   var fl=document.querySelector('.fi-labels');if(fl)fl.style.display=isLive()?'none':'';
-  el=qs('fi-goal-label');if(el)el.textContent=isLive()?'No net-worth goal set yet.':'Net Worth vs \u20A610M Goal (sample)';
-  el=qs('fi-pct-label');if(el)el.textContent=isLive()?'No target set':fi+'%';
+  el=qs('fi-goal-label');if(el)el.textContent=isLive()?(ng?'Progress toward the goal you set ('+fmt(ng)+')':'No net-worth goal set yet.'):'Net Worth vs \u20A610M Goal (sample)';
+  el=qs('fi-pct-label');if(el)el.textContent=isLive()&&!ng?'No target set':fi+'%';
   el=qs('fi-bar');if(el)raf2(function(){el.style.width=fi+'%';});
   el=qs('nw-trend');
   if(el&&isLive())el.innerHTML='<div class="muted-note" data-live-na="nw-trend">Not enough recorded history yet.</div>';
@@ -3666,6 +4260,7 @@ function renderAutopilot(){
     {lbl:'Restricted (coop, fixed deposit)',val:fmt(cp.restricted),color:'#7A7880'},
     {lbl:'Committed: Next 30 Days',val:fmt(totalObs),color:'#EF4444'},
     {lbl:'&nbsp;&nbsp;of which loan repayments',val:fmt(loanDue),color:'#F5A623'},
+    {lbl:'&nbsp;&nbsp;covered by linked earmarks',val:fmt(cc.covered),color:'#7A7880'},
     {lbl:'Expected Inflows',val:'Not forecast',color:'#7A7880'},
     {lbl:'Left After Known Obligations (free to use)',val:(gap<0?'-':'+')+fmt(gap),color:gap>=0?'#22C55E':'#EF4444'},
     {lbl:'Largest Demand',val:largest?esc(largest.label)+' '+fmt(largest.remaining):'--',color:'#F5A623'},
@@ -3754,6 +4349,235 @@ function renderSettings(){
   renderNotifStatus();
 }
 
+/* ═══════════════ BILLS ═══════════════
+   One bill record per bill (store "bills"); its occurrences are derived by the engine
+   (F.billOccurrences) from the saved definition, so nothing is ever generated twice. A payment
+   is one ordinary "Bill paid" transaction carrying billId + billOcc. */
+var BILL_STATUS={upcoming:'Upcoming',due_soon:'Due soon',due_today:'Due today',partial:'Part paid',paid:'Paid',overdue:'Overdue',cancelled:'Cancelled',skipped:'Not owed'};
+function billById(id){return BILLS.find(function(b){return b.id===id;});}
+function billPayments(id){return items.filter(function(t){return !t.demo&&t.billId===id;});}
+function billHasPayments(id){return billPayments(id).some(function(t){return !t.voided;});}
+function billOccs(b,days){return F.billOccurrences(b,items,{today:getToday(),until:F.addDays(getToday(),days||60)});}
+function findOcc(occId){var bid=String(occId).split('@')[0],b=billById(bid);if(!b)return null;var o=F.billOccurrences(b,items,{today:getToday(),until:'9999-12-31'}).find(function(x){return x.id===occId;});return o?{bill:b,occ:o}:null;}
+function openBillOccs(days){var out=[];BILLS.forEach(function(b){billOccs(b,days).forEach(function(o){if(o.remaining>0)out.push(o);});});return out.sort(function(a,b){return a.dueDate<b.dueDate?-1:1;});}
+// A recorded "Bill paid" that is not linked to any bill but matches an open occurrence closely.
+function unlinkedPaymentsFor(o){return items.filter(function(t){return !t.demo&&!t.voided&&!t.billId&&t.type==='obligation'&&Math.abs(F.daysBetween(t.date,o.dueDate))<=10&&t.amount<=o.remaining+0.001;});}
+function renderBills(){
+  var due=qs('bills-due'),list=qs('bills-list'),note=qs('bills-mode-note'),add=qs('bill-add-btn');if(!due||!list)return;
+  var live=isLive();
+  if(note)note.innerHTML=live?'':'<div class="form-warn">Bills are tracked for your real accounts. Set them up first in Settings &rarr; Accounts. Demo mode shows sample bills on the other screens.</div>';
+  if(add)add.disabled=!live;
+  var occ=live?openBillOccs(60):[];
+  due.innerHTML=occ.length?occ.map(function(o){
+    var cand=unlinkedPaymentsFor(o).length;
+    return'<div class="autopilot-row" data-bill-occ="'+esc(o.id)+'"><span class="autopilot-lbl">'+esc(o.label)+' &middot; '+dueText(o.dueDate)+'<br><span style="font-size:10px;">'+fmt(o.amount)+(o.paid>0?', paid '+fmt(o.paid)+', left '+fmt(o.remaining):'')+(cand?' &middot; a matching payment may already be recorded':'')+'</span></span>'
+      +'<span class="autopilot-val"><span class="status-pill '+(o.status==='overdue'?'overdue':o.status==='upcoming'?'':'due_soon')+'">'+BILL_STATUS[o.status]+'</span><br><button class="act-btn act-approve" data-bill-pay="'+esc(o.id)+'">PAY</button> <button class="act-btn act-dismiss" data-bill-skip="'+esc(o.id)+'">NOT OWED</button></span></div>';
+  }).join(''):'<div class="muted-note">'+(live?(BILLS.length?'Nothing due in the next 60 days.':'No bills yet. Add rent, electricity, salaries and other regular payments so they count in your plans.'):'')+'</div>';
+  list.innerHTML=BILLS.length&&live?BILLS.slice().sort(function(a,b){return(a.status==='cancelled')-(b.status==='cancelled')||String(a.name).localeCompare(String(b.name));}).map(function(b){
+    var all=F.billOccurrences(b,items,{today:getToday(),until:F.addDays(getToday(),400)}),next=all.find(function(o){return o.remaining>0;}),pays=billPayments(b.id).sort(function(x,y){return x.date<y.date?1:-1;});
+    var skipped=all.filter(function(o){return o.status==='skipped';});
+    return'<div class="agr-card" data-bill="'+esc(b.id)+'"><div style="display:flex;justify-content:space-between;gap:8px;"><b>'+esc(b.name)+'</b><span class="status-pill'+(b.status==='cancelled'?' overdue':' active')+'">'+(b.status==='cancelled'?'Cancelled from '+fmtD(b.cancelledFrom):'Active')+'</span></div>'
+      +'<div class="muted-note" style="margin:4px 0;">'+esc(b.cat||'No category')+' &middot; '+F.BILL_REPEAT[b.repeat]+' &middot; '+fmt(F.billAmountOn(b,getToday()))+(b.until?' &middot; ends '+fmtD(b.until):'')+' &middot; next: '+(next?fmtD(next.dueDate)+' ('+fmt(next.remaining)+')':'nothing due')+'</div>'
+      +(pays.length?'<div class="muted-note" style="margin:4px 0;">Payments: '+pays.map(function(t){return'<span data-bill-payment="'+esc(t.id)+'">'+fmtD(t.date)+' '+fmt(t.amount)+(t.voided?' (reversed)':/^billpay/.test(t.idemKey||'')?' <button class="act-btn act-dismiss" data-bill-reverse="'+esc(t.id)+'">REVERSE</button>':' <button class="act-btn act-dismiss" data-bill-unlink="'+esc(t.id)+'">UNLINK</button>')+'</span>';}).join(' &middot; ')+'</div>':'')
+      +(skipped.length?'<div class="muted-note" style="margin:4px 0;">Marked not owed: '+skipped.map(function(o){return fmtD(o.dueDate)+' <button class="act-btn act-approve" data-bill-unskip="'+esc(o.id)+'">OWED AFTER ALL</button>';}).join(' &middot; ')+'</div>':'')
+      +'<div class="btn-row"><button data-bill-edit="'+esc(b.id)+'">Edit</button>'+(b.status!=='cancelled'?'<button class="danger" data-bill-cancel="'+esc(b.id)+'">Cancel bill</button>':'')+'</div></div>';
+  }).join(''):'<div class="muted-note">'+(live?'No bills yet.':'')+'</div>';
+}
+var billCtx=null;
+function billMsg(h){var el=qs('bill-form-msg');if(el)el.innerHTML=h;}
+function openBillForm(id){
+  var b=id?billById(id):null,locked=!!(b&&billHasPayments(b.id));
+  billCtx={id:b?b.id:uid('bill'),prev:b?clone(b):null};
+  qs('bill-modal-title').textContent=b?'EDIT BILL':'ADD A BILL';
+  qs('bill-cat').innerHTML=budgetCats().map(function(c){return'<option'+(b&&b.cat===c?' selected':'')+'>'+esc(c)+'</option>';}).join('');
+  if(!b)qs('bill-cat').value='Utilities';
+  setVal('bill-name',b?b.name:'');setVal('bill-amount',b?F.billAmountOn(b,getToday()):'');setVal('bill-first',b?b.firstDue:getToday());
+  setVal('bill-repeat',b?b.repeat:'monthly');setVal('bill-until',b&&b.until?b.until:'');setVal('bill-amount-from',getToday());
+  qs('bill-first').disabled=locked;qs('bill-repeat').disabled=locked;
+  document.querySelectorAll('[data-bill-edit="1"]').forEach(function(el){el.style.display=b?'':'none';});
+  billMsg(locked?'<div class="muted-note">This bill already has payments, so its first due date and repeat are fixed. Cancel it and add a new one to change them.</div>':'');
+  var sb=qs('bill-save-btn');sb.disabled=false;sb.textContent='SAVE BILL';
+  openModal('bill-modal');
+}
+function saveBill(){
+  if(!billCtx)return;
+  var prev=billCtx.prev,hasPay=!!(prev&&billHasPayments(prev.id)),now=nowISO();
+  var b=prev?clone(prev):{id:billCtx.id,status:'active',createdAt:now,amountChanges:[],overrides:{},history:[]};
+  b.name=String(val('bill-name')||'').trim();b.cat=qs('bill-cat').value;b.until=val('bill-until')||null;
+  if(!prev||!hasPay){b.firstDue=val('bill-first');b.repeat=val('bill-repeat');}
+  var amt=F.num(val('bill-amount')),changes=[];
+  if(!prev)b.amount=amt;
+  else if(amt!==F.billAmountOn(prev,getToday())){
+    var from=val('bill-amount-from')||getToday();
+    if(!F.parseDate(from)){billMsg('<div class="form-err">Choose the date the new amount applies from.</div>');return;}
+    if(from<=b.firstDue){b.amount=amt;b.amountChanges=[];}
+    else b.amountChanges=(prev.amountChanges||[]).filter(function(c){return c.from<from;}).concat([{from:from,amount:amt}]);
+    changes.push({field:'amount',from:F.billAmountOn(prev,from),to:amt,effectiveFrom:from});
+  }
+  if(prev){['name','cat','until','firstDue','repeat'].forEach(function(k){if((prev[k]||null)!==(b[k]||null))changes.push({field:k,from:prev[k]||null,to:b[k]||null});});}
+  var v=F.validateBill(b,{previous:prev,hasPayments:hasPay});
+  if(!v.ok){billMsg('<div class="form-err">Not saved yet: '+v.errors.map(esc).join('<br>')+'</div>');return;}
+  b.updatedAt=now;b.history=(b.history||[]).concat([{at:now,changes:prev?changes:[{field:'created'}]}]);
+  if(saving){billMsg('<div class="form-err">Another save is still in progress, so nothing was saved yet. Try again in a moment.</div>');return;}
+  var sb=qs('bill-save-btn');if(sb.disabled)return;sb.disabled=true;sb.textContent='SAVING…';
+  guard(function(){return commit([{store:'bills',put:b}]).then(function(){
+    billCtx=null;closeModal('bill-modal');showToast('Bill saved');
+  },function(err){
+    console.error(err);sb.disabled=false;sb.textContent='SAVE BILL';
+    billMsg('<div class="form-err"><b>Not saved.</b> '+esc(errText(err))+'. Nothing was changed; your entries are still in the form.</div>');
+  });});
+}
+function saveBillRecord(b,okMsg,what){
+  return guard(function(){return commit([{store:'bills',put:b}]).then(function(){showToast(okMsg);},function(err){console.error(err);reportFailure(what+' NOT saved: '+errText(err)+'. Nothing was changed.');});});
+}
+function cancelBill(id){
+  var b=billById(id);if(!b||b.status==='cancelled')return;
+  var td=getToday(),owed=billOccs(b,0).filter(function(o){return o.remaining>0&&o.dueDate<td;});
+  if(!kfConfirm('Cancel "'+b.name+'" from today? Nothing due from today on will be expected.'+(owed.length?'\n\n'+owed.length+' earlier unpaid occurrence(s) stay owed. Mark them "not owed" separately if they will never be paid.':'')))return;
+  var n=clone(b),now=nowISO();n.status='cancelled';n.cancelledFrom=td;n.updatedAt=now;n.history=(n.history||[]).concat([{at:now,changes:[{field:'cancelled',to:td}]}]);
+  saveBillRecord(n,'Bill cancelled','Cancelling the bill');
+}
+function skipOcc(occId,undo){
+  var f=findOcc(occId);if(!f)return;
+  var n=clone(f.bill),now=nowISO(),due=f.occ.dueDate;n.overrides=n.overrides||{};
+  if(undo){delete n.overrides[due];n.history=(n.history||[]).concat([{at:now,changes:[{field:'owed_again',key:due}]}]);}
+  else{
+    if(f.occ.paid>0){alert('Part of this has been paid. Reverse the payment first if none of it was owed.');return;}
+    var reason=kfPrompt('Why is the '+fmtD(due)+' payment of "'+f.bill.name+'" not owed? (e.g. waived, moved)','');if(reason===null)return;
+    n.overrides[due]={skipped:true,reason:String(reason).trim(),at:now};n.history=(n.history||[]).concat([{at:now,changes:[{field:'not_owed',key:due,reason:String(reason).trim()}]}]);
+  }
+  n.updatedAt=now;saveBillRecord(n,undo?'Marked as owed':'Marked as not owed','The change');
+}
+var billPayCtx=null;
+function billPayMsg(h){var el=qs('bill-pay-msg');if(el)el.innerHTML=h;}
+function openBillPay(occId){
+  var f=findOcc(occId);if(!f)return;var o=f.occ;
+  billPayCtx={occId:o.id,billId:f.bill.id,idem:uid('billpay')};
+  qs('bill-pay-info').innerHTML='<div class="card" style="background:var(--surf2);"><b>'+esc(f.bill.name)+'</b> &middot; due '+fmtD(o.dueDate)+'<br>Amount '+fmt(o.amount)+(o.paid>0?' &middot; already paid '+fmt(o.paid):'')+' &middot; <b>still due '+fmt(o.remaining)+'</b></div>';
+  var cand=unlinkedPaymentsFor(o);
+  qs('bill-pay-candidates').innerHTML=cand.length?'<div class="form-warn">Already recorded this payment elsewhere? Link it instead of recording it again:<br>'+cand.map(function(t){return esc(t.desc)+' &middot; '+fmtD(t.date)+' &middot; '+fmt(t.amount)+' <button class="act-btn act-approve" data-bill-link="'+esc(t.id)+'">LINK THIS PAYMENT</button>';}).join('<br>')+'</div>':'';
+  setVal('bill-pay-amount',o.remaining);setVal('bill-pay-date',getToday());
+  qs('bill-pay-account').innerHTML=ACCOUNTS.map(function(a){return'<option value="'+esc(a.id)+'"'+(a.id===primaryAccountId()?' selected':'')+'>'+esc(a.label)+'</option>';}).join('');
+  billPayMsg('');var sb=qs('bill-pay-save-btn');sb.disabled=false;sb.textContent='RECORD PAYMENT';
+  openModal('bill-pay-modal');
+}
+function saveBillPay(){
+  if(!billPayCtx)return;
+  var f=findOcc(billPayCtx.occId);if(!f){billPayMsg('<div class="form-err">This bill date no longer exists.</div>');return;}
+  if(items.some(function(t){return t.idemKey===billPayCtx.idem;})){closeModal('bill-pay-modal');return;} // already saved: never twice
+  var amt=F.num(val('bill-pay-amount')),date=val('bill-pay-date'),acct=qs('bill-pay-account').value,o=f.occ;
+  if(!(amt>0)){billPayMsg('<div class="form-err">Enter the amount paid.</div>');return;}
+  if(amt>o.remaining+0.001){billPayMsg('<div class="form-err">That is more than is still due ('+fmt(o.remaining)+'). Record any extra as a separate entry.</div>');return;}
+  if(!F.parseDate(date)||date>getToday()){billPayMsg('<div class="form-err">Choose the date it was paid (not in the future).</div>');return;}
+  if(!acct){billPayMsg('<div class="form-err">Choose the account it was paid from.</div>');return;}
+  var rec={id:newTxnId(),amount:amt,desc:f.bill.name,cat:f.bill.cat||'Utilities',type:'obligation',state:'Linked',date:date,time:getNow(),fromAcct:acct,toAcct:'',billId:f.bill.id,billOcc:o.id,idemKey:billPayCtx.idem,createdAt:nowISO()};
+  if(saving){billPayMsg('<div class="form-err">Another save is still in progress, so nothing was recorded yet. Try again in a moment.</div>');return;}
+  var sb=qs('bill-pay-save-btn');if(sb.disabled)return;sb.disabled=true;sb.textContent='SAVING…';
+  guard(function(){return commit([{store:'transactions',put:rec}]).then(function(){
+    billPayCtx=null;closeModal('bill-pay-modal');showToast(amt<o.remaining?'Part payment recorded':'Payment recorded');
+  },function(err){
+    console.error(err);sb.disabled=false;sb.textContent='RECORD PAYMENT';
+    billPayMsg('<div class="form-err"><b>Payment NOT recorded.</b> '+esc(errText(err))+'. Nothing was changed; try again.</div>');
+  });});
+}
+function linkBillPayment(txnId){
+  if(!billPayCtx)return;var f=findOcc(billPayCtx.occId),t=items.find(function(x){return String(x.id)===String(txnId);});if(!f||!t)return;
+  if(t.billId){billPayMsg('<div class="form-err">That payment is already linked to a bill.</div>');return;}
+  if(t.amount>f.occ.remaining+0.001){billPayMsg('<div class="form-err">That payment is more than is still due.</div>');return;}
+  var n=clone(t);n.billId=f.bill.id;n.billOcc=f.occ.id;n.state='Linked';
+  guard(function(){return commit([{store:'transactions',put:n}]).then(function(){billPayCtx=null;closeModal('bill-pay-modal');showToast('Payment linked to the bill');},function(err){console.error(err);billPayMsg('<div class="form-err"><b>Not linked.</b> '+esc(errText(err))+'. Nothing was changed.</div>');});});
+}
+/* A payment recorded elsewhere and linked to a bill is detached, not voided: the money was still
+   spent. The bill shows that date as unpaid again. The link history is kept on the entry. */
+function unlinkBillPayment(txnId){
+  var t=items.find(function(x){return String(x.id)===String(txnId);});if(!t||!t.billId)return;
+  if(!kfConfirm('Unlink "'+t.desc+'" ('+fmt(t.amount)+', '+fmtD(t.date)+') from this bill? It stays recorded as money spent; the bill shows that date as unpaid again.'))return;
+  var n=clone(t);n.billLinks=(t.billLinks||[]).concat([{billId:t.billId,billOcc:t.billOcc,unlinkedAt:nowISO()}]);delete n.billId;delete n.billOcc;
+  guard(function(){return commit([{store:'transactions',put:n}]).then(function(){showToast('Payment unlinked');},function(err){console.error(err);reportFailure('Unlink NOT saved: '+errText(err)+'. Nothing was changed.');});});
+}
+function reverseBillPayment(txnId){
+  var t=items.find(function(x){return String(x.id)===String(txnId);});if(!t||t.voided||!t.billId||!/^billpay/.test(t.idemKey||''))return;
+  if(!kfConfirm('Reverse the '+fmt(t.amount)+' payment of '+fmtD(t.date)+'? Its amount goes back into '+acctLabel(t.fromAcct)+' and the bill shows it as unpaid again. The record is kept, marked reversed.'))return;
+  var n=clone(t);n.voided=true;n.voidedAt=nowISO();n.voidReason='Bill payment reversed';
+  guard(function(){return commit([{store:'transactions',put:n}]).then(function(){showToast('Payment reversed');},function(err){console.error(err);reportFailure('Reversal NOT saved: '+errText(err)+'. Nothing was changed.');});});
+}
+
+/* ═══════════════ DAILY MONEY DIRECTOR ═══════════════
+   Built only from the shared engine: cashPosition + reservationPlan (earmarks and their links),
+   the 30-day obligations, the working-capital floor you set, and data-quality checks. Its
+   "free after commitments" is the same figure as freeCash(), Autopilot and Pressure. */
+function liveQuality(){
+  if(!isLive())return[];
+  var q=F.dataQuality({txns:items,accountIds:ACCOUNTS.map(function(a){return a.id;}),aliases:SETUP.aliases,baselineDate:SETUP.baselineDate,today:getToday()});
+  ACCOUNTS.filter(function(a){return a.balance<0;}).forEach(function(a){q.push({key:'negative_balance',severity:'high',count:1,ids:[a.id],text:a.label+' shows a negative balance (-'+fmt(a.balance)+'). An inflow may be missing, or it is an overdraft that should be recorded as a loan.'});});
+  var um=F.billUnmatchedPayments(BILLS,items,{today:getToday()});
+  if(um.length)q.push({key:'bill_unmatched',severity:'medium',count:um.length,ids:um.map(function(t){return t.id;}),text:um.length+' bill payment'+(um.length>1?'s point':' points')+' to a bill date that no longer exists. '+(um.length>1?'They still count':'It still counts')+' as money spent.'});
+  var maybe=[];openBillOccs(7).forEach(function(o){unlinkedPaymentsFor(o).forEach(function(t){if(Math.abs(t.amount-o.remaining)<0.01||Math.abs(t.amount-o.amount)<0.01)maybe.push({t:t,o:o});});});
+  if(maybe.length)q.push({key:'bill_maybe_paid',severity:'medium',count:maybe.length,ids:maybe.map(function(m){return m.t.id;}),text:maybe.map(function(m){return'"'+m.t.desc+'" ('+fmt(m.t.amount)+', '+fmtD(m.t.date)+') may be the payment for '+m.o.label+' due '+fmtD(m.o.dueDate)+'. Link it in Bills so the bill is not counted as still due.';}).join(' ')});
+  var ul=unlinkedLoanReceipts();
+  if(ul.length)q.push({key:'unlinked_loan',severity:'high',count:ul.length,ids:ul.map(function(t){return t.id;}),text:ul.length+' loan receipt'+(ul.length>1?'s have':' has')+' no agreement, so what you owe on '+(ul.length>1?'them':'it')+' is unknown. Link '+(ul.length>1?'them':'it')+' in Loans.'});
+  return q;
+}
+function directorData(){
+  var r=reservations(),cp=F.cashPosition(ACCOUNTS,r.effective),obs=obligationsWithin(30);
+  var avail={};ACCOUNTS.forEach(function(a){avail[a.id]=F.accountAccess(a)==='immediate';});
+  var linked=r.buckets.filter(function(b){return b.reservedFor&&avail[b.parentId];}).reduce(function(t,b){return t+b.effective;},0);
+  var plan=F.directorPlan({today:getToday(),cashNow:cp.available,restricted:cp.restricted,earmarkedGeneral:cp.earmarked-linked,reservedLinked:linked,freeToUse:cp.unearmarked,
+    obligations:obs.map(function(o){return{id:o.id,label:o.label,dueDate:o.dueDate,remaining:o.remaining,covered:r.coverage[o.id]||0,agreementId:o.agreementId||null};}),
+    floor:planning().workingCapitalFloor,quality:liveQuality(),overEarmarked:cp.overEarmarked,staleReservations:staleReservations()});
+  plan.position=cp;plan.notBacked=Math.round((cp.unearmarked-(cp.available-cp.earmarked))*100)/100;
+  return plan;
+}
+function renderDirector(){
+  var body=qs('director-body'),teaser=qs('director-teaser');if(!body&&!teaser)return;
+  var d=directorData(),f=d.figures,td=getToday(),live=isLive();
+  function row(l,v,c,cls){return'<div class="autopilot-row"'+(cls?' data-dir-row="'+cls+'"':'')+'><span class="autopilot-lbl">'+l+'</span><span class="autopilot-val" style="color:'+(c||'var(--text)')+';">'+v+'</span></div>';}
+  function signed(v){return(v<0?'-':'')+fmt(v);}
+  function link(a){if(!a.link)return'';if(a.link.agreementId)return' <button class="act-btn act-approve" data-dir-open-agr="'+esc(a.link.agreementId)+'">OPEN</button>';return' <button class="act-btn act-approve" data-nav="'+esc(a.link.screen)+'">OPEN</button>';}
+  var top=d.actions[0];
+  if(teaser)teaser.innerHTML='<div class="card" data-nav="director" style="cursor:pointer;"><div class="card-label">Daily Money Director</div>'
+    +row('Free to allocate now',fmt(f.safeToAllocate),f.safeToAllocate>0?'#22C55E':'#7A7880','teaser-safe')
+    +(top?'<div class="muted-note" style="margin-bottom:0;">Next: '+esc(top.title)+'</div>':'')+'</div>';
+  if(!body)return;
+  var h='';
+  h+=live?'':'<div class="form-warn">Demo mode: these are sample figures, not your money.</div>';
+  h+=d.qualified?'<div class="form-warn" data-dir-status="qualified">Some information is missing or uncertain (listed at the bottom). Treat these figures as a guide until it is fixed.</div>'
+    :'<div class="muted-note" data-dir-status="complete">Based on your recorded balances, earmarks and the payments due. No problems found in the records.</div>';
+  h+='<div class="card"><div class="card-label">Where your money stands</div>'
+    +row('Cash Now (cash, bank, wallet)',fmt(f.cashNow),'#22C55E','cash')
+    +row('&minus; General earmarks',fmt(f.earmarkedGeneral),'#7A7880','general')
+    +row('&minus; Reserved for payments (linked earmarks)',fmt(f.reservedLinked),'#7A7880','linked')
+    +(d.notBacked>0?row('+ Earmarks the accounts cannot cover',fmt(d.notBacked),'#EF4444','notbacked'):'')
+    +row('= Free to use',fmt(f.freeToUse),'#22C55E','free')
+    +row('&minus; Payments due in 30 days not yet reserved',fmt(f.uncovered),'#EF4444','uncovered')
+    +row('= Free after commitments',signed(f.freeAfterCommitments),f.freeAfterCommitments>=0?'#22C55E':'#EF4444','after')
+    +row('&minus; Working-capital floor (your setting)',f.floor===null?'Not set':fmt(f.floor),'#7A7880','floor')
+    +row('= Free to allocate',fmt(f.safeToAllocate),f.safeToAllocate>0?'#22C55E':'#7A7880','safe')
+    +row('Restricted (coop, fixed deposit): not counted',fmt(f.restricted),'#7A7880','restricted')
+    +'<div class="muted-note" style="margin-bottom:0;">Every line comes from saved records. Payments due after 30 days and income you have not recorded are not included.</div></div>';
+  var FUND={funded:['Funded','#22C55E'],partly:['Partly funded','#F5A623'],unfunded:['Not funded','#EF4444']};
+  h+='<div class="card"><div class="card-label">Payments due (next 30 days)</div>'
+    +(d.obligations.length?d.obligations.map(function(o){var fs=FUND[o.funding];return'<div class="autopilot-row" data-dir-obl="'+esc(o.id)+'"'+(o.agreementId?' data-open-agr="'+esc(o.agreementId)+'" style="cursor:pointer;"':o.billId?' data-nav="bills" style="cursor:pointer;"':'')+'><span class="autopilot-lbl">'+esc(o.label)+' &middot; '+dueText(o.dueDate)
+      +'<br><span style="font-size:10px;">'+fmt(o.remaining)+(o.covered>0?', '+fmt(o.covered)+' reserved':'')+'</span></span><span class="autopilot-val" style="color:'+fs[1]+';">'+fs[0]+'</span></div>';}).join('')
+      :'<div class="muted-note">No recorded payments are due in the next 30 days.'+(live&&!BILLS.length?' No bills are set up yet.':'')+'</div>')+'</div>';
+  h+='<div class="card"><div class="card-label">What to do next</div>'
+    +d.actions.map(function(a){return'<div class="director-action" data-dir-action="'+a.kind+'" style="border-top:1px solid var(--border);padding:8px 0;"><div style="font-weight:700;">'+a.rank+'. '+esc(a.title)+link(a)+'</div>'
+      +'<div class="muted-note" style="margin:3px 0;">Why: '+esc(a.why)+'</div><div class="muted-note" style="margin:0;">If not: '+esc(a.consequence)+'</div></div>';}).join('')
+    +'<div class="muted-note">Ranked by urgency and risk: overdue payments, then any shortfall, then payments due within 7 days, then payments due within 30 days, then working capital, then record problems and setup. No fixed percentage split is used.</div></div>';
+  var todayIn=items.filter(function(t){return !t.voided&&t.date===td&&F.classifyTxn(t).income>0;}),inTot=todayIn.reduce(function(t,x){return t+F.classifyTxn(x).income;},0);
+  h+='<div class="card"><div class="card-label">Today\'s income</div>'
+    +(todayIn.length?row(todayIn.length+' entr'+(todayIn.length>1?'ies':'y')+' recorded today',fmt(inTot),'#22C55E','today-income')
+      +'<div class="muted-note" style="margin-bottom:0;">Recorded income is cash received into the account you chose, so it is already inside Cash Now above. The Director plans from balances, so this money is not allocated a second time.</div>'
+      :'<div class="muted-note" style="margin-bottom:0;">No income recorded today.</div>')
+    +'<div class="muted-note" style="margin-bottom:0;">PBSRx sales are not imported. KoboFlow counts only the cash you record here; a sale recorded in PBSRx is not treated as cash received until you record it.</div></div>';
+  var q=liveQuality();
+  h+='<div class="card"><div class="card-label">Missing or uncertain</div>'
+    +(q.length?q.map(function(x){return'<div class="muted-note" data-dir-quality="'+x.key+'" style="color:'+(x.severity==='high'?'var(--red)':x.severity==='medium'?'var(--amber)':'var(--muted)')+';">'+esc(x.text)+'</div>';}).join(''):'')
+    +(f.floor===null?'<div class="muted-note" data-dir-quality="no_floor">No working-capital floor is set (Settings &rarr; Accounts).</div>':'')
+    +(live&&!BILLS.length?'<div class="muted-note" data-dir-quality="no_bills">No bills set up yet: add rent, electricity, salaries and other regular payments in Bills so they count in these figures.</div>':'')
+    +'</div>';
+  body.innerHTML=h;
+}
 function renderAll(){
   recalcBalances();
   renderDashboard();renderTimeline();renderInbox();
@@ -3761,7 +4585,7 @@ function renderAll(){
   renderCashDrop();renderCapital();renderNetWorth();
   renderAnalytics();renderSettings();
   renderAutopilot();renderOwnerImpact();renderRestockROI();renderCashFlow();
-  renderLoans();renderAgreementDetail();renderOppSaved();renderModeNote();
+  renderLoans();renderAgreementDetail();renderOppSaved();renderModeNote();renderBills();renderDirector();
 }
 
 /* ═══════════════ BACKUP: EXPORT / IMPORT ═══════════════ */
@@ -3795,11 +4619,11 @@ function exportCSV(){
    transaction). If the database cannot be opened or any read fails, no file is produced:
    an empty, partial or mixed backup is never offered. */
 function exportJSON(){
-  return db.snapshot(['transactions','agreements','instalments','allocations','agreementEvents','opportunities','meta']).then(function(r){
+  return db.snapshot(['transactions','agreements','instalments','allocations','agreementEvents','opportunities','meta','bills']).then(function(r){
     var txs=r.transactions.filter(function(t){return !t.demo;});
     txs.sort(function(a,b){var x=(b.date||'')+(b.time||''),y=(a.date||'')+(a.time||'');return x>y?1:x<y?-1:0;});
     var ls=r.meta.find(function(m){return m.id==='ledgerSetup';}),setup=ls&&ls.mode==='live'?ls:null;
-    var data={app:'KoboFlow',testDatabase:"KoboFlowDB-test",version:'3.2',exported:new Date().toISOString(),ledgerSetup:setup,transactions:txs,agreements:r.agreements,instalments:r.instalments,allocations:r.allocations,agreementEvents:r.agreementEvents,opportunities:r.opportunities,
+    var data={app:'KoboFlow',testDatabase:"KoboFlowDB-test",version:'4.0',exported:new Date().toISOString(),ledgerSetup:setup,transactions:txs,agreements:r.agreements,instalments:r.instalments,allocations:r.allocations,agreementEvents:r.agreementEvents,opportunities:r.opportunities,bills:r.bills,
       accounts:ACCOUNTS.map(function(a){return{id:a.id,label:a.label,opening:a.opening};})};
     dlFile('koboflow_TEST_backup_'+getToday()+'.json',JSON.stringify(data,null,2),'application/json');
     showToast('JSON backup exported');
@@ -3809,6 +4633,30 @@ function exportJSON(){
     reportFailure('Backup NOT created: a reliable backup could not be produced from '+db.name+' ('+errText(err)+'). No file was saved. Run Settings → Storage Check.');
     return null;
   });
+}
+/* Pre-upgrade safety copy → an ordinary backup file (the v3.2 format every KoboFlow since v3
+   can import). Built from the copy itself, never from the upgraded database. */
+function backupFromStores(r){
+  var txs=(r.transactions||[]).filter(function(t){return !t.demo;});
+  txs.sort(function(a,b){var x=(b.date||'')+(b.time||''),y=(a.date||'')+(a.time||'');return x>y?1:x<y?-1:0;});
+  var ls=(r.meta||[]).find(function(m){return m.id==='ledgerSetup';}),setup=ls&&ls.mode==='live'?ls:null;
+  return{app:'KoboFlow',version:'3.2',exported:new Date().toISOString(),preUpgradeCopy:true,ledgerSetup:setup,transactions:txs,
+    agreements:r.agreements||[],instalments:r.instalments||[],allocations:r.allocations||[],agreementEvents:r.agreementEvents||[],opportunities:r.opportunities||[],
+    accounts:setup&&Array.isArray(setup.accounts)?setup.accounts.filter(function(a){return !a.removed;}).map(function(a){return{id:a.id,label:a.label,opening:a.opening};}):[]};
+}
+function copyFileName(){return(window.__kfTestBuild?'koboflow_TEST_':'koboflow_')+'pre_v4_copy_'+getToday()+'.json';}
+function downloadPreUpgradeCopy(name){
+  return db.readCopy(name).then(function(c){
+    var data=backupFromStores(c.data);
+    dlFile(copyFileName(),JSON.stringify(data,null,2),'application/json');
+    showToast('Pre-upgrade copy downloaded ('+data.transactions.length+' entries)');
+    return data;
+  }).catch(function(err){console.error(err);reportFailure('Pre-upgrade copy NOT downloaded: '+errText(err)+'.');return null;});
+}
+function downloadPausedUpgradeData(){
+  var p=window.__kfPreUpgradeData;if(!p)return null;
+  var data=backupFromStores(p.data);dlFile(copyFileName(),JSON.stringify(data,null,2),'application/json');
+  showToast('Copy of your data downloaded ('+data.transactions.length+' entries)');return data;
 }
 function dlFile(name,content,mime){
   var a=document.createElement('a');
@@ -3854,6 +4702,7 @@ function planImport(data){
     each(data.instalments,'instalments',INST,function(r){return agrOk[r.agreementId]&&F.parseDate(r.dueDate)&&Number(r.total)>=0;});
     each(data.allocations,'allocations',ALLOC,function(r){return agrOk[r.agreementId]&&txIdsOk[r.txnId];});
     each(data.agreementEvents,'agreementEvents',EVENTS,function(r){return agrOk[r.agreementId];});
+    each(data.bills,'bills',BILLS,function(r){return F.validateBill(r).ok;});
   }else{
     if(data.loans&&data.loans.length)rep.notes.push('The old backup\'s loan list was sample data and was not imported. Re-enter real loans in the Loans tab.');
   }
@@ -3959,10 +4808,43 @@ function setState(idAttr,state){
   saveEntry(n,'Inbox change ('+state+')','The item keeps its previous status. Try again.').then(function(){delete statePending[idAttr];});
 }
 var il2=qs('inbox-list');
+/* Correcting a category: amount, accounts and date are unchanged; the original category is kept in
+   reclassified[] so nothing is silently rewritten. A "Vehicle: <name>" category assigns that vehicle;
+   "Vehicle fuel (vehicle not set)" entries are fuel, so their vehicle log category becomes Fuel. */
+function reclassify(idAttr,cat){
+  var cur=items.find(function(i){return String(i.id)===idAttr;});if(!cur||!cat||statePending[idAttr])return;
+  var n=clone(cur),m=/^Vehicle: (.+)$/.exec(cat),v=m&&VEHICLES.find(function(x){return x.name===m[1];});
+  n.reclassified=(cur.reclassified||[]).concat([{from:cur.cat,fromVehicle:cur.vehicle||null,to:cat,at:nowISO()}]);
+  n.cat=cat;n.vehicle=v?v.id:null;n.state='Linked';
+  if(v&&cur.cat==='Vehicle fuel (vehicle not set)'&&!n.vehicleCat)n.vehicleCat='Fuel';
+  if(!v)delete n.vehicleCat;
+  if(n.demo){upsertItem(n);renderAll();return;}
+  statePending[idAttr]=true;
+  saveEntry(n,'Category correction','The entry keeps its previous category. Try again.').then(function(){delete statePending[idAttr];});
+}
 if(il2)il2.addEventListener('click',function(e){
+  var rc=e.target.closest('[data-reclass]');
+  if(rc){var id=rc.getAttribute('data-reclass'),sel=document.querySelector('[data-reclass-sel="'+(window.CSS&&CSS.escape?CSS.escape(id):id)+'"]');if(!sel||!sel.value){showToast('Choose the correct category first.');return;}reclassify(id,sel.value);return;}
   var ab=e.target.closest('[data-approve]'),db2=e.target.closest('[data-dismiss]');
   if(ab)setState(ab.getAttribute('data-approve'),'Linked');
   if(db2)setState(db2.getAttribute('data-dismiss'),'Archived');
+});
+
+/* Bills wiring */
+qs('bill-add-btn').addEventListener('click',function(){if(isLive())openBillForm(null);});
+qs('bill-save-btn').addEventListener('click',saveBill);
+qs('bill-pay-save-btn').addEventListener('click',saveBillPay);
+['bill-modal','bill-pay-modal'].forEach(function(id){var m=qs(id);m.addEventListener('click',function(e){if(e.target===m&&!saving)closeModal(id);});});
+qs('bill-pay-candidates').addEventListener('click',function(e){var b=e.target.closest('[data-bill-link]');if(b)linkBillPayment(b.getAttribute('data-bill-link'));});
+qs('screen-bills').addEventListener('click',function(e){
+  var t;
+  if((t=e.target.closest('[data-bill-pay]')))return openBillPay(t.getAttribute('data-bill-pay'));
+  if((t=e.target.closest('[data-bill-skip]')))return skipOcc(t.getAttribute('data-bill-skip'),false);
+  if((t=e.target.closest('[data-bill-unskip]')))return skipOcc(t.getAttribute('data-bill-unskip'),true);
+  if((t=e.target.closest('[data-bill-edit]')))return openBillForm(t.getAttribute('data-bill-edit'));
+  if((t=e.target.closest('[data-bill-cancel]')))return cancelBill(t.getAttribute('data-bill-cancel'));
+  if((t=e.target.closest('[data-bill-reverse]')))return reverseBillPayment(t.getAttribute('data-bill-reverse'));
+  if((t=e.target.closest('[data-bill-unlink]')))return unlinkBillPayment(t.getAttribute('data-bill-unlink'));
 });
 
 var tlSel=qs('tl-search');if(tlSel)tlSel.addEventListener('input',function(){tlSearch=tlSel.value;renderTimeline();});
@@ -4006,10 +4888,16 @@ function autofocusWhenIdle(overlayId,fieldId){
     ov.setAttribute('data-form-ready','1');
   },100);
 }
-var addBtn=qs('add-btn');if(addBtn)addBtn.addEventListener('click',function(){qs('modal-overlay').classList.add('open');autofocusWhenIdle('modal-overlay','modal-amount');});
+var addBtn=qs('add-btn');if(addBtn)addBtn.addEventListener('click',function(){refreshModalBill();qs('modal-overlay').classList.add('open');autofocusWhenIdle('modal-overlay','modal-amount');});
 qs('modal-close-btn').addEventListener('click',function(){qs('modal-overlay').classList.remove('open');});
 qs('modal-overlay').addEventListener('click',function(e){if(e.target===qs('modal-overlay'))qs('modal-overlay').classList.remove('open');});
-document.querySelectorAll('.type-chip').forEach(function(btn){btn.addEventListener('click',function(){modalType=btn.getAttribute('data-type');var th=qs('type-chip-hint');if(th)th.style.display=modalType==='obligation'?'':'none';document.querySelectorAll('.type-chip').forEach(function(b){b.classList.remove('active');});btn.classList.add('active');});});
+function refreshModalBill(){
+  var w=qs('modal-bill-wrap'),sel=qs('modal-bill');if(!w||!sel)return;
+  var occ=modalType==='obligation'&&isLive()?openBillOccs(60):[];
+  w.style.display=occ.length?'':'none';
+  sel.innerHTML='<option value="">Not one of my bills</option>'+occ.map(function(o){return'<option value="'+esc(o.id)+'">For bill: '+esc(o.label)+' &middot; due '+fmtD(o.dueDate)+' &middot; '+fmt(o.remaining)+' left</option>';}).join('');
+}
+document.querySelectorAll('.type-chip').forEach(function(btn){btn.addEventListener('click',function(){modalType=btn.getAttribute('data-type');var th=qs('type-chip-hint');if(th)th.style.display=modalType==='obligation'?'':'none';refreshModalBill();document.querySelectorAll('.type-chip').forEach(function(b){b.classList.remove('active');});btn.classList.add('active');});});
 qs('modal-save-btn').addEventListener('click',function(){
   var amt=parseFloat(qs('modal-amount').value);
   var desc=(qs('modal-desc').value||'').trim();
@@ -4020,6 +4908,11 @@ qs('modal-save-btn').addEventListener('click',function(){
   var type=(modalType==='capital_injection'&&cat==='Loan')?'loan_receipt':modalType;
   var rec={id:newTxnId(),amount:amt,desc:desc,cat:type==='loan_receipt'?'Loan Proceeds':cat,type:type,state:type==='loan_receipt'?'Needs Review':'AI Categorized',date:getToday(),time:getNow(),fromAcct:from,toAcct:to};
   if(type==='capital_injection')rec.fundingKind='capital_injection';
+  // "Bill paid" for one of your bills: linked once, so the bill no longer shows it as due.
+  var mb=type==='obligation'&&qs('modal-bill-wrap').style.display!=='none'?qs('modal-bill').value:'';
+  if(mb){var fo=findOcc(mb);if(!fo){alert('That bill date no longer exists. Choose again.');return;}
+    if(amt>fo.occ.remaining+0.001){alert('That is more than is still due on this bill ('+fmt(fo.occ.remaining)+'). Record any extra as a separate entry.');return;}
+    rec.billId=fo.bill.id;rec.billOcc=fo.occ.id;rec.state='Linked';}
   var sb=this;if(sb.disabled)return;sb.disabled=true;
   saveEntry(rec,'Entry "'+desc+'"','It was not added. The form stays open with your values so you can try again.').then(function(ok){
     sb.disabled=false;if(!ok)return;
@@ -4055,6 +4948,9 @@ document.addEventListener('click',function(e){
   var n=e.target.closest('[data-nav]');if(n){showScreen(n.getAttribute('data-nav'));return;}
   var lr=e.target.closest('[data-link-receipt]');
   if(lr){var t=items.find(function(x){return String(x.id)===lr.getAttribute('data-link-receipt');});if(t)openAgrForm({mode:'new',linkTxnId:t.id},{name:t.desc,terms:{nature:'debt',principal:t.amount,cashReceived:t.amount},fundsReceived:true,accountId:t.toAcct,receivedDate:t.date,agreementDate:t.date});return;}
+  var dlc=e.target.closest('[data-dl-copy]');if(dlc){downloadPreUpgradeCopy(dlc.getAttribute('data-dl-copy'));return;}
+  if(e.target.closest('[data-dl-paused]')){downloadPausedUpgradeData();return;}
+  var doa=e.target.closest('[data-dir-open-agr]');if(doa){openAgreement(doa.getAttribute('data-dir-open-agr'));return;}
   var oa=e.target.closest('[data-open-agr]');if(oa&&!e.target.closest('button')){openAgreement(oa.getAttribute('data-open-agr'));return;}
 });
 ['agr-modal','pay-modal','settle-modal','amend-modal','funds-modal'].forEach(function(id){var m=qs(id);m.addEventListener('click',function(e){if(e.target===m)closeModal(id);});});
@@ -4102,8 +4998,8 @@ qs('import-file-input').addEventListener('change',function(e){var f=e.target.fil
 qs('clear-data-btn').addEventListener('click',function(){
   if(!kfConfirm('Clear ALL KoboFlow data, including loans, payments and opportunities? Export a backup first. This cannot be undone.'))return;
   if(kfPrompt('Type CLEAR to confirm')!=='CLEAR')return;
-  Promise.all(['transactions','agreements','instalments','allocations','agreementEvents','opportunities','meta'].map(function(s){return db[s].clear();})).then(function(){
-    items=[];AGR=[];INST=[];ALLOC=[];EVENTS=[];OPPS=[];META={id:'settings',seenReminders:{}};currentAgrId=null;SETUP=null;DEMO_ITEMS=null;applySetup();
+  Promise.all(['transactions','agreements','instalments','allocations','agreementEvents','opportunities','meta','bills'].map(function(s){return db[s].clear();})).then(function(){
+    items=[];AGR=[];INST=[];ALLOC=[];EVENTS=[];OPPS=[];BILLS=[];META={id:'settings',seenReminders:{}};currentAgrId=null;SETUP=null;DEMO_ITEMS=null;applySetup();
     showToast('All data cleared');renderAll();
   }).catch(function(err){
     console.error(err);
@@ -4114,11 +5010,13 @@ qs('clear-data-btn').addEventListener('click',function(){
 window.__kfOnBlocked=function(err){showToast(err.message);};
 qs('setup-open-btn').addEventListener('click',openSetup);
 qs('setup-add-acct').addEventListener('click',function(){setupDirty=true;readSetupForm();setupDraft.accounts.push({id:uid('acc'),label:'',institution:'',kind:'',use:'business',primary:false,opening:''});renderSetupRows();});
-qs('setup-add-bucket').addEventListener('click',function(){setupDirty=true;readSetupForm();setupDraft.buckets.push({id:uid('bkt'),label:'',parentId:'',amount:''});renderSetupRows();});
+qs('setup-add-bucket').addEventListener('click',function(){setupDirty=true;readSetupForm();setupDraft.buckets.push({id:uid('bkt'),label:'',parentId:'',amount:'',reservedFor:''});renderSetupRows();});
+qs('setup-add-budget').addEventListener('click',function(){setupDirty=true;readSetupForm();setupDraft.budgets.push({id:uid('bdg'),cat:'',amount:''});renderSetupRows();});
 qs('setup-modal').addEventListener('click',function(e){
   if(e.target===qs('setup-modal')){if(setupSaving){setupResult('<div class="form-warn">Still saving. The form stays open until the save finishes.</div>');return;}closeModal('setup-modal');return;}
   if(e.target.id==='setup-discard-btn'){openSetup(true);return;}
-  if(e.target.closest('[data-remove-acct],[data-remove-bucket]'))setupDirty=true;
+  if(e.target.closest('[data-remove-acct],[data-remove-bucket],[data-remove-budget]'))setupDirty=true;
+  var rbg=e.target.closest('[data-remove-budget]');if(rbg){readSetupForm();setupDraft.budgets.splice(+rbg.getAttribute('data-remove-budget'),1);renderSetupRows();}
   var ra=e.target.closest('[data-remove-acct]');if(ra){readSetupForm();var a=setupDraft.accounts[+ra.getAttribute('data-remove-acct')];if(SETUP&&SETUP.accounts.some(function(x){return x.id===a.id;}))a.removed=true;else setupDraft.accounts.splice(+ra.getAttribute('data-remove-acct'),1);Object.keys(setupDraft.aliases).forEach(function(k){if(setupDraft.aliases[k]===a.id)delete setupDraft.aliases[k];});renderSetupRows();return;}
   var rb=e.target.closest('[data-remove-bucket]');if(rb){readSetupForm();setupDraft.buckets.splice(+rb.getAttribute('data-remove-bucket'),1);renderSetupRows();}
 });
@@ -4148,12 +5046,12 @@ function startupAppError(stage,err){
     :'Data problem: KoboFlow read '+db.name+', but could not load a stored record into the app ('+m+'). ')
     +'Storage itself is working and nothing was deleted. Export a backup (Settings → Export) and run Storage Check before changing anything.');
 }
-Promise.all([db.transactions.toArray(),db.agreements.toArray(),db.instalments.toArray(),db.allocations.toArray(),db.agreementEvents.toArray(),db.opportunities.toArray(),db.meta.get('settings'),db.meta.get('ledgerSetup')]).then(function(r){
+Promise.all([db.transactions.toArray(),db.agreements.toArray(),db.instalments.toArray(),db.allocations.toArray(),db.agreementEvents.toArray(),db.opportunities.toArray(),db.meta.get('settings'),db.meta.get('ledgerSetup'),db.bills.toArray()]).then(function(r){
   var stage='process';
   try{
     (r[0]||[]).forEach(function(row){if(!items.some(function(i){return i.id===row.id;}))items.push(row);});
     items.sort(function(a,b){var x=(b.date||'')+(b.time||''),y=(a.date||'')+(a.time||'');return x>y?1:x<y?-1:0;});
-    AGR=r[1]||[];INST=r[2]||[];ALLOC=r[3]||[];EVENTS=r[4]||[];OPPS=r[5]||[];
+    AGR=r[1]||[];INST=r[2]||[];ALLOC=r[3]||[];EVENTS=r[4]||[];OPPS=r[5]||[];BILLS=r[8]||[];
     if(r[6])META=r[6];if(!META.seenReminders)META.seenReminders={};
     if(r[7]&&r[7].mode==='live'){SETUP=r[7];applySetup();}
     var maxId=items.reduce(function(m,i){return typeof i.id==='number'?Math.max(m,i.id):m;},0);
@@ -4171,6 +5069,8 @@ Promise.all([db.transactions.toArray(),db.agreements.toArray(),db.instalments.to
   document.body.setAttribute('data-kf-ready','error');
   showToast('Storage unavailable: changes will not be saved');
   showDialogWarning('Storage unavailable: KoboFlow could not open or read its database ('+db.name+'): '+window.__kfStorage.error+'. Nothing you enter will be saved. See Settings → Storage Check.');
+  var dw=qs('dialog-warning');
+  if(dw&&window.__kfPreUpgradeData){var bt=document.createElement('button');bt.className='act-btn act-approve';bt.setAttribute('data-dl-paused','1');bt.textContent='DOWNLOAD A COPY OF YOUR DATA';dw.insertBefore(bt,dw.lastChild);}
 });
 });
 </script>

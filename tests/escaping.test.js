@@ -119,7 +119,7 @@ for (const b of BUILDS) {
     assert.equal(await openApp(page, b.url), '1', 'startup succeeds with markup in stored text');
     await visitAll(page);
     assert.deepEqual(await injection(page), clean, 'nothing injected after reload');
-    assert.match(await runStorageCheck(page), new RegExp(`Storage: available[\\s\\S]*Database: ${b.dbName} \\(v3\\)[\\s\\S]*Stored entries: 4 `));
+    assert.match(await runStorageCheck(page), new RegExp(`Storage: available[\\s\\S]*Database: ${b.dbName} \\(v4\\)[\\s\\S]*Stored entries: 4 `));
     assert.deepEqual(page.errors, []);
     await context.close();
   });

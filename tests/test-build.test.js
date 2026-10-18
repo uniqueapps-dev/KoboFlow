@@ -23,7 +23,7 @@ test('database name is a fixed constant; no URL input can select a database', ()
   assert.match(html, /var DB_NAME = "KoboFlowDB-test", TEST_DB = 'test';/);
   assert.doesNotMatch(html, /location\.search/, 'no query-string database selection');
   assert.equal((html.match(/['"]KoboFlowDB['"]/g) || []).length, 1, 'live name appears only in the guard');
-  assert.ok(html.indexOf('refused to') < html.indexOf('KoboFlow IDB Shim v3'), 'guard runs before the storage layer');
+  assert.ok(html.indexOf('refused to') < html.indexOf('KoboFlow IDB Shim v4'), 'guard runs before the storage layer');
 });
 
 let server, base, browser;
@@ -160,7 +160,7 @@ test('a full workflow in the test build leaves the live database byte-for-byte u
   assert.deepEqual(after, before);
   const test = await snapshot(page, 'KoboFlowDB-test');
   assert.equal(test.exists, true);
-  assert.equal(test.version, 3);
+  assert.equal(test.version, 4);
   await context.close();
 });
 
@@ -217,5 +217,29 @@ test('test build: the reported Android setup persists across close/reopen with d
   assert.deepEqual((await again.evaluate(() => indexedDB.databases())).map(d => d.name), ['KoboFlowDB-test']);
   const meta = await snapshot(again, 'KoboFlowDB-test');
   assert.equal(meta.stores.meta.find(m => m.id === 'ledgerSetup').accounts[1].opening, 100000);
+  await context.close();
+});
+
+test('the test build cannot open, delete or even list production\'s pre-upgrade safety copies', { skip }, async () => {
+  const { context, page } = await ctxPage();
+  // A production copy exists on this origin (created from a neutral page).
+  await page.goto(base + '/blank');
+  await page.evaluate(() => new Promise(res => { const q = indexedDB.open('KoboFlowDB-pre-v4-20261018190000', 3); q.onupgradeneeded = () => q.result.createObjectStore('transactions', { keyPath: 'id' }).put({ id: 1, amount: 5 }); q.onsuccess = () => { q.result.close(); res(); }; }));
+  await page.goto(base + '/koboflow-test.html');
+  await page.waitForSelector('body[data-kf-ready="1"]');
+  const r = await page.evaluate(async () => {
+    const out = {};
+    try { indexedDB.open('KoboFlowDB-pre-v4-20261018190000'); out.open = 'allowed'; } catch (e) { out.open = e.message; }
+    try { indexedDB.deleteDatabase('KoboFlowDB-pre-v4-20261018190000'); out.del = 'allowed'; } catch (e) { out.del = e.message; }
+    out.listed = (await indexedDB.databases()).map(d => d.name);
+    return out;
+  });
+  assert.match(r.open, /refused to open the live database or its safety copy/);
+  assert.match(r.del, /refused to delete the live database or its safety copy/);
+  assert.equal(r.listed.some(n => /^KoboFlowDB-pre-v4-/.test(n)), false);
+  assert.ok(r.listed.includes('KoboFlowDB-test'));
+  await page.goto(base + '/blank');
+  const still = await page.evaluate(() => new Promise(res => { const q = indexedDB.open('KoboFlowDB-pre-v4-20261018190000'); q.onsuccess = () => { const g = q.result.transaction('transactions').objectStore('transactions').getAll(); g.onsuccess = () => { q.result.close(); res(g.result); }; }; }));
+  assert.deepEqual(still, [{ id: 1, amount: 5 }], 'the production copy is untouched');
   await context.close();
 });

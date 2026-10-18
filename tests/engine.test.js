@@ -708,8 +708,307 @@ test('cash cover: obligations are compared with free-to-use cash (after earmarks
 
 test('cash cover: shortfall is negative; no free cash gives full pressure only when something is due', () => {
   const p = F.cashPosition([{ id: 'w', kind: 'wallet', balance: 20000 }], [{ parentId: 'w', amount: 20000 }]);
-  assert.deepEqual(F.cashCover(p, 5000), { cashNow: 20000, earmarked: 20000, freeToUse: 0, due: 5000, leftAfter: -5000, pressure: 100 });
+  assert.deepEqual(F.cashCover(p, 5000), { cashNow: 20000, earmarked: 20000, freeToUse: 0, due: 5000, covered: 0, uncovered: 5000, leftAfter: -5000, pressure: 100 });
   assert.equal(F.cashCover(p, 0).pressure, 0, 'nothing due: no pressure');
   assert.equal(F.cashCover(F.cashPosition([{ id: 'w', kind: 'wallet', balance: 1000 }], []), 4000).pressure, 100, 'capped at 100');
   assert.equal(F.cashCover(F.cashPosition([{ id: 'w', kind: 'wallet', balance: 1000.10 }], []), 0.20).leftAfter, 999.9, 'kobo-exact');
+});
+
+/* ───────────── Integrated build: reservations linked to obligations ───────────── */
+const RP_ACCTS = [
+  { id: 'w', label: 'Wallet', kind: 'wallet', balance: 100000 },
+  { id: 'b', label: 'Bank', kind: 'bank', balance: 500000 },
+  { id: 'c', label: 'Coop', kind: 'coop', balance: 80000 },
+];
+const RP_OBLS = [
+  { id: 'L_v1_1', agreementId: 'L', dueDate: '2026-10-25', remaining: 55455, label: 'Loan #1' },
+  { id: 'L_v1_2', agreementId: 'L', dueDate: '2026-11-25', remaining: 55455, label: 'Loan #2' },
+];
+
+test('reservation linked to a loan covers its instalments by due date; general earmarks cover nothing', () => {
+  const r = F.reservationPlan(RP_ACCTS, [
+    { id: 'g', label: 'Rent', parentId: 'w', amount: 30000 },
+    { id: 'l', label: 'Loan money', parentId: 'b', amount: 70000, reservedFor: 'agr:L' },
+  ], RP_OBLS);
+  assert.deepEqual(r.buckets.map(b => [b.id, b.status, b.effective, b.covers]), [['g', 'general', 30000, 0], ['l', 'linked', 70000, 70000]]);
+  assert.deepEqual(r.coverage, { L_v1_1: 55455, L_v1_2: 14545 }, 'first instalment in full, then the next');
+  // Cash cover for the 30-day window (instalment #1 only): it is fully covered, so nothing is subtracted twice.
+  const p = F.cashPosition(RP_ACCTS, r.effective);
+  assert.equal(p.unearmarked, 500000, '600,000 available − 30,000 − 70,000');
+  const due30 = [RP_OBLS[0]];
+  const c = F.cashCover(p, 55455, F.coveredAmount(due30, r.coverage));
+  assert.deepEqual([c.covered, c.uncovered, c.leftAfter, c.pressure], [55455, 0, 500000, 0]);
+  // Without the link the same money would be deducted as an earmark AND as the obligation.
+  const unlinked = F.reservationPlan(RP_ACCTS, [{ id: 'l', label: 'Loan money', parentId: 'b', amount: 70000 }], RP_OBLS);
+  const pu = F.cashPosition(RP_ACCTS, unlinked.effective);
+  assert.equal(F.cashCover(pu, 55455, F.coveredAmount(due30, unlinked.coverage)).leftAfter, 474545, 'general earmark: obligation still subtracted');
+});
+
+test('reservation: partial funding leaves the uncovered part as a requirement; paid instalments stop being reserved', () => {
+  const part = F.reservationPlan(RP_ACCTS, [{ id: 'l', label: 'Part', parentId: 'w', amount: 20000, reservedFor: 'agr:L' }], RP_OBLS);
+  assert.equal(part.coverage.L_v1_1, 20000);
+  const p = F.cashPosition(RP_ACCTS, part.effective);
+  const c = F.cashCover(p, 55455, F.coveredAmount([RP_OBLS[0]], part.coverage));
+  assert.deepEqual([c.freeToUse, c.covered, c.uncovered, c.leftAfter], [580000, 20000, 35455, 544545]);
+  // After both instalments are paid there is nothing outstanding: the earmark reserves 0 and is reported as no longer needed.
+  const paid = F.reservationPlan(RP_ACCTS, [{ id: 'l', label: 'Loan money', parentId: 'b', amount: 70000, reservedFor: 'agr:L' }], []);
+  assert.deepEqual([paid.buckets[0].status, paid.buckets[0].effective], ['no_outstanding', 0]);
+  assert.equal(F.cashPosition(RP_ACCTS, paid.effective).unearmarked, 600000, 'released once, automatically, without editing the earmark');
+  // Partly paid: the reservation shrinks to what is still owed.
+  const left = F.reservationPlan(RP_ACCTS, [{ id: 'l', label: 'Loan money', parentId: 'b', amount: 70000, reservedFor: 'agr:L' }], [{ ...RP_OBLS[0], remaining: 25000 }]);
+  assert.equal(left.buckets[0].effective, 25000);
+});
+
+test('reservation: two earmarks for one loan share its outstanding amount; restricted or over-earmarked money covers nothing extra', () => {
+  const two = F.reservationPlan(RP_ACCTS, [
+    { id: 'a', label: 'A', parentId: 'b', amount: 100000, reservedFor: 'agr:L' },
+    { id: 'z', label: 'Z', parentId: 'w', amount: 50000, reservedFor: 'agr:L' },
+  ], RP_OBLS);
+  assert.deepEqual(two.buckets.map(b => b.effective), [100000, 10910], 'total reserved never exceeds 110,910 owed');
+  assert.equal(F.coveredAmount(RP_OBLS, two.coverage), 110910);
+  const coop = F.reservationPlan(RP_ACCTS, [{ id: 'k', label: 'In coop', parentId: 'c', amount: 55455, reservedFor: 'agr:L' }], RP_OBLS);
+  assert.deepEqual([coop.buckets[0].status, coop.buckets[0].covers], ['restricted_source', 0], 'restricted money is not available to pay');
+  const over = F.reservationPlan([{ id: 'w', kind: 'wallet', balance: 30000 }], [
+    { id: 'g', label: 'Rent', parentId: 'w', amount: 20000 },
+    { id: 'l', label: 'Loan', parentId: 'w', amount: 55455, reservedFor: 'agr:L' },
+  ], RP_OBLS);
+  assert.deepEqual([over.buckets[1].funded, over.coverage.L_v1_1], [10000, 10000], 'only money the account holds covers the obligation');
+  assert.equal(F.cashPosition([{ id: 'w', kind: 'wallet', balance: 30000 }], over.effective).overEarmarked[0].shortBy, 45455);
+});
+
+test('data quality: flags records that distort figures without changing them', () => {
+  const txns = [
+    { id: 1, date: '2026-10-10', amount: 500, type: 'expense', desc: 'Fuel', state: 'Needs Review', fromAcct: 'w' },
+    { id: 2, date: '2026-10-20', amount: 100, type: 'expense', desc: 'Later', state: 'Linked', fromAcct: 'w' },
+    { id: 3, date: '2026-10-11', amount: 900, type: 'income', desc: 'Sales', state: 'Linked', toAcct: 'pharma_cash' },
+    { id: 4, date: '2026-10-11', amount: 900, type: 'income', desc: 'sales ', state: 'Linked', toAcct: 'pharma_cash' },
+    { id: 5, date: '2026-10-12', amount: 300, type: 'income', desc: 'No account', state: 'Linked', toAcct: '' },
+    { id: 6, date: '2026-09-01', amount: 300, type: 'expense', desc: 'Old', state: 'Linked', fromAcct: 'w' },
+    { id: 7, date: '2026-10-10', amount: 500, type: 'expense', desc: 'Fuel', state: 'Needs Review', fromAcct: 'w', voided: true },
+  ];
+  const q = F.dataQuality({ txns, accountIds: ['w'], aliases: { pharma_cash: '' }, baselineDate: '2026-10-01', today: TODAY });
+  const by = Object.fromEntries(q.map(x => [x.key, x]));
+  assert.deepEqual(by.needs_review.ids, [1], 'voided entries are ignored');
+  assert.deepEqual(by.future_dated.ids, [2]);
+  assert.deepEqual(by.unmapped_account.ids, [3, 4], '"Not used" mapping moves no balance');
+  assert.deepEqual(by.missing_account.ids, [5]);
+  assert.deepEqual(by.possible_duplicates.ids, [4]);
+  assert.deepEqual(by.pre_baseline.ids, [6]);
+  assert.equal(by.pre_baseline.severity, 'info');
+  assert.deepEqual(txns.map(t => t.id), [1, 2, 3, 4, 5, 6, 7], 'input untouched');
+});
+
+test('budgets: only configured budgets; expenses in the month, voided and other categories excluded', () => {
+  const r = F.budgetProgress([{ id: 'b1', cat: 'Food', amount: 20000 }], [
+    { date: '2026-10-02', amount: 5000, type: 'expense', cat: 'Food' },
+    { date: '2026-10-03', amount: 2500, type: 'obligation', cat: 'Food' },
+    { date: '2026-10-04', amount: 9000, type: 'expense', cat: 'Food', voided: true },
+    { date: '2026-09-30', amount: 9000, type: 'expense', cat: 'Food' },
+    { date: '2026-10-04', amount: 9000, type: 'expense', cat: 'Household' },
+    { date: '2026-10-05', amount: 9000, type: 'owner_withdrawal', cat: 'Food' },
+  ], '2026-10-01', TODAY);
+  assert.deepEqual(r, [{ id: 'b1', cat: 'Food', amount: 20000, used: 7500, left: 12500, pct: 38 }]);
+  assert.deepEqual(F.budgetProgress([], [], '2026-10-01', TODAY), []);
+});
+
+test('setup validation: planning targets and budgets are optional but must be sensible; links must be recognisable', () => {
+  const base = { baselineDate: '2026-10-01', accounts: [{ id: 'w', label: 'W', kind: 'wallet', opening: 0, primary: true }], buckets: [],
+    aliases: Object.fromEntries(Object.keys(F.LEGACY_ACCOUNTS).map(k => [k, 'w'])) };
+  assert.equal(F.validateSetup({ ...base, planning: {}, budgets: [] }, [], TODAY).ok, true, 'nothing set is valid');
+  assert.equal(F.validateSetup({ ...base, planning: { workingCapitalFloor: '', netWorthGoal: null } }, [], TODAY).ok, true);
+  const bad = F.validateSetup({ ...base, planning: { workingCapitalFloor: -5, netWorthGoal: 0 },
+    budgets: [{ cat: 'Food', amount: 100 }, { cat: 'Food', amount: 0 }, { cat: '', amount: 5 }],
+    buckets: [{ id: 'x', label: 'X', parentId: 'w', amount: 1, reservedFor: 'something' }] }, [], TODAY);
+  assert.deepEqual(bad.errors, [
+    'Earmark "X" is linked to something KoboFlow does not recognise. Choose what it is for again.',
+    'The working-capital floor must be more than 0, or left blank.',
+    'The net-worth goal must be more than 0, or left blank.',
+    'There are two budgets for "Food".',
+    'The budget for "Food" needs a monthly amount above 0.',
+    'Budget 3 needs a category.',
+  ]);
+});
+
+/* ───────────── Daily Money Director ───────────── */
+const dir = (over = {}) => F.directorPlan({ today: TODAY, cashNow: 600000, restricted: 80000, earmarkedGeneral: 30000, reservedLinked: 0,
+  freeToUse: 570000, obligations: [], floor: 200000, quality: [], overEarmarked: [], staleReservations: [], ...over });
+
+test('director: arithmetic reconciles and the free amount respects commitments and the working-capital floor; no percentage split', () => {
+  const r = dir({ obligations: [{ id: 'a', label: 'Loan #1', dueDate: '2026-10-20', remaining: 55455, covered: 20000 }] });
+  const f = r.figures;
+  assert.deepEqual([f.due, f.covered, f.uncovered, f.freeAfterCommitments, f.floor, f.safeToAllocate], [55455, 20000, 35455, 534545, 200000, 334545]);
+  assert.equal(f.freeToUse - f.uncovered, f.freeAfterCommitments);
+  assert.equal(f.freeAfterCommitments - f.floor, f.safeToAllocate);
+  assert.deepEqual(r.obligations[0].funding, 'partly');
+  assert.deepEqual(r.actions.map(a => a.kind), ['due_soon', 'free']);
+  assert.match(r.actions[0].title, /Set aside ₦35,455 for Loan #1 due 2026-10-20/);
+  assert.match(r.actions[1].title, /₦334,545 can go to other purposes/);
+  assert.equal(r.actions.some(a => /%/.test(a.title + a.why + a.consequence)), false, 'no generic percentages');
+  assert.equal(r.qualified, false);
+});
+
+test('director: ranking puts overdue first, then shortfall, then due soon, then reserve; floor breach and data issues follow', () => {
+  const r = dir({ freeToUse: 60000, floor: 100000, obligations: [
+    { id: 'c', label: 'Later', dueDate: '2026-11-10', remaining: 40000, covered: 0 },
+    { id: 'a', label: 'Late', dueDate: '2026-10-10', remaining: 30000, covered: 0 },
+    { id: 'b', label: 'Soon', dueDate: '2026-10-18', remaining: 30000, covered: 30000 },
+    { id: 'd', label: 'Week', dueDate: '2026-10-19', remaining: 25000, covered: 0 },
+  ], quality: [{ key: 'needs_review', severity: 'high', text: '2 entries need review.' }, { key: 'pre_baseline', severity: 'info', text: 'x' }] });
+  assert.deepEqual(r.actions.map(a => a.kind), ['overdue', 'shortfall', 'due_soon', 'reserve', 'floor_breach', 'data_quality']);
+  assert.deepEqual(r.actions.map(a => a.rank), [1, 2, 3, 4, 5, 6]);
+  assert.equal(r.figures.uncovered, 95000, 'the funded instalment needs nothing more');
+  assert.equal(r.figures.freeAfterCommitments, -35000);
+  assert.equal(r.figures.safeToAllocate, 0, 'never a positive amount to allocate during a shortfall');
+  assert.match(r.actions[1].why, /first payment that cannot be met in full is Later on 2026-11-10/);
+  assert.equal(r.obligations.find(o => o.id === 'b').funding, 'funded');
+  assert.equal(r.actions.some(a => a.kind === 'free'), false);
+  assert.equal(r.qualified, true, 'high-severity data issues qualify the result');
+});
+
+test('director: no floor set is said plainly; stale reservations and over-earmarks are actions, not silent corrections', () => {
+  const r = dir({ floor: null, obligations: [], overEarmarked: [{ label: 'Opay', shortBy: 5000 }], staleReservations: [{ label: 'Old loan' }] });
+  assert.deepEqual(r.actions.map(a => a.kind), ['over_earmark', 'stale_reservation', 'set_floor', 'free']);
+  assert.equal(r.figures.floor, null);
+  assert.equal(r.figures.safeToAllocate, 570000);
+  assert.match(r.actions[3].why, /No working-capital floor is set/);
+  assert.equal(r.qualified, true);
+});
+
+test('cash position: a negative (overdrawn) balance reduces free-to-use cash; over-earmarking alone never does', () => {
+  const p = F.cashPosition([
+    { id: 'w', label: 'Wallet', kind: 'wallet', balance: 250000 },
+    { id: 'b', label: 'Bank', kind: 'bank', balance: -80000 },
+  ], [{ parentId: 'w', amount: 30000 }, { parentId: 'b', amount: 10000 }]);
+  assert.equal(p.available, 170000);
+  assert.equal(p.unearmarked, 140000, '220,000 from the wallet, −80,000 from the overdrawn bank');
+  assert.ok(p.unearmarked <= p.available, 'free-to-use never exceeds Cash Now');
+});
+
+/* ───────────── Bills (database v4): recurrence, payments, reservations ───────────── */
+const BILL = (over = {}) => ({ id: 'b_rent', name: 'Shop rent', cat: 'Business Overhead', amount: 50000, firstDue: '2026-10-20', repeat: 'monthly', status: 'active', amountChanges: [], overrides: {}, ...over });
+const payTx = (over = {}) => ({ id: 1, type: 'obligation', amount: 20000, date: '2026-10-15', fromAcct: 'b', billId: 'b_rent', billOcc: 'b_rent@2026-10-20', ...over });
+
+test('bill dates: month-end anchored, leap years, weekly, quarterly, one-time and an end date', () => {
+  assert.deepEqual(F.billDueDates(BILL({ firstDue: '2026-01-31' }), '2026-05-31'), ['2026-01-31', '2026-02-28', '2026-03-31', '2026-04-30', '2026-05-31']);
+  assert.deepEqual(F.billDueDates(BILL({ firstDue: '2028-01-31' }), '2028-03-01'), ['2028-01-31', '2028-02-29']);
+  assert.deepEqual(F.billDueDates(BILL({ firstDue: '2028-02-29', repeat: 'yearly' }), '2030-12-31'), ['2028-02-29', '2029-02-28', '2030-02-28']);
+  assert.deepEqual(F.billDueDates(BILL({ firstDue: '2026-10-01', repeat: 'weekly' }), '2026-10-22'), ['2026-10-01', '2026-10-08', '2026-10-15', '2026-10-22']);
+  assert.deepEqual(F.billDueDates(BILL({ firstDue: '2026-11-30', repeat: 'quarterly' }), '2027-06-30'), ['2026-11-30', '2027-02-28', '2027-05-30']);
+  assert.deepEqual(F.billDueDates(BILL({ repeat: 'none' }), '2030-01-01'), ['2026-10-20']);
+  assert.deepEqual(F.billDueDates(BILL({ until: '2026-12-01' }), '2027-12-31'), ['2026-10-20', '2026-11-20']);
+});
+
+test('bill occurrences: stable ids, partial and full payment, overdue, voided payments ignored, deterministic on reload', () => {
+  const b = BILL({ firstDue: '2026-09-20' });
+  const txns = [payTx({ billOcc: 'b_rent@2026-10-20' }), payTx({ id: 2, amount: 50000, billOcc: 'b_rent@2026-09-20', date: '2026-09-20' }), payTx({ id: 3, amount: 30000, voided: true })];
+  const occ = F.billOccurrences(b, txns, { today: TODAY, until: '2026-11-30' });
+  assert.deepEqual(occ.map(o => [o.id, o.status, o.paid, o.remaining]), [
+    ['b_rent@2026-09-20', 'paid', 50000, 0],
+    ['b_rent@2026-10-20', 'partial', 20000, 30000],
+    ['b_rent@2026-11-20', 'upcoming', 0, 50000],
+  ]);
+  assert.deepEqual(F.billOccurrences(b, txns, { today: TODAY, until: '2026-11-30' }), occ, 'same records, same occurrences: nothing generated twice');
+  const missed = F.billOccurrences(BILL({ firstDue: '2026-08-20' }), [], { today: TODAY, until: '2026-10-31' });
+  assert.deepEqual(missed.map(o => o.status), ['overdue', 'overdue', 'due_soon'], 'missed months stay owed');
+  assert.equal(F.billOccurrences(BILL({ firstDue: TODAY }), [], { today: TODAY })[0].status, 'due_today');
+});
+
+test('bill occurrences: an amount change applies from its date; cancelling and "not owed" stop only what they should', () => {
+  const b = BILL({ firstDue: '2026-09-20', amountChanges: [{ from: '2026-11-01', amount: 60000 }] });
+  assert.deepEqual(F.billOccurrences(b, [], { today: TODAY, until: '2026-12-31' }).map(o => o.amount), [50000, 50000, 60000, 60000], 'earlier occurrences keep their amount');
+  const c = BILL({ firstDue: '2026-09-20', status: 'cancelled', cancelledFrom: TODAY });
+  assert.deepEqual(F.billOccurrences(c, [], { today: TODAY, until: '2026-12-31' }).map(o => [o.dueDate, o.status, o.remaining]),
+    [['2026-09-20', 'overdue', 50000], ['2026-10-20', 'cancelled', 0], ['2026-11-20', 'cancelled', 0], ['2026-12-20', 'cancelled', 0]], 'an unpaid past occurrence stays owed');
+  const sk = BILL({ firstDue: '2026-09-20', overrides: { '2026-09-20': { skipped: true, reason: 'waived' } } });
+  assert.deepEqual(F.billOccurrences(sk, [], { today: TODAY, until: '2026-10-31' }).map(o => o.status), ['skipped', 'due_soon']);
+  assert.deepEqual(F.billObligations([c, sk], [], { today: TODAY, until: '2026-10-31' }).map(o => [o.id, o.target, o.remaining]), [['b_rent@2026-09-20', 'bill:b_rent', 50000], ['b_rent@2026-10-20', 'bill:b_rent', 50000]]);
+});
+
+test('bill validation; a bill with payments keeps its schedule; payments to a vanished date are reported', () => {
+  assert.deepEqual(F.validateBill({ name: '', amount: 0, firstDue: '', repeat: 'daily' }).errors, ['Give the bill a name.', 'Enter the amount (more than 0).', 'Choose the first due date.', 'Choose how often it repeats.']);
+  assert.equal(F.validateBill(BILL()).ok, true);
+  assert.match(F.validateBill(BILL({ firstDue: '2026-10-21' }), { previous: BILL(), hasPayments: true }).errors[0], /already has payments/);
+  assert.equal(F.validateBill(BILL({ name: 'Rent (shop)' }), { previous: BILL(), hasPayments: true }).ok, true);
+  assert.deepEqual(F.billUnmatchedPayments([BILL()], [payTx({ billOcc: 'b_rent@2026-10-21' }), payTx({ id: 2 })], { today: TODAY }).map(t => t.id), [1]);
+});
+
+test('reservations cover bills and loans with one model: one naira is never counted twice; restricted money covers nothing', () => {
+  const accts = [{ id: 'w', label: 'Wallet', kind: 'wallet', balance: 100000 }, { id: 'c', label: 'Coop', kind: 'coop', balance: 80000 }];
+  const obls = F.billObligations([BILL({ firstDue: '2026-10-20' })], [payTx()], { today: TODAY, until: '2026-11-30' })
+    .concat([{ id: 'L_1', agreementId: 'L', dueDate: '2026-10-25', remaining: 10000 }]);
+  const r = F.reservationPlan(accts, [
+    { id: 'rb', label: 'Rent money', parentId: 'w', amount: 40000, reservedFor: 'bill:b_rent' },
+    { id: 'rl', label: 'Loan money', parentId: 'w', amount: 10000, reservedFor: 'agr:L' },
+    { id: 'rc', label: 'Rent in coop', parentId: 'c', amount: 50000, reservedFor: 'bill:b_rent' },
+  ], obls);
+  assert.deepEqual(r.coverage, { 'b_rent@2026-10-20': 30000, 'b_rent@2026-11-20': 10000, L_1: 10000 }, 'the part-paid occurrence needs only 30,000');
+  assert.equal(r.buckets[2].status, 'restricted_source');
+  const due30 = obls.filter(o => o.dueDate <= '2026-11-14');
+  const p = F.cashPosition(accts, r.effective);
+  const c = F.cashCover(p, due30.reduce((t, o) => t + o.remaining, 0), F.coveredAmount(due30, r.coverage));
+  assert.deepEqual([p.available, p.unearmarked, c.due, c.covered, c.uncovered, c.leftAfter], [100000, 50000, 40000, 40000, 0, 50000]);
+  assert.equal(p.available - (40000 + 10000) - c.uncovered, c.leftAfter, 'reconciles: Cash Now − linked earmarks − uncovered = free after commitments');
+  const paidAll = F.billObligations([BILL({ firstDue: '2026-10-20', repeat: 'none' })], [payTx({ amount: 50000 })], { today: TODAY });
+  assert.deepEqual(paidAll, [], 'a paid bill is no longer an obligation');
+});
+
+test('opportunity analysis applies the working-capital floor once, before and after the commitment; no floor is qualified', () => {
+  const o = { ...EASI_OPP, expectedProfit: 160000, conversionDays: 150, recovery: 'end' };
+  const base = F.analyzeOpportunity(o, { freeCash: 300000 });
+  assert.equal(base.floor, undefined, 'no floor passed: older callers unchanged');
+  assert.ok(base.maxShortfall > 0);
+  const above = F.analyzeOpportunity(o, { freeCash: 300000, floor: 50000 });
+  assert.equal(above.verdict, base.verdict);
+  assert.deepEqual(above.before, { freeAfterCommitments: 300000, aboveFloor: 250000 });
+  assert.equal(above.after.lowestFree, Math.round((300000 - above.maxShortfall) * 100) / 100);
+  assert.ok(above.after.aboveFloor >= 0);
+  const below = F.analyzeOpportunity(o, { freeCash: 300000, floor: 200000 });
+  assert.equal(below.verdict, 'bad');
+  assert.match(below.reasons.join(' '), /below your working-capital floor of ₦200,000/);
+  const none = F.analyzeOpportunity(o, { freeCash: 300000, floor: null });
+  assert.equal(none.floor, null);
+  assert.match(none.reasons.join(' '), /No working-capital floor is set/);
+  assert.equal(none.before.aboveFloor, null);
+  const already = F.analyzeOpportunity(o, { freeCash: 40000, floor: 50000 });
+  assert.match(already.reasons.join(' '), /Even before this commitment/);
+  assert.ok(!('income' in above), 'loan proceeds are never treated as income');
+});
+
+test('bill dates: a 29th or 30th due day clamps in short months and returns in long ones, leap years included', () => {
+  assert.deepEqual(F.billDueDates(BILL({ firstDue: '2027-01-29' }), '2027-04-30'), ['2027-01-29', '2027-02-28', '2027-03-29', '2027-04-29']);
+  assert.deepEqual(F.billDueDates(BILL({ firstDue: '2028-01-29' }), '2028-03-31'), ['2028-01-29', '2028-02-29', '2028-03-29']);
+  assert.deepEqual(F.billDueDates(BILL({ firstDue: '2027-01-30' }), '2027-05-31'), ['2027-01-30', '2027-02-28', '2027-03-30', '2027-04-30', '2027-05-30']);
+  assert.deepEqual(F.billDueDates(BILL({ firstDue: '2026-12-31' }), '2027-02-28'), ['2026-12-31', '2027-01-31', '2027-02-28'], 'across a year end');
+});
+
+test('reservations never exceed what is still owed, whatever is paid; nothing is released twice', () => {
+  const accts = [{ id: 'w', kind: 'wallet', balance: 1000000 }];
+  const bk = [{ id: 'a', parentId: 'w', amount: 80000, reservedFor: 'bill:b_rent' }, { id: 'z', parentId: 'w', amount: 80000, reservedFor: 'bill:b_rent' }];
+  for (const paid of [0, 10000, 49999, 50000, 90000, 100000, 150000]) {
+    // Three monthly dates of 50,000; payments applied to the earliest dates first.
+    const txns = []; let left = paid;
+    for (const d of ['2026-10-20', '2026-11-20', '2026-12-20']) { const a = Math.min(50000, left); left -= a; if (a > 0) txns.push(payTx({ id: txns.length + 1, amount: a, billOcc: 'b_rent@' + d })); }
+    const obls = F.billObligations([BILL()], txns, { today: TODAY, until: '2026-12-31' });
+    const owed = obls.reduce((t, o) => t + o.remaining, 0);
+    const r = F.reservationPlan(accts, bk, obls);
+    const reserved = r.buckets.reduce((t, b) => t + b.effective, 0);
+    assert.equal(reserved, Math.min(160000, owed), `paid ${paid}: reserved ${reserved} vs owed ${owed}`);
+    assert.equal(F.coveredAmount(obls, r.coverage), Math.min(160000, owed));
+    assert.equal(F.cashPosition(accts, r.effective).unearmarked, 1000000 - reserved, 'each naira reserved once');
+  }
+});
+
+test('opportunity analysis counts your other known payments due during the repayment period (their unreserved part)', () => {
+  const o = { ...EASI_OPP, expectedProfit: 160000, conversionDays: 150, recovery: 'end' };
+  const alone = F.analyzeOpportunity(o, { freeCash: 300000, floor: 50000 });
+  assert.equal(alone.otherPaymentsInPeriod, 0);
+  // A 60,000 bill due before the second repayment, and one due after the last repayment (not in the period).
+  const firstDue = EASI_OPP.firstDueDate;
+  const withOther = F.analyzeOpportunity(o, { freeCash: 300000, floor: 50000, laterObligations: [{ dueDate: F.addDays(firstDue, 20), amount: 60000 }, { dueDate: '2030-01-01', amount: 999999 }] });
+  assert.equal(withOther.otherPaymentsInPeriod, 60000);
+  assert.equal(withOther.after.lowestFree, Math.round((300000 - alone.maxShortfall - 60000) * 100) / 100);
+  assert.equal(withOther.before.freeAfterCommitments, 300000, 'the before figure is unchanged (same as the Director)');
+  const tight = F.analyzeOpportunity(o, { freeCash: alone.maxShortfall + 30000, floor: null, laterObligations: [{ dueDate: F.addDays(firstDue, 20), amount: 60000 }] });
+  assert.equal(tight.verdict, 'bad', 'affordable alone, not with the other payments');
+  assert.match(tight.reasons.join(' '), /other known payments of ₦60,000 also fall due in that period/);
 });

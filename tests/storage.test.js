@@ -17,7 +17,7 @@ const skip = !pw && 'Playwright not installed';
 /* ───────────── Static checks ───────────── */
 test('storage wrapper has no silent fallbacks: failed reads reject instead of returning empty data', () => {
   const html = fs.readFileSync(path.join(ROOT, 'koboflow.html'), 'utf8');
-  const shim = /\/\* KoboFlow IDB Shim v3[\s\S]*?\}\)\(window\);/.exec(html)[0];
+  const shim = /\/\* KoboFlow IDB Shim v4[\s\S]*?\}\)\(window\);/.exec(html)[0];
   assert.doesNotMatch(shim, /fallback/);
   assert.match(shim, /get:\s+function\(key\)\s+\{ return run\('readonly',\s+function\(s\)\{ return s\.get\(key\); \}\); \}/);
   assert.match(shim, /toArray: function\(\)\s+\{ return run\('readonly',\s+function\(s\)\{ return s\.getAll\(\); \}\); \}/);
@@ -30,7 +30,7 @@ test('test build guards IDBFactory.prototype and forbids frames, objects and for
   assert.match(testHtml, /var F = w && w\.IDBFactory, P = F && F\.prototype;/);
   assert.match(testHtml, /<meta http-equiv="Content-Security-Policy" content="frame-src 'none'; child-src 'none'; object-src 'none'; worker-src 'self'"\/>/);
   assert.ok(testHtml.indexOf('Content-Security-Policy') < testHtml.indexOf('<script'), 'CSP is declared before any script');
-  assert.ok(testHtml.indexOf('isolation guard'.replace('i', 'I')) < testHtml.indexOf('KoboFlow IDB Shim v3'), 'guard runs before the storage layer');
+  assert.ok(testHtml.indexOf('isolation guard'.replace('i', 'I')) < testHtml.indexOf('KoboFlow IDB Shim v4'), 'guard runs before the storage layer');
   assert.doesNotMatch(prodHtml, /Content-Security-Policy/, 'production unchanged by the test-only policy');
   for (const re of [/new Worker\(/, /SharedWorker/, /createElement\(['"](iframe|frame|object|embed)['"]\)/, /<(iframe|frame|object|embed)\b/i, /window\.open\(/, /importScripts/])
     assert.doesNotMatch(prodHtml, re, 'the app itself creates no frame/worker/popup route: ' + re);
@@ -241,7 +241,7 @@ test('every frame, popup and worker route is refused, the guard cannot be replac
   await page.fill('#capture-input', '2500 fuel fjr');
   await page.press('#capture-input', 'Enter');
   await page.waitForFunction(() => document.getElementById('capture-input').value === '');
-  assert.match(await runStorageCheck(page), /Database: KoboFlowDB-test \(v3\)[\s\S]*Stored entries: 1 /);
+  assert.match(await runStorageCheck(page), /Database: KoboFlowDB-test \(v4\)[\s\S]*Stored entries: 1 /);
   assert.deepEqual(page.errors, []);
   assert.ok(!(await realDatabases(context)).includes('KoboFlowDB'), 'live database never created');
   await context.close();
@@ -301,14 +301,14 @@ test('a genuinely empty database is reported as available and empty, with ready 
   assert.equal(await page.isVisible('#dialog-warning'), false);
   const sc = await runStorageCheck(page);
   assert.match(sc, /Storage: available/);
-  assert.match(sc, /Database: KoboFlowDB-test \(v3\)/);
+  assert.match(sc, /Database: KoboFlowDB-test \(v4\)/);
   assert.match(sc, /Stored entries: 0 \(0 active · 0 reversed\) · agreements: 0/);
   await context.close();
 });
 
 test('Storage Check shows the opened database and separates active from reversed entries', { skip }, async () => {
   const { context, page } = await ctx();
-  await openApp(page); // creates KoboFlowDB-test v3
+  await openApp(page); // creates KoboFlowDB-test v4
   await seedTest(context, [
     { id: 1, amount: 100, type: 'expense', date: '2026-10-01', time: '09:00', desc: 'a' },
     { id: 2, amount: 200, type: 'income', date: '2026-10-01', time: '09:01', desc: 'b' },

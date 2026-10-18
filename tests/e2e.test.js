@@ -92,7 +92,7 @@ async function createEasiMoni(page, { received = true, account = 'pharma_bank' }
   await page.waitForSelector('#screen-agreement.active');
 }
 
-test('existing v2 data survives the upgrade to v3', { skip }, async () => {
+test('existing v2 data survives the upgrade to v4, after a verified safety copy is made', { skip }, async () => {
   const { context, page } = await newPage();
   await page.goto(base + '/blank');
   // Build the exact v2 database the previous release created, with two real records.
@@ -114,11 +114,17 @@ test('existing v2 data survives the upgrade to v3', { skip }, async () => {
     };
   }));
   await open(page);
-  assert.equal(await dbVersion(page), 3);
+  assert.equal(await dbVersion(page), 4);
   const txs = await dbAll(page, 'transactions');
   assert.equal(txs.length, 2, 'no records lost or duplicated');
   assert.deepEqual(txs.map(t => t.id).sort(), [1, 2]);
-  for (const s of ['agreements', 'instalments', 'allocations', 'agreementEvents', 'opportunities', 'meta']) assert.ok(Array.isArray(await dbAll(page, s)));
+  // The safety copy keeps the v2 layout and the same two records.
+  const copies = await page.evaluate(() => indexedDB.databases().then(d => d.filter(x => /^KoboFlowDB-pre-v4-/.test(x.name))));
+  assert.equal(copies.length, 1);
+  assert.equal(copies[0].version, 2);
+  const copyTx = await page.evaluate(n => new Promise(res => { const q = indexedDB.open(n); q.onsuccess = () => { const g = q.result.transaction('transactions').objectStore('transactions').getAll(); g.onsuccess = () => { q.result.close(); res(g.result); }; }; }), copies[0].name);
+  assert.deepEqual(copyTx.map(t => t.desc).sort(), ['Old real entry one', 'Old real sales']);
+  for (const s of ['agreements', 'instalments', 'allocations', 'agreementEvents', 'opportunities', 'meta', 'bills']) assert.ok(Array.isArray(await dbAll(page, s)));
   // id 1 used to be hidden behind sample record #1; it must now be visible.
   await nav(page, 'timeline');
   const tl = await page.textContent('#timeline-list');
@@ -324,7 +330,7 @@ test('export then import is lossless and repeat imports add nothing', { skip }, 
   const [dl] = await Promise.all([page.waitForEvent('download'), page.click('#export-json-btn')]);
   const file = await dl.path();
   const backup = JSON.parse(fs.readFileSync(file, 'utf8'));
-  assert.equal(backup.version, '3.2');
+  assert.equal(backup.version, '4.0');
   assert.equal(backup.ledgerSetup, null, 'demo mode exports no account setup');
   assert.ok(backup.transactions.every(t => !t.demo), 'sample data is not exported');
 

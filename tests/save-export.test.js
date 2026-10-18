@@ -293,7 +293,7 @@ for (const b of BUILDS) {
     assert.ok(dl, 'backup downloaded');
     const backup = JSON.parse(fs.readFileSync(await dl.path(), 'utf8'));
     assert.equal(backup.app, 'KoboFlow');
-    assert.equal(backup.version, '3.2');
+    assert.equal(backup.version, '4.0');
     if (b.dbName === 'KoboFlowDB-test') assert.equal(backup.testDatabase, 'KoboFlowDB-test');
     else assert.equal(backup.testDatabase, undefined);
     assert.equal(backup.transactions.filter(t => /zqxexport/.test(t.desc)).length, 1);
@@ -340,7 +340,7 @@ for (const b of BUILDS) {
     const dl = await download(page);
     assert.ok(dl, 'backup downloaded');
     const log = await page.evaluate(() => window.__txLog);
-    assert.deepEqual(log, [{ stores: ['agreementEvents', 'agreements', 'allocations', 'instalments', 'meta', 'opportunities', 'transactions'], mode: 'readonly' }]);
+    assert.deepEqual(log, [{ stores: ['agreementEvents', 'agreements', 'allocations', 'bills', 'instalments', 'meta', 'opportunities', 'transactions'], mode: 'readonly' }]);
     const backup = JSON.parse(fs.readFileSync(await dl.path(), 'utf8'));
     assert.equal(backup.transactions.filter(t => /zqxsnapshot/.test(t.desc)).length, 1);
     await context.close();
