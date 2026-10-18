@@ -82,27 +82,55 @@
   }
   function flush(d){ var q=_opening||[]; _opening=null; q.forEach(function(f){ f(d); }); }
 
+  /* Every read and write either succeeds or rejects. A database that could not be
+     opened or queried is never reported as an empty one. */
+  function unavailable() { return _err || new Error('Storage unavailable: the database could not be opened'); }
   function makeTable(storeName) {
-    function run(mode, op, fallback) {
+    function run(mode, op) {
       return new Promise(function(resolve, reject) {
         openDB(function(database) {
-          if (!database) { if (fallback !== undefined) resolve(fallback); else reject(_err || new Error('Storage unavailable')); return; }
+          if (!database) { reject(unavailable()); return; }
           try {
             var tx  = database.transaction([storeName], mode);
             var req = op(tx.objectStore(storeName));
             tx.oncomplete = function() { resolve(req ? req.result : undefined); };
-            tx.onerror = tx.onabort = function() { if (fallback !== undefined) resolve(fallback); else reject(tx.error || (req && req.error)); };
-          } catch(err) { if (fallback !== undefined) resolve(fallback); else reject(err); }
+            tx.onerror = tx.onabort = function() { reject(tx.error || (req && req.error) || new Error('Storage ' + mode + ' failed on ' + storeName)); };
+          } catch(err) { reject(err); }
         });
       });
     }
     return {
       add:     function(record) { return run('readwrite', function(s){ return s.add(record); }); },
       put:     function(record) { return run('readwrite', function(s){ return s.put(record); }); },
-      get:     function(key)    { return run('readonly',  function(s){ return s.get(key); }, null); },
-      toArray: function()       { return run('readonly',  function(s){ return s.getAll(); }, []).then(function(r){ return r || []; }); },
-      clear:   function()       { return run('readwrite', function(s){ return s.clear(); }, undefined); }
+      get:     function(key)    { return run('readonly',  function(s){ return s.get(key); }); },
+      toArray: function()       { return run('readonly',  function(s){ return s.getAll(); }); },
+      clear:   function()       { return run('readwrite', function(s){ return s.clear(); }); }
     };
+  }
+  /* Name and version of the database actually opened (not just the configured name). */
+  function info() {
+    return new Promise(function(resolve, reject) {
+      openDB(function(database) {
+        if (!database) { reject(unavailable()); return; }
+        resolve({ name: database.name, version: database.version, stores: Array.prototype.slice.call(database.objectStoreNames) });
+      });
+    });
+  }
+
+  /* One read-only transaction across several stores. IndexedDB runs it after every earlier
+     overlapping write and before every later one, so the result is one consistent snapshot. */
+  function snapshot(names) {
+    return new Promise(function(resolve, reject) {
+      openDB(function(database) {
+        if (!database) { reject(unavailable()); return; }
+        try {
+          var tx = database.transaction(names, 'readonly'), out = {};
+          names.forEach(function(n){ var r = tx.objectStore(n).getAll(); r.onsuccess = function(){ out[n] = r.result; }; });
+          tx.oncomplete = function(){ resolve(out); };
+          tx.onerror = tx.onabort = function(){ reject(tx.error || new Error('Storage snapshot failed')); };
+        } catch(err) { reject(err); }
+      });
+    });
   }
 
   /* All-or-nothing write across several stores: ops = [{store, put:record}] */
@@ -126,6 +154,8 @@
     var self = this;
     STORES.concat(Object.keys(V3_STORES)).forEach(function(n){ self[n] = makeTable(n); });
     this.atomic  = atomic;
+    this.info    = info;
+    this.snapshot= snapshot;
     this.verno   = DB_VERSION;
     this.name    = DB_NAME;
     this.testName= TEST_DB;
@@ -484,6 +514,69 @@ var ACCOUNT_KINDS={wallet:'Mobile money wallet',bank:'Bank account',cash:'Cash',
 var LEGACY_ACCOUNTS={pharma_cash:'Pharmacy Cash',pharma_bank:'Pharmacy Bank',pers_cash:'Personal Cash',pers_bank:'Personal Bank',coop:'Coop Savings',emergency:'Emergency Fund',fixed_dep:'Fixed Deposit'};
 /* Buckets are earmarks inside one physical account. They are never added to
    totals, so the same naira is never counted twice. */
+/* One cash rule for every screen. "Available" = money that can be spent now: cash, bank and
+   wallet accounts by default. Cooperative/thrift, investment / fixed deposit and any other kind
+   are "restricted" by default. A per-account access setting ('immediate'|'restricted')
+   overrides the default either way. Restricted money is still an asset (net worth).
+   Earmarks are reported, never subtracted from a balance: "unearmarked" is what is left in
+   available accounts after earmarks, never below zero per account; any account whose earmarks
+   exceed its balance is listed in overEarmarked. */
+var AVAILABLE_KINDS={cash:1,bank:1,wallet:1};
+function accountAccess(a){
+  if(a&&(a.access==='immediate'||a.access==='restricted'))return a.access;
+  return a&&AVAILABLE_KINDS[a.kind]?'immediate':'restricted';
+}
+function cashPosition(accounts,buckets){
+  var by={},avK=0,reK=0;
+  (accounts||[]).forEach(function(a){
+    var b=toK(a.balance!==undefined?a.balance:a.opening),acc=accountAccess(a);
+    by[a.id]={id:a.id,label:a.label,access:acc,balanceK:b,earK:0};
+    if(acc==='immediate')avK+=b;else reK+=b;
+  });
+  (buckets||[]).forEach(function(bk){var p=by[bk.parentId];if(p)p.earK+=toK(bk.amount);});
+  var earAv=0,earRe=0,freeK=0,over=[],out={};
+  Object.keys(by).forEach(function(id){
+    var p=by[id];
+    if(p.access==='immediate'){earAv+=p.earK;freeK+=Math.max(0,p.balanceK-p.earK);}else earRe+=p.earK;
+    if(p.earK>0&&p.earK>p.balanceK)over.push({id:id,label:p.label,balance:fromK(p.balanceK),earmarked:fromK(p.earK),shortBy:fromK(p.earK-p.balanceK)});
+    out[id]={access:p.access,balance:fromK(p.balanceK),earmarked:fromK(p.earK)};
+  });
+  return{available:fromK(avK),restricted:fromK(reK),total:fromK(avK+reK),earmarked:fromK(earAv),earmarkedRestricted:fromK(earRe),
+    unearmarked:fromK(freeK),overEarmarked:over,accounts:out};
+}
+/* Cash cover for upcoming obligations, from a cashPosition() result and the amount due in a window.
+   The figure that obligations are compared with is free-to-use cash (available cash after earmarks),
+   so Pressure, Calendar, Autopilot and Opportunity Analysis never imply more spendable money than
+   exists. Gross Cash Now and the earmarked amount are returned for display only. Earmarks and
+   obligations are each subtracted once; an earmark is not linked to a particular obligation. */
+function cashCover(position,due){
+  var p=position||{},freeK=toK(p.unearmarked),dueK=toK(due);
+  return{cashNow:fromK(toK(p.available)),earmarked:fromK(toK(p.earmarked)),freeToUse:fromK(freeK),due:fromK(dueK),
+    leftAfter:fromK(freeK-dueK),pressure:freeK>0?Math.min(100,Math.round(dueK/freeK*100)):dueK>0?100:0};
+}
+/* Spending runway = available cash / average daily spending, where spending is expenses plus loan
+   interest and fees (owner withdrawals, transfers and loan principal are not spending).
+   History window rule: the average covers the days from historyStart (the live baseline date: the
+   day from which every entry is recorded) through today, inclusive, capped at the last 90 days.
+   Entries dated before the window or after today are not used. With fewer than 30 days of history
+   there is no estimate (reason 'short_history'): under one monthly cycle, monthly bills such as rent
+   or salaries may not have fallen due yet and the runway would be overstated. With enough history
+   but no spending, there is also no estimate (reason 'no_spending'). An estimate is never invented. */
+var RUNWAY_MIN_DAYS=30,RUNWAY_MAX_DAYS=90;
+function spendingRunway(txns,available,opts){
+  opts=opts||{};
+  var td=opts.today||today(),start=parseDate(opts.historyStart)?String(opts.historyStart).slice(0,10):td;
+  if(start>td)start=td;
+  var historyDays=Math.min(RUNWAY_MAX_DAYS,daysBetween(start,td)+1),from=addDays(td,1-historyDays),spendK=0;
+  (txns||[]).forEach(function(t){
+    var d=String(t&&t.date||'').slice(0,10);if(!d||d<from||d>td)return;
+    var c=classifyTxn(t);spendK+=toK(c.expense)+toK(c.financeCost);
+  });
+  var spending=fromK(spendK),daily=spending/historyDays,
+    reason=historyDays<RUNWAY_MIN_DAYS?'short_history':spendK<=0?'no_spending':null;
+  return{known:!reason,reason:reason,historyDays:historyDays,minDays:RUNWAY_MIN_DAYS,windowStart:from,spending:spending,
+    dailyBurn:reason?null:daily,monthlyBurn:reason?null:daily*30,days:reason?null:Math.round((Number(available)||0)/daily)};
+}
 function bucketSummary(balances,buckets){
   var by={};
   (buckets||[]).forEach(function(b){var p=b.parentId;if(!by[p])by[p]={earmarked:0,buckets:[]};by[p].earmarked+=toK(b.amount);by[p].buckets.push(b);});
@@ -746,7 +839,7 @@ var API={toK:toK,fromK:fromK,num:num,fmtDate:fmtDate,parseDate:parseDate,today:t
   isDebt:isDebt,cashReceived:function(t){return fromK(cashReceivedK(t));},buildSchedule:buildSchedule,termsSummary:termsSummary,
   instalmentStates:instalmentStates,agreementBalances:agreementBalances,allocatePayment:allocatePayment,settlementPlan:settlementPlan,
   classifyTxn:classifyTxn,accountDeltas:accountDeltas,accountBalances:accountBalances,upcomingObligations:upcomingObligations,cashForecast:cashForecast,
-  buildReminders:buildReminders,xirr:xirr,ACCOUNT_KINDS:ACCOUNT_KINDS,LEGACY_ACCOUNTS:LEGACY_ACCOUNTS,bucketSummary:bucketSummary,validateSetup:validateSetup,cashFlowSummary:cashFlowSummary,oppRepayments:oppRepayments,analyzeOpportunity:analyzeOpportunity,oppToTerms:oppToTerms,parseManualRows:parseManualRows};
+  buildReminders:buildReminders,xirr:xirr,ACCOUNT_KINDS:ACCOUNT_KINDS,LEGACY_ACCOUNTS:LEGACY_ACCOUNTS,bucketSummary:bucketSummary,accountAccess:accountAccess,cashPosition:cashPosition,cashCover:cashCover,spendingRunway:spendingRunway,validateSetup:validateSetup,cashFlowSummary:cashFlowSummary,oppRepayments:oppRepayments,analyzeOpportunity:analyzeOpportunity,oppToTerms:oppToTerms,parseManualRows:parseManualRows};
 root.KoboFin=API;
 if(typeof module!=='undefined'&&module.exports)module.exports=API;
 })(typeof window!=='undefined'?window:this);
@@ -1194,7 +1287,7 @@ body.kf-live .sample-tag{display:inline-block;}
             </div>
           </div>
           <div style="flex:1;">
-            <div class="card-label" style="margin-bottom:5px;">Financial Health<span class="sample-tag">Sample budgets</span></div>
+            <div class="card-label" style="margin-bottom:5px;">Financial Health</div>
             <div id="score-msg" style="font-size:12px;line-height:1.6;color:var(--text);">Spending is well within control.</div>
             <div id="pressure-mini" style="color:var(--muted);font-size:11px;margin-top:3px;">Pressure: calculating...</div>
           </div>
@@ -1215,7 +1308,7 @@ body.kf-live .sample-tag{display:inline-block;}
       <div class="runway-card" id="runway-card">
         <div style="display:flex;justify-content:space-between;align-items:flex-start;">
           <div>
-            <div class="card-label" style="margin-bottom:4px;">CASH RUNWAY</div>
+            <div class="card-label" style="margin-bottom:4px;">SPENDING RUNWAY</div>
             <div class="runway-days" id="runway-days">--</div>
             <div class="runway-label">DAYS REMAINING</div>
           </div>
@@ -1224,13 +1317,14 @@ body.kf-live .sample-tag{display:inline-block;}
             <div style="font-size:10px;color:var(--muted);">If no new income arrives</div>
           </div>
         </div>
+        <div class="muted-note" id="runway-basis" style="margin:6px 0 0;">Spending runway: expenses + interest/fees; excludes owner withdrawals and loan principal. Available cash excludes restricted accounts (coop, fixed deposit). Averaged over the days recorded since your baseline (up to the last 90); at least 30 days are needed.</div>
         <div class="runway-meta" id="runway-meta"></div>
       </div>
       <div style="margin-bottom:4px;"><span class="card-label">ACCOUNTS</span></div>
       <div class="accounts-scroll" id="accounts-scroll"></div>
       <div class="bucket-line" id="bucket-list"></div>
       <div class="card"><div class="card-label">Upcoming Obligations</div><div id="ob-list"></div></div>
-      <div class="card"><div class="card-label">Budget Status<span class="sample-tag">Sample</span></div><div id="budget-list"></div></div>
+      <div class="card"><div class="card-label">Budget Status</div><div id="budget-list"></div></div>
     </div>
 
     <div class="screen" id="screen-timeline">
@@ -1260,7 +1354,7 @@ body.kf-live .sample-tag{display:inline-block;}
 
     <div class="screen" id="screen-vehicles">
       <div class="screen-title">VEHICLE COSTS</div>
-      <div class="screen-sub">FJR1300AE &middot; Sportage Green &middot; Sportage Black<span class="sample-tag">Sample logs</span></div>
+      <div class="screen-sub">FJR1300AE &middot; Sportage Green &middot; Sportage Black</div>
       <div class="vehicle-tabs" id="vehicle-tabs"></div>
       <div id="vehicle-panels"></div>
     </div>
@@ -1274,7 +1368,7 @@ body.kf-live .sample-tag{display:inline-block;}
 
     <div class="screen" id="screen-pressure">
       <div class="screen-title">FINANCIAL PRESSURE</div>
-      <div class="screen-sub">Obligations vs available cash &middot; 30-day window</div>
+      <div class="screen-sub">Obligations vs free-to-use cash (after earmarks) &middot; 30-day window</div>
       <div class="card">
         <div class="pressure-hero">
           <div class="pressure-label">Pressure Score</div>
@@ -1300,7 +1394,7 @@ body.kf-live .sample-tag{display:inline-block;}
 
     <div class="screen" id="screen-cashdrop">
       <div class="screen-title">WHY DID CASH DROP?</div>
-      <div class="screen-sub">Month-over-month spending changes<span class="sample-tag">Sample</span></div>
+      <div class="screen-sub">Month-over-month spending changes</div>
       <div class="card"><div class="card-label">Compared to Last Month</div><div id="drop-list"></div></div>
       <div class="card"><div class="card-label">Largest Contributors to Drop</div><div id="drop-chart"></div></div>
     </div>
@@ -1344,11 +1438,11 @@ body.kf-live .sample-tag{display:inline-block;}
       </div>
       <div class="card"><div class="card-label">Assets</div><div id="nw-assets-list"></div></div>
       <div class="card"><div class="card-label">Liabilities</div><div id="nw-liabs-list"></div></div>
-      <div class="card"><div class="card-label">6-Month Trend<span class="sample-tag">Sample</span></div><div class="nw-trend-row" id="nw-trend"></div></div>
+      <div class="card"><div class="card-label">6-Month Trend</div><div class="nw-trend-row" id="nw-trend"></div></div>
       <div class="card">
         <div class="card-label">Financial Independence Progress</div>
         <div id="fi-pct-label" style="font-family:var(--bebas);font-size:20px;color:var(--amber);margin-bottom:3px;">0%</div>
-        <div style="font-size:11px;color:var(--muted);margin-bottom:9px;">Net Worth vs &#8358;10M Goal</div>
+        <div id="fi-goal-label" style="font-size:11px;color:var(--muted);margin-bottom:9px;">Net Worth vs &#8358;10M Goal (sample)</div>
         <div class="fi-track"><div class="fi-bar" id="fi-bar"></div></div>
         <div class="fi-labels"><span class="fi-label">&#8358;0</span><span class="fi-label">&#8358;5M</span><span class="fi-label">&#8358;10M</span></div>
       </div>
@@ -1501,6 +1595,10 @@ body.kf-live .sample-tag{display:inline-block;}
           <div><div class="settings-row-label">Storage Check</div><div class="settings-row-sub" id="storage-check-out">Shows which database this file uses and what is saved in it.</div></div>
           <button class="settings-btn" id="storage-check-btn">Check</button>
         </div>
+        <div class="settings-row">
+          <div><div class="settings-row-label">Persistent Storage</div><div class="settings-row-sub" id="persist-out">Asks the browser not to clear this app's data automatically. The browser decides.</div></div>
+          <button class="settings-btn" id="persist-request-btn">Request</button>
+        </div>
       </div>
       <div class="card">
         <div class="settings-section-title">DATA MANAGEMENT</div>
@@ -1644,15 +1742,16 @@ body.kf-live .sample-tag{display:inline-block;}
         <button class="type-chip" data-type="owner_withdrawal">Owner W/D</button>
         <button class="type-chip" data-type="investment">Investment</button>
         <button class="type-chip" data-type="capital_injection">Capital Inj.</button>
-        <button class="type-chip" data-type="obligation">Obligation</button>
+        <button class="type-chip" data-type="obligation">Bill paid</button>
       </div>
+      <div class="muted-note" id="type-chip-hint" style="display:none;margin:-4px 0 8px;">Bill paid records money already paid. Upcoming bills are added separately.</div>
       <input id="modal-amount" class="modal-input" type="number" inputmode="numeric" placeholder="Amount"/>
       <input id="modal-desc" class="modal-input" type="text" placeholder="Description"/>
       <select id="modal-cat" class="modal-input">
         <option>Vehicle: FJR1300AE</option><option>Vehicle: Sportage Green</option><option>Vehicle: Sportage Black</option>
         <option>Food</option><option>Household</option><option>Business Overhead</option>
         <option>Utilities</option><option>Pharmacy Sales</option><option>Restocking</option>
-        <option>Obligations</option><option>Loan</option><option>Savings</option><option>Other</option>
+        <option>Obligations</option><option>Loan</option><option>Savings</option><option selected>Other</option>
       </select>
       <div class="grid2" style="margin-bottom:0;">
         <div>
@@ -1968,7 +2067,7 @@ function parseEntry(raw){
   var amount=parseFloat(parts[0].replace(/,/g,''));
   var rest=parts.slice(1).join(' ').toLowerCase();
   var desc=parts.slice(1).join(' ');
-  var cat='Other',type='expense',vehicle=null,fromAcct='pers_cash',toAcct='';
+  var cat='Other',type='expense',vehicle=null,fromAcct='pers_cash',toAcct='',review=false;
   for(var vi=0;vi<VEHICLES.length;vi++){
     var v=VEHICLES[vi];
     for(var ki=0;ki<v.keywords.length;ki++){
@@ -1984,7 +2083,7 @@ function parseEntry(raw){
     else if(/capital injection/.test(rest)){cat='Capital Injection';type='capital_injection';toAcct='pharma_bank';fromAcct='';}
     else if(/coop|cooperative/.test(rest)){cat='Savings';type='transfer';fromAcct='pers_bank';toAcct='coop';}
     else if(/savings|transfer/.test(rest)){cat='Savings';type='transfer';fromAcct='pers_cash';toAcct='pers_bank';}
-    else if(/fuel|petrol/.test(rest)){cat='Vehicle: FJR1300AE';vehicle='fjr';}
+    else if(/fuel|petrol/.test(rest)){cat='Vehicle fuel (vehicle not set)';review=true;} // no vehicle named: never assume one
     else if(/lunch|food|breakfast|dinner|meal|eat|bread|rice|market/.test(rest)){cat='Food';}
     else if(/internet|electricity|nepa|ibedc|generator|rent/.test(rest)){cat='Business Overhead';fromAcct='pharma_cash';}
     else if(/household|house|home|kerosene|gas|cooking/.test(rest)){cat='Household';}
@@ -1992,10 +2091,13 @@ function parseEntry(raw){
     else if(/salary|income|refund|gift/.test(rest)){cat='Income';type='income';toAcct='pers_cash';}
     else if(/invest|fixed deposit/.test(rest)){cat='Investment';type='investment';fromAcct='pers_bank';toAcct='fixed_dep';}
   }
-  return{amount:isNaN(amount)?0:amount,desc:desc||'Entry',cat:cat,type:type,vehicle:vehicle||null,fromAcct:fromAcct,toAcct:toAcct,state:type==='loan_receipt'?'Needs Review':'AI Categorized'};
+  return{amount:isNaN(amount)?0:amount,desc:desc||'Entry',cat:cat,type:type,vehicle:vehicle||null,fromAcct:fromAcct,toAcct:toAcct,state:type==='loan_receipt'||review?'Needs Review':'AI Categorized'};
 }
 
-function pill(text,bg,color){return'<span class="pill" style="background:'+bg+';color:'+color+'"><span class="pill-dot" style="background:'+color+'"></span>'+text+'</span>';}
+/* Display name of a transaction type. The stored value 'obligation' is kept for existing records,
+   backups and CSV, but it means a bill that was PAID, so it is shown as "bill paid". */
+function typeLabel(t){return t==='obligation'?'bill paid':String(t==null?'':t).replace(/_/g,' ');}
+function pill(text,bg,color){return'<span class="pill" style="background:'+bg+';color:'+color+'"><span class="pill-dot" style="background:'+color+'"></span>'+esc(text)+'</span>';}
 
 (function(){
   var h=new Date().getHours();
@@ -2004,7 +2106,7 @@ function pill(text,bg,color){return'<span class="pill" style="background:'+bg+';
 })();
 
 (function(){
-  var opts=ACCOUNTS.map(function(a){return'<option value="'+a.id+'">'+a.label+'</option>';}).join('');
+  var opts=ACCOUNTS.map(function(a){return'<option value="'+esc(a.id)+'">'+esc(a.label)+'</option>';}).join('');
   var none='<option value="">-- None --</option>';
   var mf=qs('modal-from'),mt=qs('modal-to');
   if(mf)mf.innerHTML=none+opts;
@@ -2012,6 +2114,12 @@ function pill(text,bg,color){return'<span class="pill" style="background:'+bg+';
 })();
 
 function renderScore(){
+  if(isLive()){ // the score was built from sample budgets: never show it as a live result
+    var a0=qs('score-arc');if(a0){a0.style.transition='none';a0.setAttribute('stroke','#4A4858');a0.setAttribute('stroke-dasharray','213.6 213.6');a0.setAttribute('stroke-dashoffset','213.6');}
+    var n0=qs('score-num');if(n0){n0.textContent='--';n0.style.color='#7A7880';}
+    var m0=qs('score-msg');if(m0)m0.textContent='Not available: no budgets set yet.';
+    return;
+  }
   var avg=BUDGETS.reduce(function(s,b){return s+pct(b.used,b.total);},0)/BUDGETS.length;
   var score=Math.max(0,Math.round(100-avg*0.8));
   var color=score>70?'#22C55E':score>50?'#F5A623':'#EF4444';
@@ -2045,31 +2153,48 @@ function renderInbox(){
     var sign=isIn(i.type)?'+':i.type==='transfer'||i.type==='owner_withdrawal'?'~':'-';
     var icCls='inbox-icon'+(isIn(i.type)?' income':i.type==='transfer'?' transfer':i.type==='owner_withdrawal'?' owner_withdrawal':'');
     var icCh=isIn(i.type)?'+':i.type==='transfer'?'~':i.type==='owner_withdrawal'?'v':'-';
-    var acts=i.state==='Needs Review'?'<div class="action-btns"><button class="act-btn act-approve" data-approve="'+i.id+'">OK</button><button class="act-btn act-dismiss" data-dismiss="'+i.id+'">X</button></div>':'';
-    return'<div class="inbox-item'+(i.state==='Needs Review'?' needs-review':'')+'"><div class="'+icCls+'">'+icCh+'</div><div class="inbox-mid"><div style="display:flex;align-items:center;gap:6px;margin-bottom:3px;flex-wrap:wrap;"><span class="inbox-desc-txt">'+i.desc+'</span>'+pill(i.state,ss2.bg,ss2.color)+pill(i.type.replace(/_/g,' '),'#222228','#7A7880')+'</div><div class="inbox-meta">'+dateLabel(i.date)+' &middot; '+i.time+' &middot; '+i.cat+'</div></div><div class="inbox-right"><div class="amount-badge '+i.type+'">'+sign+fmt(i.amount)+'</div>'+acts+'</div></div>';
+    var acts=i.state==='Needs Review'?'<div class="action-btns"><button class="act-btn act-approve" data-approve="'+esc(i.id)+'">OK</button><button class="act-btn act-dismiss" data-dismiss="'+esc(i.id)+'">X</button></div>':'';
+    return'<div class="inbox-item'+(i.state==='Needs Review'?' needs-review':'')+'"><div class="'+icCls+'">'+icCh+'</div><div class="inbox-mid"><div style="display:flex;align-items:center;gap:6px;margin-bottom:3px;flex-wrap:wrap;"><span class="inbox-desc-txt">'+esc(i.desc)+'</span>'+pill(i.state,ss2.bg,ss2.color)+pill(typeLabel(i.type),'#222228','#7A7880')+'</div><div class="inbox-meta">'+esc(dateLabel(i.date))+' &middot; '+esc(i.time)+' &middot; '+esc(i.cat)+'</div></div><div class="inbox-right"><div class="amount-badge '+cls(i.type)+'">'+sign+fmt(i.amount)+'</div>'+acts+'</div></div>';
   }).join('');
 }
 
-function vTotal(v){return v.logs.reduce(function(s,l){return s+l.amount;},0);}
+/* Vehicles: in live mode every figure comes from saved, non-voided transactions (a vehicle log
+   saves one expense with vehicle and category "Vehicle: <name>"); the in-memory v.logs are
+   demo samples only. The log's own category is kept in vehicleCat for new logs; older entries
+   show "Category not recorded" rather than a guess. */
+function monthStartISO(){var d=new Date();return d.getFullYear()+'-'+(d.getMonth()+1<10?'0':'')+(d.getMonth()+1)+'-01';}
+function vehicleIdOf(t){
+  if(!t||t.demo||t.voided)return null;
+  if(t.vehicle)return VEHICLES.some(function(v){return v.id===t.vehicle;})?t.vehicle:null;
+  var m=/^Vehicle: (.+)$/.exec(t.cat||''),v=m&&VEHICLES.find(function(x){return x.name===m[1];});
+  return v?v.id:null;
+}
+function vehicleLogs(v){
+  if(!isLive())return v.logs;
+  var ms=monthStartISO();
+  return items.filter(function(t){return vehicleIdOf(t)===v.id&&(t.date||'')>=ms&&F.classifyTxn(t).expense>0;})
+    .map(function(t){return{id:t.id,cat:t.vehicleCat||'Category not recorded',amount:F.classifyTxn(t).expense,desc:t.desc,date:t.date,time:t.time};});
+}
+function vTotal(v){return vehicleLogs(v).reduce(function(s,l){return s+l.amount;},0);}
 function renderVehicles(){
   var tabs=qs('vehicle-tabs'),panels=qs('vehicle-panels');
   if(!tabs||!panels)return;
   tabs.innerHTML=VEHICLES.map(function(v){return'<button class="vtab'+(v.id===activeVehicle?' active':'')+'" data-vid="'+v.id+'">'+v.icon+' '+v.name+'</button>';}).join('');
   panels.innerHTML=VEHICLES.map(function(v){
-    var spent=vTotal(v),p=pct(spent,v.budget),c=hColor(p);
-    var ct={};v.logs.forEach(function(l){ct[l.cat]=(ct[l.cat]||0)+l.amount;});
+    var live=isLive(),logs=vehicleLogs(v),spent=vTotal(v),p=live?0:pct(spent,v.budget),c=live?'#7A7880':hColor(p);
+    var ct={};logs.forEach(function(l){ct[l.cat]=(ct[l.cat]||0)+l.amount;});
     var catRows=Object.keys(ct).map(function(k){return[k,ct[k]];}).sort(function(a,b){return b[1]-a[1];}).map(function(e,idx){
       var cp=pct(e[1],spent),cc=CAT_COLORS[idx%CAT_COLORS.length];
-      return'<div class="budget-row"><div class="budget-top"><div class="budget-cat">'+e[0]+'</div><div class="budget-right"><span class="budget-fig">'+fmt(e[1])+'</span><span class="budget-pct" style="color:'+cc+'">'+cp+'%</span></div></div><div class="budget-track"><div class="budget-bar" style="background:'+cc+';" data-pct="'+cp+'"></div></div></div>';
+      return'<div class="budget-row"><div class="budget-top"><div class="budget-cat">'+esc(e[0])+'</div><div class="budget-right"><span class="budget-fig">'+fmt(e[1])+'</span><span class="budget-pct" style="color:'+cc+'">'+cp+'%</span></div></div><div class="budget-track"><div class="budget-bar" style="background:'+cc+';" data-pct="'+cp+'"></div></div></div>';
     }).join('');
-    var logRows=v.logs.map(function(l){
+    var logRows=(live&&!logs.length)?'<div class="muted-note" data-live-na="vehicle-logs">No entries recorded for this vehicle this month.</div>':logs.map(function(l){
       var icons={'Fuel':'&#9981;','Repair':'&#128295;','Tyres':'O','Service':'&#9881;','Battery':'B','Insurance':'S','Registration':'R','Wash':'~','Other':'$'};
       var ic=icons[l.cat]||'$';
-      return'<div class="vlog-item"><div class="vlog-icon">'+ic+'</div><div class="vlog-body"><div class="vlog-desc">'+(l.desc||l.cat)+'</div><div class="vlog-meta">'+dateLabel(l.date)+' &middot; '+l.cat+'</div></div><div class="vlog-amount">-'+fmt(l.amount)+'</div></div>';
+      return'<div class="vlog-item"><div class="vlog-icon">'+ic+'</div><div class="vlog-body"><div class="vlog-desc">'+esc(l.desc||l.cat)+'</div><div class="vlog-meta">'+esc(dateLabel(l.date))+' &middot; '+esc(l.cat)+'</div></div><div class="vlog-amount">-'+fmt(l.amount)+'</div></div>';
     }).join('');
     return'<div class="vehicle-panel'+(v.id===activeVehicle?' active':'')+'" data-panel="'+v.id+'">'
       +'<div class="vehicle-hero"><div class="vh-top"><div class="vh-icon" style="font-family:var(--bebas);font-size:22px;color:var(--amber);">'+v.icon+'</div><div><div class="vh-name">'+v.name+'</div><div class="vh-sub">'+v.sub+'</div></div></div>'
-      +'<div class="vh-stats"><div class="vh-stat"><div class="vh-stat-val">'+fmt(spent)+'</div><div class="vh-stat-label">Spent</div></div><div class="vh-stat"><div class="vh-stat-val">'+fmt(v.budget)+'</div><div class="vh-stat-label">Budget</div></div><div class="vh-stat"><div class="vh-stat-val" style="color:'+c+';">'+p+'%</div><div class="vh-stat-label">Used</div></div></div>'
+      +'<div class="vh-stats"><div class="vh-stat"><div class="vh-stat-val" data-vehicle-spent="'+v.id+'">'+fmt(spent)+'</div><div class="vh-stat-label">'+(live?'Spent this month':'Spent')+'</div></div><div class="vh-stat"><div class="vh-stat-val">'+(live?'--':fmt(v.budget))+'</div><div class="vh-stat-label">'+(live?'No target set':'Budget')+'</div></div><div class="vh-stat"><div class="vh-stat-val" style="color:'+c+';">'+(live?'--':p+'%')+'</div><div class="vh-stat-label">Used</div></div></div>'
       +'<div class="budget-track" style="height:5px;overflow:hidden;border-radius:2px;"><div class="budget-bar" style="background:'+c+';height:100%;" data-pct="'+p+'"></div></div></div>'
       +'<div class="card"><div class="card-label">By Type</div>'+catRows+'</div>'
       +'<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:9px;"><div style="font-family:var(--bebas);font-size:16px;letter-spacing:.04em;color:var(--amber);">EXPENSE LOG</div><button class="add-vlog-btn" data-vid="'+v.id+'" style="background:var(--surf2);border:1px solid var(--border);border-radius:6px;padding:6px 12px;color:var(--muted);font-size:11px;font-weight:600;">+ Log</button></div>'
@@ -2081,6 +2206,11 @@ function renderVehicles(){
 
 
 function renderCashDrop(){
+  if(isLive()){ // month-over-month figures are sample data: not computed for live records yet
+    var na='<div class="muted-note" data-live-na="cash-drop">Not available yet. Cash Drop is not calculated from your recorded entries yet.</div>';
+    var l0=qs('drop-list');if(l0)l0.innerHTML=na;var c0=qs('drop-chart');if(c0)c0.innerHTML='';
+    return;
+  }
   var el=qs('drop-list');
   if(el)el.innerHTML=DROPS.map(function(d){var up=d.change>0;return'<div class="drop-row"><span class="drop-cat">'+d.icon+' '+d.cat+'</span><span class="drop-change '+(up?'up':'down')+'">'+(up?'+':'')+fmt(d.change)+'</span></div>';}).join('');
   var el2=qs('drop-chart');
@@ -2101,35 +2231,35 @@ function renderCashDrop(){
    V2.1 — CASH RUNWAY ENGINE
 ═══════════════════════════════════════════════════════════════ */
 function calcRunway(){
-  // Available cash: all accounts except fixed_dep
-  var liquid = ACCOUNTS.filter(function(a){
-    return a.id !== 'fixed_dep';
-  }).reduce(function(s,a){return s+a.balance;},0);
+  // Available cash: the shared cash rule (restricted accounts such as coop and fixed deposits excluded).
+  var liquid = cashNow().available;
 
-  // Monthly burn: last 90 days of expenses only
-  var now = new Date();
-  var day90 = new Date(now); day90.setDate(day90.getDate()-90);
-  var d90str = day90.toISOString().slice(0,10);
-  var totalBurn90 = items.filter(function(i){return i.date >= d90str;}).reduce(function(s,i){var c=F.classifyTxn(i);return s+c.expense+c.financeCost;},0);
-  var monthlyBurn = totalBurn90 / 3; // 90 days = ~3 months
-  var dailyBurn = monthlyBurn / 30;
-  var runwayDays = dailyBurn > 0 ? Math.round(liquid / dailyBurn) : 999;
+  // Spending runway: expenses plus loan interest and fees, averaged over the recorded history window
+  // (engine spendingRunway: from the live baseline date, up to the last 90 days, at least 30 days).
+  // Owner withdrawals and loan principal are deliberately excluded (they are not spending), and the
+  // card says so. In demo mode the history starts at the earliest sample entry.
+  var start = isLive() ? SETUP.baselineDate : items.reduce(function(m,i){return i.date&&(!m||i.date<m)?i.date:m;},'');
+  var r = F.spendingRunway(items, liquid, {today:getToday(), historyStart:start});
+  var known = r.known;
+  var runwayDays = known ? r.days : null;
 
-  var color = runwayDays >= 180 ? '#22C55E' : runwayDays >= 90 ? '#F5A623' : '#EF4444';
-  var status = runwayDays >= 180 ? 'STRONG' : runwayDays >= 90 ? 'MODERATE' : 'CRITICAL';
+  var color = !known ? '#7A7880' : runwayDays >= 180 ? '#22C55E' : runwayDays >= 90 ? '#F5A623' : '#EF4444';
+  var status = r.reason==='short_history' ? 'NOT ENOUGH SPENDING HISTORY YET' : r.reason==='no_spending' ? 'NO SPENDING RECORDED (LAST '+r.historyDays+' DAYS)' : runwayDays >= 180 ? 'STRONG' : runwayDays >= 90 ? 'MODERATE' : 'CRITICAL';
 
   var dEl = qs('runway-days');
-  if(dEl){ dEl.textContent = runwayDays > 999 ? '999+' : runwayDays; dEl.style.color = color; }
+  if(dEl){ dEl.textContent = !known ? '--' : runwayDays > 999 ? '999+' : runwayDays; dEl.style.color = color; }
   var sEl = qs('runway-status');
   if(sEl){ sEl.textContent = status; sEl.style.color = color; }
   var rc = qs('runway-card');
   if(rc) rc.style.borderColor = color;
+  var burn = function(v){ return r.reason==='short_history' ? '--' : fmt(v||0); };
   var mEl = qs('runway-meta');
   if(mEl) mEl.innerHTML =
     '<span><span style="font-size:9px;color:var(--muted);text-transform:uppercase;letter-spacing:.08em;">Available Cash</span><b>'+fmt(liquid)+'</b></span>'+
-    '<span><span style="font-size:9px;color:var(--muted);text-transform:uppercase;letter-spacing:.08em;">Monthly Burn</span><b>'+fmt(monthlyBurn)+'</b></span>'+
-    '<span><span style="font-size:9px;color:var(--muted);text-transform:uppercase;letter-spacing:.08em;">Daily Burn</span><b>'+fmt(dailyBurn)+'</b></span>';
-  return {liquid:liquid, monthlyBurn:monthlyBurn, dailyBurn:dailyBurn, runwayDays:runwayDays, color:color};
+    '<span><span style="font-size:9px;color:var(--muted);text-transform:uppercase;letter-spacing:.08em;">Monthly Burn</span><b>'+burn(r.monthlyBurn)+'</b></span>'+
+    '<span><span style="font-size:9px;color:var(--muted);text-transform:uppercase;letter-spacing:.08em;">Daily Burn</span><b>'+burn(r.dailyBurn)+'</b></span>'+
+    '<span><span style="font-size:9px;color:var(--muted);text-transform:uppercase;letter-spacing:.08em;">History</span><b>'+(r.reason==='short_history'?r.historyDays+' of '+r.minDays+' days needed':r.historyDays+' days')+'</b></span>';
+  return {liquid:liquid, monthlyBurn:r.monthlyBurn, dailyBurn:r.dailyBurn, runwayDays:runwayDays, known:known, reason:r.reason, historyDays:r.historyDays, color:color};
 }
 
 /* ═══════════════════════════════════════════════════════════════
@@ -2150,9 +2280,10 @@ function renderOwnerImpact(){
   var lastEnd   = thisStart;
   var yearStart = y+'-01-01';
 
-  var wdThis  = items.filter(function(i){return i.type==='owner_withdrawal'&&i.date>=thisStart;}).reduce(function(s,i){return s+i.amount;},0);
-  var wdLast  = items.filter(function(i){return i.type==='owner_withdrawal'&&i.date>=lastStart&&i.date<lastEnd;}).reduce(function(s,i){return s+i.amount;},0);
-  var wdYTD   = items.filter(function(i){return i.type==='owner_withdrawal'&&i.date>=yearStart;}).reduce(function(s,i){return s+i.amount;},0);
+  // Voided (reversed) withdrawals are not counted.
+  var wdThis  = items.filter(function(i){return i.type==='owner_withdrawal'&&!i.voided&&i.date>=thisStart;}).reduce(function(s,i){return s+i.amount;},0);
+  var wdLast  = items.filter(function(i){return i.type==='owner_withdrawal'&&!i.voided&&i.date>=lastStart&&i.date<lastEnd;}).reduce(function(s,i){return s+i.amount;},0);
+  var wdYTD   = items.filter(function(i){return i.type==='owner_withdrawal'&&!i.voided&&i.date>=yearStart;}).reduce(function(s,i){return s+i.amount;},0);
   var monthsElapsed = m+1;
   var wdAvg   = Math.round(wdYTD / monthsElapsed);
 
@@ -2178,10 +2309,12 @@ function renderOwnerImpact(){
   var momChange = wdLast>0 ? Math.round(((wdThis-wdLast)/wdLast)*100) : 0;
   if(momChange>0) insights.push({icon:'&#128200;',text:'Owner withdrawals increased '+momChange+'% this month vs last month.'});
   else if(momChange<0) insights.push({icon:'&#128994;',text:'Owner withdrawals decreased '+Math.abs(momChange)+'% vs last month — good discipline.'});
-  if(ratio>30) insights.push({icon:'&#128308;',text:'Withdrawals are consuming '+ratio+'% of income — above safe threshold of 30%.'});
-  else if(ratio>15) insights.push({icon:'&#129000;',text:'Owner withdrawals at '+ratio+'% of income — approaching warning zone.'});
-  else insights.push({icon:'&#128994;',text:'Withdrawal ratio of '+ratio+'% is healthy — below 15% threshold.'});
-  if(wdThis>wdLast && wdThis>wdAvg) insights.push({icon:'&#9888;',text:'Withdrawals are now your second-largest cash drain this month.'});
+  // 15% / 30% are a rule of thumb, not a measured standard; the text says so.
+  if(incThis<=0) insights.push({icon:'&#8505;',text:'No income recorded this month, so the withdrawal ratio cannot be calculated.'});
+  else if(ratio>30) insights.push({icon:'&#128308;',text:'Withdrawals are '+ratio+'% of this month\'s income — above the 30% rule of thumb.'});
+  else if(ratio>15) insights.push({icon:'&#129000;',text:'Owner withdrawals are '+ratio+'% of this month\'s income — between the 15% and 30% rule-of-thumb levels.'});
+  else insights.push({icon:'&#128994;',text:'Withdrawals are '+ratio+'% of this month\'s income — below the 15% rule of thumb.'});
+  if(wdThis>wdLast && wdThis>wdAvg) insights.push({icon:'&#9888;',text:'Withdrawals this month are above both last month and your monthly average.'});
   if(ratio>30) insights.push({icon:'&#9888;',text:'Withdrawal pressure may be underfunding business operations.'});
 
   var wdIns = qs('wd-insights');
@@ -2209,6 +2342,9 @@ var F=window.KoboFin;
 var AGR=[],INST=[],ALLOC=[],EVENTS=[],OPPS=[],META={id:'settings',seenReminders:{}};
 var sessionNewReminders={},currentAgrId=null,saving=false;
 function esc(s){return String(s==null?'':s).replace(/[&<>"']/g,function(c){return{'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c];});}
+/* Values used as a CSS class token (types, statuses, levels) come from stored or imported
+   records: keep only letters, digits, '-' and '_', so they can never leave the attribute. */
+function cls(s){return String(s==null?'':s).replace(/[^A-Za-z0-9_-]/g,'');}
 function uid(p){return p+'_'+Date.now().toString(36)+Math.random().toString(36).slice(2,7);}
 function nowISO(){return new Date().toISOString();}
 function clone(o){return JSON.parse(JSON.stringify(o));}
@@ -2216,10 +2352,14 @@ function isIn(type){return type==='income'||type==='capital_injection'||type==='
 function realItems(){return items.filter(function(i){return !i.demo;});}
 function recalcBalances(){var b=F.accountBalances(ACCOUNTS,items,isLive()?{baselineDate:SETUP.baselineDate,aliases:SETUP.aliases}:{});ACCOUNTS.forEach(function(a){a.balance=b[a.id];});}
 /* Physical accounts only (earmark buckets are never in ACCOUNTS). Investments are not liquid. */
-function liquidCash(){return ACCOUNTS.filter(function(a){return a.kind!=='investment';}).reduce(function(s,a){return s+a.balance;},0);}
-function spendableCash(){return ACCOUNTS.filter(function(a){return a.kind==='cash'||a.kind==='bank'||a.kind==='wallet';}).reduce(function(s,a){return s+a.balance;},0);}
+/* Every screen uses the same cash rule (engine cashPosition): available = cash, bank and wallet
+   accounts unless marked restricted; coop and investment accounts are restricted unless marked
+   available. Earmarks are reported separately and never reduce a balance. */
+function cashNow(){return F.cashPosition(ACCOUNTS,isLive()&&SETUP&&SETUP.buckets?SETUP.buckets:[]);}
+function liquidCash(){return cashNow().available;}
+function spendableCash(){return cashNow().available;}
 function acctLabel(id){var r=resolveAcct(id),a=ACCOUNTS.find(function(x){return x.id===r;});return a?a.label:(id?(F.LEGACY_ACCOUNTS[id]||id)+(isLive()?' (not mapped)':''):'');}
-function acctOptions(sel){return ACCOUNTS.map(function(a){return'<option value="'+a.id+'"'+(a.id===sel?' selected':'')+'>'+esc(a.label)+' ('+fmt(a.balance)+')</option>';}).join('');}
+function acctOptions(sel){return ACCOUNTS.map(function(a){return'<option value="'+esc(a.id)+'"'+(a.id===sel?' selected':'')+'>'+esc(a.label)+' ('+fmt(a.balance)+')</option>';}).join('');}
 function fmtD(iso){var d=F.parseDate(iso);return d?d.toLocaleDateString('en-NG',{day:'numeric',month:'short',year:'numeric'}):'--';}
 function signed(n){return(n<0?'-':'+')+fmt(n);}
 function basisTag(b){var t={contract:'Contract',estimate:'Your estimate',calculated:'Calculated',unknown:'Unknown'}[b]||b;return'<span class="basis '+b+'">'+t+'</span>';}
@@ -2240,18 +2380,30 @@ function newTxnId(){return nextId++;}
 var STORE_ARR={agreements:function(){return AGR;},instalments:function(){return INST;},allocations:function(){return ALLOC;},agreementEvents:function(){return EVENTS;},opportunities:function(){return OPPS;}};
 function commit(ops){
   return db.atomic(ops).then(function(){
-    ops.forEach(function(o){
-      if(o.store==='transactions')upsertItem(o.put);
-      else if(o.store==='meta'){if(o.put.id==='ledgerSetup'){SETUP=o.put;applySetup();}else META=o.put;}
-      else upsert(STORE_ARR[o.store](),o.put);
-    });
-    renderAll();
+    // The write is durable from here on. A failure while updating the screen must not be
+    // reported as a failed save: that would invite a retry and a duplicate record.
+    try{
+      ops.forEach(function(o){
+        if(o.store==='transactions')upsertItem(o.put);
+        else if(o.store==='meta'){if(o.put.id==='ledgerSetup'){SETUP=o.put;applySetup();}else META=o.put;}
+        else upsert(STORE_ARR[o.store](),o.put);
+      });
+      renderAll();
+    }catch(uiErr){savedButNotShown(uiErr);}
   });
 }
-function failSave(err){console.error(err);var m='Could not save: '+(err&&err.message?err.message:err)+'. Nothing was changed.';showToast(m);showDialogWarning(m);try{alert(m);}catch(e){}}
+function savedButNotShown(err,what){
+  console.error(err);
+  var m=(what||'The change')+' WAS saved to '+db.name+', but the screen could not be refreshed ('+errText(err)+'). Do not enter it again. Reload KoboFlow to see it.';
+  showToast(m);showDialogWarning(m);
+}
+function errText(err){return err&&err.message?err.message:String(err);}
+/* Toast, persistent red bar and an alert: a failure must not be missed. */
+function reportFailure(m){showToast(m);showDialogWarning(m);try{alert(m);}catch(e){}}
+function failSave(err){console.error(err);reportFailure('Could not save: '+errText(err)+'. Nothing was changed.');}
 /* Some Android viewers block kfConfirm()/kfPrompt() and return cancel instantly.
    Detect that and say so on screen instead of silently doing nothing. */
-function showDialogWarning(msg){var el=qs('dialog-warning');if(!el)return;el.style.display='block';el.innerHTML='&#9888; '+esc(msg)+' <button class="act-btn act-dismiss" onclick="this.parentNode.style.display=\'none\'">OK</button>';}
+function showDialogWarning(msg){var el=qs('dialog-warning');if(!el)return;el.removeAttribute('data-entry');el.style.display='block';el.innerHTML='&#9888; '+esc(msg)+' <button class="act-btn act-dismiss" onclick="this.parentNode.style.display=\'none\'">OK</button>';}
 var DIALOG_BLOCKED_MSG='This browser blocked a confirmation dialog, so that action was NOT saved. Open the file in Chrome (not a file viewer) and try again.';
 function kfConfirm(msg){var t=Date.now(),r=window.confirm(msg);if(!r&&Date.now()-t<80)showDialogWarning(DIALOG_BLOCKED_MSG);return r;}
 function kfPrompt(msg,def){var t=Date.now(),r=window.prompt(msg,def);if(r===null&&Date.now()-t<80)showDialogWarning(DIALOG_BLOCKED_MSG);return r;}
@@ -2295,7 +2447,8 @@ function loanEntries(){
 }
 function obligationsWithin(days){return F.upcomingObligations(billEntries().concat(loanEntries()),getToday(),days);}
 function sumRem(list){return list.reduce(function(s,e){return s+e.remaining;},0);}
-function freeCash(){return liquidCash()-sumRem(obligationsWithin(30));}
+function cashCoverFor(obs){return F.cashCover(cashNow(),sumRem(obs));}
+function freeCash(){return cashCoverFor(obligationsWithin(30)).leftAfter;}
 function unlinkedLoanReceipts(){return items.filter(function(t){return !t.demo&&!t.agreementId&&F.classifyTxn(t).loanProceeds>0;});}
 function dueText(iso){var d=F.daysBetween(getToday(),iso);return d<0?'Overdue '+(-d)+'d':d===0?'Today':d===1?'Tomorrow':'In '+d+' days';}
 
@@ -2321,7 +2474,7 @@ function notifyPhone(list){
 function reminderHTML(limit){
   var rs=currentReminders();
   return rs.slice(0,limit||99).map(function(r){
-    return'<div class="kf-alert '+r.level+'" data-open-agr="'+esc(r.agreementId)+'"><div><div style="font-weight:600;">'+esc(r.agreementName)+(sessionNewReminders[r.key]?'<span class="new-tag">NEW</span>':'')+'</div><div style="font-size:10px;color:var(--muted);">'+r.label+' &middot; '+fmtD(r.dueDate)+' &middot; '+dueText(r.dueDate)+'</div></div><b>'+fmt(r.remaining)+'</b></div>';
+    return'<div class="kf-alert '+cls(r.level)+'" data-open-agr="'+esc(r.agreementId)+'"><div><div style="font-weight:600;">'+esc(r.agreementName)+(sessionNewReminders[r.key]?'<span class="new-tag">NEW</span>':'')+'</div><div style="font-size:10px;color:var(--muted);">'+esc(r.label)+' &middot; '+fmtD(r.dueDate)+' &middot; '+dueText(r.dueDate)+'</div></div><b>'+fmt(r.remaining)+'</b></div>';
   }).join('')+(rs.length>(limit||99)?'<div class="muted-note" data-nav="loans" style="cursor:pointer;">+'+(rs.length-limit)+' more in Loans &rarr;</div>':'');
 }
 function renderNotifStatus(){
@@ -2339,8 +2492,8 @@ function agrCard(v){
     :'<div class="inject-amount">+'+fmt(v.receipt?v.receipt.amount:(a.terms.amount||0))+'</div>';
   var last=b.states.length?b.states[b.states.length-1]:null;
   var maturing=a.status==='active'&&last&&last.remaining>0&&last.daysToDue<=30;
-  var line=v.debt&&a.status==='active'&&n?'Next: '+fmt(n.remaining)+' &middot; '+fmtD(n.dueDate)+' <span class="status-pill '+n.status+'">'+F.STATUS_LABEL[n.status]+'</span>'+(maturing?' &middot; <span style="color:var(--amber);">Matures '+fmtD(last.dueDate)+'</span>':''):'';
-  return'<div class="agr-card'+(b.overdue>0?' overdue':'')+'" data-open-agr="'+esc(a.id)+'"><div class="loan-top" style="margin-bottom:6px;"><div><div class="loan-name">'+esc(a.name)+'</div><div class="loan-source">'+esc(a.counterparty||'')+' &middot; '+(F.CATEGORIES[a.category]||'')+' &middot; <span class="status-pill '+a.status+'">'+F.STATUSES[a.status]+'</span></div></div><div style="text-align:right;">'+right+'</div></div>'
+  var line=v.debt&&a.status==='active'&&n?'Next: '+fmt(n.remaining)+' &middot; '+fmtD(n.dueDate)+' <span class="status-pill '+cls(n.status)+'">'+F.STATUS_LABEL[n.status]+'</span>'+(maturing?' &middot; <span style="color:var(--amber);">Matures '+fmtD(last.dueDate)+'</span>':''):'';
+  return'<div class="agr-card'+(b.overdue>0?' overdue':'')+'" data-open-agr="'+esc(a.id)+'"><div class="loan-top" style="margin-bottom:6px;"><div><div class="loan-name">'+esc(a.name)+'</div><div class="loan-source">'+esc(a.counterparty||'')+' &middot; '+(F.CATEGORIES[a.category]||'')+' &middot; <span class="status-pill '+cls(a.status)+'">'+F.STATUSES[a.status]+'</span></div></div><div style="text-align:right;">'+right+'</div></div>'
     +(line?'<div style="font-size:11px;color:var(--muted);">'+line+'</div>':'')
     +(v.debt&&a.status==='active'?'<div class="loan-progress-track"><div class="loan-progress-bar" data-w="'+paidPct+'" style="width:'+paidPct+'%;"></div></div>':'')+'</div>';
 }
@@ -2363,7 +2516,7 @@ function renderLoans(){
   ].map(function(s){return'<div class="stat-card"><div class="stat-label">'+s.l+'</div><div class="stat-val" style="color:'+s.c+';">'+s.v+'</div></div>';}).join('');
   var un=unlinkedLoanReceipts();
   qs('loan-unlinked').innerHTML=un.length?'<div class="form-warn"><b>'+un.length+' loan receipt'+(un.length>1?'s':'')+' without an agreement.</b> What you owe on '+(un.length>1?'them':'it')+' is unknown until linked.'
-    +un.map(function(t){return'<div style="margin-top:7px;display:flex;justify-content:space-between;align-items:center;gap:6px;"><span>'+esc(t.desc)+' &middot; '+fmtD(t.date)+' &middot; '+fmt(t.amount)+'</span><button class="act-btn act-approve" data-link-receipt="'+t.id+'">LINK</button></div>';}).join('')+'</div>':'';
+    +un.map(function(t){return'<div style="margin-top:7px;display:flex;justify-content:space-between;align-items:center;gap:6px;"><span>'+esc(t.desc)+' &middot; '+fmtD(t.date)+' &middot; '+fmt(t.amount)+'</span><button class="act-btn act-approve" data-link-receipt="'+esc(t.id)+'">LINK</button></div>';}).join('')+'</div>':'';
   qs('loan-active').innerHTML=act.length?act.map(agrCard).join(''):'<div class="muted-note">No active loans.</div>';
   var aw=views.filter(function(v){return v.agr.status==='accepted_awaiting';});
   qs('loan-awaiting-wrap').style.display=aw.length?'':'none';
@@ -2390,7 +2543,7 @@ function renderAgreementDetail(){
   var v=agrView(a),b=v.bal,t=a.terms||{},debt=v.debt,h='';
   var live=agrTxns(a.id).filter(function(x){return !x.voided;});
   h+='<button class="back-btn" data-nav="loans">&#8592; LOANS</button>';
-  h+='<div class="screen-title">'+esc(a.name)+'</div><div class="screen-sub">'+esc(a.counterparty||'')+' &middot; '+(F.CATEGORIES[a.category]||'')+' &middot; '+(F.NATURES[t.nature||'debt'])+' &middot; <span class="status-pill '+a.status+'">'+F.STATUSES[a.status]+'</span></div>';
+  h+='<div class="screen-title">'+esc(a.name)+'</div><div class="screen-sub">'+esc(a.counterparty||'')+' &middot; '+(F.CATEGORIES[a.category]||'')+' &middot; '+(F.NATURES[t.nature||'debt'])+' &middot; <span class="status-pill '+cls(a.status)+'">'+F.STATUSES[a.status]+'</span></div>';
   var acts=[];
   if(a.status==='accepted_awaiting')acts.push('<button class="primary" data-act="funds">Confirm Funds Received</button>');
   if(a.status==='active'&&debt){acts.push('<button class="primary" data-act="pay">Record Payment</button>');acts.push('<button data-act="settle">Early Settlement</button>');acts.push('<button data-act="amend">Amend Schedule</button>');acts.push('<button data-act="close">Close Agreement</button>');}
@@ -2407,7 +2560,7 @@ function renderAgreementDetail(){
       +kv('Cost of this money',fmt(cost)+(cash>0?' <span style="font-family:var(--dm);font-size:10px;color:var(--muted);">('+(Math.round(cost/cash*10000)/100)+'% of cash, whole term)</span>':''),'#F5A623')
       +kv('Total paid so far',fmt(b.repaidToDate),'#22C55E')
       +kv('Outstanding',fmt(b.outstanding.total),b.outstanding.total>0?'#EF4444':'#22C55E','total')
-      +kv('Next payment',b.next?fmt(b.next.remaining)+' &middot; '+fmtD(b.next.dueDate)+' <span class="status-pill '+b.next.status+'">'+F.STATUS_LABEL[b.next.status]+'</span>':'None')
+      +kv('Next payment',b.next?fmt(b.next.remaining)+' &middot; '+fmtD(b.next.dueDate)+' <span class="status-pill '+cls(b.next.status)+'">'+F.STATUS_LABEL[b.next.status]+'</span>':'None')
       +(b.overdue>0?kv('Overdue now',fmt(b.overdue),'#EF4444'):'')
       +'</div>';
     h+='<div class="card"><div class="card-label">Principal, Interest &amp; Fees</div><table class="sched"><tr><th></th><th>Scheduled</th><th>Paid</th><th>Outstanding</th></tr>'
@@ -2446,7 +2599,7 @@ function renderAgreementDetail(){
     var all=agrInst(a.id).slice().sort(function(x,y){return x.dueDate<y.dueDate?-1:1;}),byId={};
     b.states.forEach(function(s){byId[s.id]=s;});
     h+='<div class="card"><div class="card-label">Repayment Schedule</div><table class="sched"><tr><th>Due</th><th>Total</th><th>Paid</th><th>Left</th><th>Status</th></tr>'
-      +b.states.map(function(s){return'<tr><td>'+fmtD(s.dueDate)+'</td><td>'+fmt(s.total)+'</td><td>'+fmt(s.paid)+'</td><td>'+fmt(s.remaining)+'</td><td><span class="status-pill '+s.status+'">'+F.STATUS_LABEL[s.status]+'</span></td></tr>';}).join('')
+      +b.states.map(function(s){return'<tr><td>'+fmtD(s.dueDate)+'</td><td>'+fmt(s.total)+'</td><td>'+fmt(s.paid)+'</td><td>'+fmt(s.remaining)+'</td><td><span class="status-pill '+cls(s.status)+'">'+F.STATUS_LABEL[s.status]+'</span></td></tr>';}).join('')
       +'</table>';
     var sup=all.filter(function(x){return x.supersededBy;});
     if(sup.length)h+='<details class="kf-adv"><summary>Replaced instalments ('+sup.length+')</summary><table class="sched">'+sup.map(function(x){return'<tr class="superseded"><td>'+fmtD(x.dueDate)+'</td><td>'+fmt(x.total)+'</td></tr>';}).join('')+'</table></details>';
@@ -2456,8 +2609,8 @@ function renderAgreementDetail(){
   var txs=agrTxns(a.id).slice().sort(function(x,y){var k1=y.date+y.time,k2=x.date+x.time;return k1>k2?1:k1<k2?-1:y.id-x.id;});
   h+='<div class="card"><div class="card-label">Ledger Transactions</div>'+(txs.length?txs.map(function(x){
     var al=x.alloc||{},split=x.type==='loan_repayment'?'<div class="tl-meta">'+(x.allocMode==='provisional'?'Split not yet known':'P '+fmt(al.principal||0)+' &middot; I '+fmt(al.interest||0)+' &middot; F '+fmt(al.fees||0)+(al.unsplit?' &middot; unsplit '+fmt(al.unsplit):''))+'</div>':'';
-    var btns=x.voided?'<div class="tl-meta" style="color:var(--red);">Reversed: '+esc(x.voidReason||'')+'</div>':'<div class="action-btns">'+(x.type==='loan_repayment'&&!x.settlement?'<button class="act-btn act-dismiss" data-correct="'+x.id+'">CORRECT</button>':'')+'<button class="act-btn act-dismiss" data-reverse="'+x.id+'">REVERSE</button></div>';
-    return'<div class="tl-item'+(x.voided?' voided':'')+'"><div class="tl-dot '+x.type+'"></div><div class="tl-body"><div class="tl-desc">'+esc(x.desc)+'</div><div class="tl-meta">'+fmtD(x.date)+' &middot; '+esc(acctLabel(x.fromAcct||x.toAcct))+' &middot; #'+x.id+'</div>'+split+btns+'</div><div class="tl-amount'+(isIn(x.type)?' income':'')+'">'+(isIn(x.type)?'+':'-')+fmt(x.amount)+'</div></div>';
+    var btns=x.voided?'<div class="tl-meta" style="color:var(--red);">Reversed: '+esc(x.voidReason||'')+'</div>':'<div class="action-btns">'+(x.type==='loan_repayment'&&!x.settlement?'<button class="act-btn act-dismiss" data-correct="'+esc(x.id)+'">CORRECT</button>':'')+'<button class="act-btn act-dismiss" data-reverse="'+esc(x.id)+'">REVERSE</button></div>';
+    return'<div class="tl-item'+(x.voided?' voided':'')+'"><div class="tl-dot '+cls(x.type)+'"></div><div class="tl-body"><div class="tl-desc">'+esc(x.desc)+'</div><div class="tl-meta">'+fmtD(x.date)+' &middot; '+esc(acctLabel(x.fromAcct||x.toAcct))+' &middot; #'+esc(x.id)+'</div>'+split+btns+'</div><div class="tl-amount'+(isIn(x.type)?' income':'')+'">'+(isIn(x.type)?'+':'-')+fmt(x.amount)+'</div></div>';
   }).join(''):'<div class="muted-note">No cash has moved yet.</div>')+'</div>';
 
   var evs=EVENTS.filter(function(e){return e.agreementId===a.id;}).sort(function(x,y){return y.at>x.at?1:-1;});
@@ -2466,7 +2619,7 @@ function renderAgreementDetail(){
     if(e.type==='payment'||e.type==='early_settlement'||e.type==='funds_received')extra+=' &middot; '+fmt(d.amount||0);
     if(e.type==='schedule_amended')extra+=' &middot; '+fmt(d.oldTotal||0)+' &rarr; '+fmt(d.newTotal||0);
     if(e.type==='details_edited'&&d.changed)extra+=' &middot; '+esc(d.changed.join(', '));
-    return'<div class="kv-row"><span class="k">'+(EVENT_TEXT[e.type]||e.type)+extra+'</span><span class="k" style="white-space:nowrap;">'+fmtD(e.at.slice(0,10))+'</span></div>';
+    return'<div class="kv-row"><span class="k">'+esc(EVENT_TEXT[e.type]||e.type)+extra+'</span><span class="k" style="white-space:nowrap;">'+fmtD(e.at.slice(0,10))+'</span></div>';
   }).join(''):'<div class="muted-note">No history.</div>')+'</div>';
   el.innerHTML=h;
 }
@@ -2849,7 +3002,7 @@ function analyzeOpp(){
 function renderOppResult(o,r){
   var V={good:['GOOD DEAL','The stated assumptions suggest a worthwhile surplus and a repayment schedule your projected cash can support.'],review:['REVIEW','Important information is missing, the margin is narrow, or repayment timing is uncertain.'],bad:['BAD DEAL','The stated assumptions show a likely loss, an unmanageable shortfall or a cash-timing mismatch.']}[r.verdict];
   var unknown='<span style="font-family:var(--dm);font-size:12px;color:var(--red);">Cannot determine yet</span>';
-  var h='<div class="verdict-big '+r.verdict+'"><div class="vb-label">'+V[0]+'</div><div class="vb-sub">'+V[1]+'<br>Decision support from your inputs &mdash; not a guarantee.</div></div>';
+  var h='<div class="verdict-big '+cls(r.verdict)+'"><div class="vb-label">'+V[0]+'</div><div class="vb-sub">'+V[1]+'<br>Decision support from your inputs &mdash; not a guarantee.</div></div>';
   h+='<div class="opp-primary-card" style="border-color:'+(r.surplus===null?'var(--border)':r.surplus>=0?'var(--green)':'var(--red)')+';background:var(--surf);"><div class="opp-primary-label">AFTER EVERYTHING IS SETTLED</div>'
     +'<div class="opp-primary-amount" style="color:'+(r.surplus===null?'var(--muted)':r.surplus>=0?'var(--green)':'var(--red)')+';'+(r.surplus===null?'font-size:28px;':'')+'">'+(r.surplus===null?'CANNOT DETERMINE YET':signed(r.surplus))+'</div>'
     +'<div class="opp-primary-sub">'+(r.surplus===null?(o.structure==='equity'?'Equity costs ownership, not naira.':'Enter your expected profit to see this.'):(r.surplus>=0?'Estimated extra money you keep':'Estimated money you lose')+', based on your profit estimate of '+fmt(r.profit)+'.')+'</div></div>';
@@ -2953,8 +3106,9 @@ function applySetup(){
   ACCOUNTS.length=0;
   if(isLive()){
     SETUP.accounts.filter(function(a){return !a.removed;}).forEach(function(a){
-      ACCOUNTS.push({id:a.id,label:a.label,opening:F.num(a.opening)||0,balance:F.num(a.opening)||0,kind:a.kind,primary:!!a.primary,
-        type:(a.primary?'Primary · ':'')+F.ACCOUNT_KINDS[a.kind]+(a.institution?' · '+a.institution:''),icon:KIND_ICON[a.kind]||'&#128179;'});
+      var acc=F.accountAccess(a);
+      ACCOUNTS.push({id:a.id,label:a.label,opening:F.num(a.opening)||0,balance:F.num(a.opening)||0,kind:a.kind,access:a.access||'',primary:!!a.primary,
+        type:(a.primary?'Primary · ':'')+F.ACCOUNT_KINDS[a.kind]+(a.institution?' · '+a.institution:'')+(acc==='restricted'?' · Restricted':''),icon:KIND_ICON[a.kind]||'&#128179;'});
     });
     if(DEMO_ITEMS===null)DEMO_ITEMS=items.filter(function(i){return i.demo;});
     items=items.filter(function(i){return !i.demo;});
@@ -2967,7 +3121,7 @@ function applySetup(){
   rebuildAccountSelects();
 }
 function rebuildAccountSelects(){
-  var opts=ACCOUNTS.map(function(a){return'<option value="'+a.id+'">'+esc(a.label)+'</option>';}).join('');
+  var opts=ACCOUNTS.map(function(a){return'<option value="'+esc(a.id)+'">'+esc(a.label)+'</option>';}).join('');
   var none='<option value="">-- None --</option>';
   var mf=qs('modal-from'),mt=qs('modal-to');
   if(mf)mf.innerHTML=none+opts;
@@ -2996,20 +3150,66 @@ function renderModeNote(){
 
 /* ── Setup form ── */
 var setupDraft=null;
+/* ── Persistent storage: request it, never assume it was granted ── */
+var PERSIST={last:null};
+function persistenceState(){
+  var st=navigator.storage;
+  if(!st||typeof st.persisted!=='function')return Promise.resolve({state:'unsupported',text:'not supported by this browser. Data is best-effort: the browser may clear it under storage pressure.'});
+  return Promise.resolve().then(function(){return st.persisted();}).then(function(p){
+    return p?{state:'granted',text:'granted. The browser should not clear this data automatically under storage pressure. It can still be deleted manually (Clear storage, clearing site data, or uninstalling with data removal).'}
+            :{state:'not-granted',text:'not granted. Data is best-effort: the browser may clear it under storage pressure. Export backups regularly.'};
+  },function(e){return{state:'unknown',text:'unknown: the browser could not report it ('+(e&&e.message?e.message:e)+').'};});
+}
+function requestPersistence(reason){
+  var st=navigator.storage,at=nowISO();
+  function done(result,detail){PERSIST.last={reason:reason,result:result,detail:detail||'',at:at};renderPersistOut();return PERSIST.last;}
+  if(!st||typeof st.persist!=='function')return Promise.resolve(done('unsupported'));
+  return Promise.resolve().then(function(){return typeof st.persisted==='function'?st.persisted():false;}).catch(function(){return false;}).then(function(already){
+    if(already)return done('already granted');
+    return Promise.resolve().then(function(){return st.persist();}).then(function(g){return done(g?'granted':'denied');},function(e){return done('failed',e&&e.message?e.message:String(e));});
+  });
+}
+function lastRequestText(){
+  var l=PERSIST.last;if(!l)return'Not requested yet in this session.';
+  var r={granted:'granted','already granted':'already granted',denied:'denied by the browser',unsupported:'not supported by this browser',failed:'failed'}[l.result]||l.result;
+  return'Last request ('+esc(l.reason)+'): '+r+(l.detail?' ('+esc(l.detail)+')':'')+'.';
+}
+function renderPersistOut(){
+  var el=qs('persist-out');if(!el)return;
+  persistenceState().then(function(ps){el.innerHTML='Status: '+esc(ps.text)+'<br>'+lastRequestText();});
+}
 function storageCheck(){
   var out=qs('storage-check-out');out.textContent='Checking…';
-  var loc=String(location.protocol)+'//'+String(location.host||'')+String(location.pathname||'').split('/').slice(-1)[0];
-  Promise.all([db.meta.get('ledgerSetup'),db.transactions.toArray(),db.agreements.toArray(),navigator.storage&&navigator.storage.persisted?navigator.storage.persisted():Promise.resolve(null)]).then(function(r){
-    var st=r[0];
-    out.innerHTML='Database: <b>'+esc(db.name)+'</b> (v'+db.verno+')<br>Opened from: '+esc(loc)+'<br>Account setup saved: <b>'+(st?'yes, '+st.accounts.filter(function(a){return !a.removed;}).length+' account(s), baseline '+esc(st.baselineDate):'no')+'</b><br>Stored entries: '+r[1].length+' &middot; agreements: '+r[2].length+'<br>Persistent storage: '+(r[3]===null?'unknown':r[3]?'yes':'not granted (browser may clear it under storage pressure)');
-  }).catch(function(e){out.innerHTML='<span style="color:var(--red);">Storage NOT available: '+esc(e&&e.message?e.message:e)+'. Nothing can be saved in this browser view.</span>';});
+  var loc=String(location.protocol)+'//'+String(location.host||'')+String(location.pathname||'');
+  function fail(msg){out.innerHTML='<span style="color:var(--red);">'+msg+'</span>';}
+  return db.info().then(function(info){
+    return Promise.all([db.meta.get('ledgerSetup'),db.transactions.toArray(),db.agreements.toArray(),persistenceState()]).then(function(r){
+      var st=r[0],tx=r[1],rev=tx.filter(function(t){return !!(t&&t.voided);}).length;
+      // A malformed stored record must not stop the diagnostic itself (it would hang on "Checking…").
+      var setupTxt=!st?'no':Array.isArray(st.accounts)?'yes, '+st.accounts.filter(function(a){return a&&!a.removed;}).length+' account(s), baseline '+esc(st.baselineDate):'yes, but the record is malformed (no account list)';
+      out.innerHTML='Storage: <b style="color:var(--green);">available</b><br>Database: <b>'+esc(info.name)+'</b> (v'+info.version+')<br>Opened from: '+esc(loc)
+        +'<br>Account setup saved: <b>'+setupTxt+'</b>'
+        +'<br>Stored entries: '+tx.length+' ('+(tx.length-rev)+' active &middot; '+rev+' reversed) &middot; agreements: '+r[2].length
+        +'<br>Persistent storage: '+esc(r[3].text)+'<br>'+lastRequestText();
+    },function(e){fail('Storage QUERY FAILED: database '+esc(info.name)+' opened, but reading it failed ('+esc(e&&e.message?e.message:e)+'). Entries cannot be counted. Do not assume the database is empty.');})
+    .catch(function(e){fail('Storage: available (database '+esc(info.name)+' was read), but the summary could not be built ('+esc(errText(e))+'). A stored record may be malformed.');});
+  },function(e){fail('Storage NOT available: could not open database '+esc(db.name)+' ('+esc(e&&e.message?e.message:e)+'). Nothing can be saved in this browser view.');});
 }
-function openSetup(){
+/* Closing the form (× or tapping outside) does not silently throw edits away: reopening
+   brings them back, clearly marked as NOT saved, with an explicit Discard. A draft is only
+   restored onto the same saved setup it was started from. */
+var setupDirty=false,setupDraftBase=null,setupSaving=false;
+function setupBaseKey(){return SETUP?String(SETUP.updatedAt||''):'none';}
+function openSetup(fresh){
   setupPending=null;
-  var s=SETUP?clone(SETUP):{mode:'live',baselineDate:getToday(),accounts:[{id:'acc_opay',label:'Opay',institution:'Opay',kind:'wallet',use:'business',primary:true,opening:''}],buckets:[],aliases:{},history:[]};
-  setupDraft=s;
-  setVal('setup-baseline',s.baselineDate);
+  var restore=fresh!==true&&setupDraft&&setupDirty&&setupDraftBase===setupBaseKey();
+  if(!restore){
+    setupDraft=SETUP?clone(SETUP):{mode:'live',baselineDate:getToday(),accounts:[{id:'acc_opay',label:'Opay',institution:'Opay',kind:'wallet',use:'business',primary:true,opening:''}],buckets:[],aliases:{},history:[]};
+    setupDirty=false;setupDraftBase=setupBaseKey();
+  }
+  setVal('setup-baseline',setupDraft.baselineDate);
   renderSetupRows();setupBack();openModal('setup-modal');
+  if(restore)setupResult('<div class="form-warn" id="setup-unsaved-note"><b>Unsaved changes.</b> These edits from earlier have NOT been saved. Review &amp; Save to keep them, or <button class="act-btn act-dismiss" id="setup-discard-btn">DISCARD</button> to show the saved setup.</div>');
 }
 function acctRowHTML(a,i){
   var kinds=Object.keys(F.ACCOUNT_KINDS).map(function(k){return'<option value="'+k+'"'+(a.kind===k?' selected':'')+'>'+F.ACCOUNT_KINDS[k]+'</option>';}).join('');
@@ -3020,16 +3220,21 @@ function acctRowHTML(a,i){
     +'<div class="grid2" style="margin-bottom:0;"><div class="form-group"><label>Type</label><select class="form-input" data-f="kind"><option value="">Choose&hellip;</option>'+kinds+'</select></div>'
     +'<div class="form-group"><label>Used For</label><select class="form-input" data-f="use"><option value="business"'+(a.use==='business'?' selected':'')+'>Business</option><option value="personal"'+(a.use==='personal'?' selected':'')+'>Personal</option><option value="shared"'+(a.use==='shared'?' selected':'')+'>Shared</option></select></div></div>'
     +'<div class="form-group"><label>Opening Balance (&#8358;) at start of baseline date</label><input class="form-input" data-f="opening" type="number" inputmode="decimal" value="'+esc(a.opening)+'"/></div>'
+    +'<div class="form-group"><label>Availability</label><select class="form-input" data-f="access">'
+      +'<option value=""'+(!a.access?' selected':'')+'>Default for this type ('+(F.accountAccess({kind:a.kind})==='immediate'?'available to spend':'restricted')+')</option>'
+      +'<option value="immediate"'+(a.access==='immediate'?' selected':'')+'>Available to spend now</option>'
+      +'<option value="restricted"'+(a.access==='restricted'?' selected':'')+'>Not immediately available (fixed deposit, locked savings, coop)</option></select>'
+      +'<div class="muted-note" style="margin:3px 0 0;">Restricted money still counts toward net worth, but not toward cash you can spend.</div></div>'
     +'<div style="display:flex;justify-content:space-between;align-items:center;"><label class="check-row" style="margin:0;"><input type="radio" name="setup-primary" data-f="primary"'+(a.primary?' checked':'')+'/> Primary operating account</label>'
     +(used?'<span class="muted-note" style="margin:0;">Has entries &mdash; cannot remove</span>':'<button class="act-btn act-dismiss" data-remove-acct="'+i+'">REMOVE</button>')+'</div></div>';
 }
 function renderSetupRows(){
   var s=setupDraft,accts=s.accounts.filter(function(a){return !a.removed;});
   qs('setup-accounts').innerHTML=s.accounts.map(function(a,i){return a.removed?'':acctRowHTML(a,i);}).join('');
-  var popts=accts.map(function(a){return'<option value="'+a.id+'">'+esc(a.label||'(unnamed)')+'</option>';}).join('');
+  var popts=accts.map(function(a){return'<option value="'+esc(a.id)+'">'+esc(a.label||'(unnamed)')+'</option>';}).join('');
   qs('setup-buckets').innerHTML=s.buckets.map(function(b,i){
     return'<div class="setup-row" data-bucket-row="'+i+'"><div class="grid3" style="margin-bottom:0;"><div class="form-group"><label>Name</label><input class="form-input" data-f="label" value="'+esc(b.label)+'" placeholder="Rent"/></div>'
-      +'<div class="form-group"><label>Inside</label><select class="form-input" data-f="parentId"><option value="">Choose&hellip;</option>'+popts.replace('value="'+b.parentId+'"','value="'+b.parentId+'" selected')+'</select></div>'
+      +'<div class="form-group"><label>Inside</label><select class="form-input" data-f="parentId"><option value="">Choose&hellip;</option>'+popts.replace('value="'+esc(b.parentId)+'"','value="'+esc(b.parentId)+'" selected')+'</select></div>'
       +'<div class="form-group"><label>Amount</label><input class="form-input" data-f="amount" type="number" inputmode="decimal" value="'+esc(b.amount)+'"/></div></div>'
       +'<button class="act-btn act-dismiss" data-remove-bucket="'+i+'">REMOVE</button></div>';
   }).join('');
@@ -3037,10 +3242,21 @@ function renderSetupRows(){
     var cur=s.aliases[k],used=items.filter(function(t){return !t.demo&&(t.fromAcct===k||t.toAcct===k);}).length;
     return'<div class="form-group"><label>"'+F.LEGACY_ACCOUNTS[k]+'"'+(used?' &mdash; '+used+' recorded entr'+(used>1?'ies':'y'):'')+'</label><select class="form-input" data-alias="'+k+'">'
       +'<option value="__unset"'+(cur===undefined||cur===null?' selected':'')+'>Choose&hellip;</option>'
-      +accts.map(function(a){return'<option value="'+a.id+'"'+(cur===a.id?' selected':'')+'>'+esc(a.label||'(unnamed)')+'</option>';}).join('')
+      +accts.map(function(a){return'<option value="'+esc(a.id)+'"'+(cur===a.id?' selected':'')+'>'+esc(a.label||'(unnamed)')+'</option>';}).join('')
       +'<option value=""'+(cur===''?' selected':'')+'>Not used</option></select></div>';
   }).join('');
   setupPreview();
+}
+/* Leaving an account field fires "change". Rebuilding the account rows at that moment
+   destroyed the field the user had just tapped, so the next thing typed (often an
+   opening balance) went nowhere and the old value was reviewed and saved. Only the
+   dropdowns that list account names are refreshed, in place, keeping their selection. */
+function refreshAcctOptions(){
+  document.querySelectorAll('#setup-accounts [data-acct-row]').forEach(function(row){var k=row.querySelector('[data-f="kind"]'),o=row.querySelector('[data-f="access"] option[value=""]');if(k&&o)o.textContent='Default for this type ('+(F.accountAccess({kind:k.value})==='immediate'?'available to spend':'restricted')+')';});
+  var accts=setupDraft.accounts.filter(function(a){return !a.removed;});
+  var opts=accts.map(function(a){return'<option value="'+esc(a.id)+'">'+esc(a.label||'(unnamed)')+'</option>';}).join('');
+  document.querySelectorAll('#setup-buckets [data-f="parentId"]').forEach(function(sel){var v=sel.value;sel.innerHTML='<option value="">Choose&hellip;</option>'+opts;sel.value=v;});
+  document.querySelectorAll('#setup-aliases [data-alias]').forEach(function(sel){var v=sel.value;sel.innerHTML='<option value="__unset">Choose&hellip;</option>'+opts+'<option value="">Not used</option>';sel.value=v;});
 }
 function readSetupForm(){
   var s=setupDraft;s.baselineDate=val('setup-baseline');
@@ -3048,6 +3264,7 @@ function readSetupForm(){
     var a=s.accounts[+row.getAttribute('data-acct-row')];
     a.label=row.querySelector('[data-f="label"]').value.trim();a.institution=row.querySelector('[data-f="institution"]').value.trim();
     a.kind=row.querySelector('[data-f="kind"]').value;a.use=row.querySelector('[data-f="use"]').value;
+    var ac=row.querySelector('[data-f="access"]');a.access=ac?ac.value:(a.access||'');
     a.opening=row.querySelector('[data-f="opening"]').value;a.primary=row.querySelector('[data-f="primary"]').checked;
   });
   document.querySelectorAll('#setup-buckets [data-bucket-row]').forEach(function(row){
@@ -3073,23 +3290,58 @@ function setupPreview(){
    inside the form; step 2 writes, reads the record back, and only then reports success. */
 var setupPending=null;
 function setupResult(html){var el=qs('setup-result');if(el)el.innerHTML=html;}
+var SETUP_BUSY_MSG='<div class="form-err">Another save is still in progress, so nothing was saved yet. Wait a moment and try again.</div>';
 function saveSetup(){
-  if(saving)return;
+  if(saving){setupResult(SETUP_BUSY_MSG);return;}
   var s=readSetupForm(),v=setupPreview();setupResult('');
   if(!v.ok){setupResult('<div class="form-err">Not saved yet: fix the items in red above.</div>');qs('setup-preview').scrollIntoView({block:'nearest'});return;}
   var prev=SETUP,changes=[];
   if(prev){
     if(prev.baselineDate!==s.baselineDate)changes.push({field:'baselineDate',from:prev.baselineDate,to:s.baselineDate});
     s.accounts.forEach(function(a){var o=prev.accounts.find(function(x){return x.id===a.id;});
-      if(!o)changes.push({account:a.label,field:'added',to:a.opening});
-      else{if(String(o.opening)!==String(a.opening))changes.push({account:a.label,field:'opening',from:o.opening,to:a.opening});if(a.removed&&!o.removed)changes.push({account:o.label,field:'removed'});}});
+      if(!o){if(!a.removed)changes.push({account:a.label,field:'added',to:a.opening});}
+      else{if(a.removed&&!o.removed){changes.push({account:o.label,field:'removed'});return;}
+        if(o.label!==a.label)changes.push({account:a.label,field:'label',from:o.label,to:a.label});
+        if((o.access||'')!==(a.access||''))changes.push({account:a.label,field:'access',from:o.access||'',to:a.access||''});
+        if((F.num(o.opening)||0)!==(F.num(a.opening)||0))changes.push({account:a.label,field:'opening',from:o.opening,to:a.opening});}});
+    // Earmarks, matched by id: added, removed, or changed (name, account or amount).
+    var pb=prev.buckets||[],nb=s.buckets||[];
+    nb.forEach(function(b){var o=pb.find(function(x){return x.id===b.id;});
+      var now={label:b.label,parentId:b.parentId,amount:F.num(b.amount)||0};
+      if(!o)changes.push({field:'earmark_added',to:now});
+      else{var was={label:o.label,parentId:o.parentId,amount:F.num(o.amount)||0};
+        if(was.label!==now.label||was.parentId!==now.parentId||was.amount!==now.amount)changes.push({field:'earmark',from:was,to:now});}});
+    pb.forEach(function(o){if(!nb.some(function(b){return b.id===o.id;}))changes.push({field:'earmark_removed',from:{label:o.label,parentId:o.parentId,amount:F.num(o.amount)||0}});});
+    // Quick-capture mapping, compared value by value (not by object key order).
+    var pa=prev.aliases||{},na=s.aliases||{},keys={};
+    Object.keys(F.LEGACY_ACCOUNTS).concat(Object.keys(pa),Object.keys(na)).forEach(function(k){keys[k]=1;});
+    Object.keys(keys).forEach(function(k){var f=pa[k]===undefined?null:pa[k],t=na[k]===undefined?null:na[k];if(f!==t)changes.push({field:'mapping',key:k,from:f,to:t});});
   }
+  function acctName(id){var a=s.accounts.find(function(x){return x.id===id;})||(prev&&prev.accounts.find(function(x){return x.id===id;}));return a?(a.label||'(unnamed)'):'?';}
+  function target(v){return v===null?'not chosen':v===''?'Not used':acctName(v);}
+  function bucketText(b){return esc(b.label||'(unnamed)')+' '+fmt(b.amount)+' inside '+esc(acctName(b.parentId));}
+  function changeLine(c){
+    if(c.field==='baselineDate')return'Baseline date: '+fmtD(c.from)+' &rarr; <b>'+fmtD(c.to)+'</b>';
+    if(c.field==='label')return'Renamed: '+esc(c.from)+' &rarr; <b>'+esc(c.to)+'</b>';
+    if(c.field==='access'){var al=function(v){return v==='immediate'?'available to spend':v==='restricted'?'restricted':'default for its type';};return esc(c.account)+' availability: '+al(c.from)+' &rarr; <b>'+al(c.to)+'</b>';}
+    if(c.field==='opening')return esc(c.account)+' opening balance: '+fmt(F.num(c.from)||0)+' &rarr; <b>'+fmt(F.num(c.to)||0)+'</b>';
+    if(c.field==='added')return'New account: <b>'+esc(c.account)+'</b> (opening '+fmt(F.num(c.to)||0)+')';
+    if(c.field==='removed')return'Removed: <b>'+esc(c.account)+'</b> (its history is kept)';
+    if(c.field==='earmark_added')return'New earmark: <b>'+bucketText(c.to)+'</b>';
+    if(c.field==='earmark_removed')return'Removed earmark: <b>'+bucketText(c.from)+'</b>';
+    if(c.field==='earmark')return'Earmark: '+bucketText(c.from)+' &rarr; <b>'+bucketText(c.to)+'</b>';
+    if(c.field==='mapping')return'Quick-capture "'+esc(F.LEGACY_ACCOUNTS[c.key]||c.key)+'": '+esc(target(c.from))+' &rarr; <b>'+esc(target(c.to))+'</b>';
+    return esc(c.field);
+  }
+  var changeBox=prev?(changes.length?'<div class="card-label" style="margin-top:6px;">What changes</div>'+changes.map(function(c){return'<div class="muted-note" data-setup-change="'+c.field+'" style="color:var(--text);">'+changeLine(c)+'</div>';}).join('')
+    :'<div class="muted-note" data-setup-change="none">No changes from the saved setup. Saving again only refreshes its saved time.</div>'):'';
   setupPending={draft:clone(s),changes:changes};
   var acc=s.accounts.filter(function(a){return !a.removed;});
   qs('setup-confirm').innerHTML='<div class="card" style="background:var(--surf2);border-color:var(--amber);"><div class="card-label">Confirm '+(prev?'changes':'live setup')+' &mdash; as at the start of '+fmtD(s.baselineDate)+'</div>'
     +acc.map(function(a){return kv((a.primary?'&#9733; ':'')+esc(a.label),fmt(F.num(a.opening)||0));}).join('')
     +s.buckets.map(function(b){return kv('Earmark '+esc(b.label)+' (inside '+esc((acc.find(function(x){return x.id===b.parentId;})||{}).label||'?')+')',fmt(F.num(b.amount)||0),'var(--muted)');}).join('')
     +'<div class="muted-note">'+Object.keys(F.LEGACY_ACCOUNTS).map(function(k){var t=s.aliases[k];return esc(F.LEGACY_ACCOUNTS[k])+' &rarr; '+(t?esc((acc.find(function(x){return x.id===t;})||{}).label||t):'Not used');}).join(' &middot; ')+'</div>'
+    +changeBox
     +(changes.some(function(c){return c.field==='opening'||c.field==='baselineDate';})?'<div class="muted-note">Opening balance or baseline changes are recorded in the setup history.</div>':'')
     +(!prev?'<div class="muted-note">Sample entries, bills and balances will be hidden from your figures. Nothing is deleted.</div>':'')
     +'<div class="btn-row"><button id="setup-back-btn">Back to Edit</button><button class="primary" id="setup-confirm-btn">CONFIRM &amp; SAVE</button></div></div>';
@@ -3097,24 +3349,35 @@ function saveSetup(){
   qs('setup-confirm').scrollIntoView({block:'nearest'});
 }
 function setupBack(){setupPending=null;qs('setup-confirm').style.display='none';qs('setup-confirm').innerHTML='';qs('setup-save-btn').style.display='';setupResult('');}
-function confirmSetup(){guard(function(){
+/* While the write is in flight the form is locked, so nothing typed then can be lost. */
+function setupLock(on){document.querySelectorAll('#setup-modal input,#setup-modal select,#setup-modal button').forEach(function(el){
+  if(on){if(!el.disabled){el.setAttribute('data-kf-locked','1');el.disabled=true;}}else if(el.getAttribute('data-kf-locked')){el.disabled=false;el.removeAttribute('data-kf-locked');}});}
+function confirmSetup(){if(saving){setupResult(SETUP_BUSY_MSG);return;}guard(function(){
   if(!setupPending)return;
   var s=setupPending.draft,changes=setupPending.changes,prev=SETUP,now=nowISO(),hist=(prev&&prev.history)||[];
   s.id='ledgerSetup';s.mode='live';s.updatedAt=now;s.createdAt=(prev&&prev.createdAt)||now;
   s.history=hist.concat(changes.length||!prev?[{at:now,changes:prev?changes:[{field:'created',to:s.baselineDate}]}]:[]);
-  s.accounts=s.accounts.map(function(a){return{id:a.id,label:a.label,institution:a.institution,kind:a.kind,use:a.use,primary:!!a.primary,opening:F.num(a.opening)||0,removed:!!a.removed};});
+  s.accounts=s.accounts.map(function(a){return{id:a.id,label:a.label,institution:a.institution,kind:a.kind,use:a.use,primary:!!a.primary,opening:F.num(a.opening)||0,removed:!!a.removed,access:a.access==='immediate'||a.access==='restricted'?a.access:''};});
   s.buckets=s.buckets.map(function(b){return{id:b.id,label:b.label,parentId:b.parentId,amount:F.num(b.amount)||0};});
-  var btn=qs('setup-confirm-btn');if(btn){btn.disabled=true;btn.textContent='SAVING…';}
-  return db.atomic([{store:'meta',put:s}]).then(function(){return db.meta.get('ledgerSetup');}).then(function(back){
-    if(!back||JSON.stringify(back)!==JSON.stringify(s))throw new Error('The setup was written but could not be read back from '+db.name+'.');
-    SETUP=back;applySetup();setupPending=null;
-    if(navigator.storage&&navigator.storage.persist)navigator.storage.persist().catch(function(){});
-    setupBack();closeModal('setup-modal');
-    showToast((prev?'Accounts updated':'Live tracking started')+' — saved & verified');renderAll();
+  var btn=qs('setup-confirm-btn'),written=false;setupLock(true);setupSaving=true;if(btn)btn.textContent='SAVING…';
+  return db.atomic([{store:'meta',put:s}]).then(function(){written=true;return db.meta.get('ledgerSetup');}).then(function(back){
+    if(!back||JSON.stringify(back)!==JSON.stringify(s))throw new Error('Reading the setup back from '+db.name+' did not match what you entered.');
+    // Saved and verified. From here on a failure is a display problem, never a failed save.
+    setupLock(false);setupSaving=false;
+    SETUP=back;setupPending=null;setupDirty=false;setupDraft=null;setupDraftBase=null;
+    try{
+      applySetup();requestPersistence('after setup');
+      setupBack();closeModal('setup-modal');
+      showToast((prev?'Accounts updated':'Live tracking started')+' — saved & verified');renderAll();
+    }catch(uiErr){closeModal('setup-modal');savedButNotShown(uiErr,'Your account setup');}
   }).catch(function(err){
     console.error(err);
-    if(btn){btn.disabled=false;btn.textContent='CONFIRM & SAVE';}
-    setupResult('<div class="form-err"><b>Not saved.</b> '+esc(err&&err.message?err.message:err)+'<br>Database: '+esc(db.name)+'. Nothing was changed. Use Settings &rarr; Storage Check and report what it shows.</div>');
+    setupLock(false);setupSaving=false;if(btn)btn.textContent='CONFIRM & SAVE';
+    // Closing is blocked while saving, but if the form is not visible the failure must still be seen.
+    if(!qs('setup-modal').classList.contains('open'))showDialogWarning((written?'Account setup save NOT verified: ':'Account setup NOT saved: ')+errText(err)+'. Open Settings → Accounts to check.');
+    setupResult(written
+      ?'<div class="form-err"><b>Save NOT verified.</b> '+esc(errText(err))+'<br>The database may now hold a different setup from the one shown here. Do not rely on these balances: reload KoboFlow, open Settings &rarr; Accounts and check what was stored, and run Storage Check.</div>'
+      :'<div class="form-err"><b>Not saved.</b> '+esc(errText(err))+'<br>Database: '+esc(db.name)+'. Nothing was changed; your edits are still in the form. Use Settings &rarr; Storage Check and report what it shows.</div>');
   });
 });}
 
@@ -3128,11 +3391,12 @@ function renderDashboard(){
   el=qs('yd-out');if(el)el.textContent=fmt(ydOut);
   el=qs('yd-net');if(el){el.textContent=(net<0?'-':'')+fmt(net);el.style.color=net>=0?'#22C55E':'#EF4444';}
   el=qs('accounts-scroll');
-  if(el)el.innerHTML=ACCOUNTS.map(function(a){return'<div class="acct-card"><div class="acct-name">'+a.icon+' '+a.label+'</div><div class="acct-bal">'+fmt(a.balance)+'</div><div class="acct-type">'+a.type+'</div></div>';}).join('');
+  if(el)el.innerHTML=ACCOUNTS.map(function(a){return'<div class="acct-card"><div class="acct-name">'+a.icon+' '+esc(a.label)+'</div><div class="acct-bal">'+fmt(a.balance)+'</div><div class="acct-type">'+esc(a.type)+'</div></div>';}).join('');
   el=qs('ob-list');
   if(el){var obs=obligationsWithin(14);el.innerHTML=obs.length?obs.map(function(o){var od=o.dueDate<getToday();return'<div class="ob-item'+(od?' overdue':'')+'"'+(o.agreementId?' data-open-agr="'+esc(o.agreementId)+'" style="cursor:pointer;"':'')+'><div class="ob-left"><span>'+o.icon+'</span><div><div class="ob-desc">'+esc(o.label)+'</div><div class="ob-due">'+dueText(o.dueDate)+' &middot; '+esc(o.source)+'</div></div></div><div class="ob-amount">'+fmt(o.remaining)+'</div></div>';}).join(''):'<div class="muted-note">Nothing due in the next 14 days.</div>';}
   el=qs('budget-list');
-  if(el){
+  if(el&&isLive())el.innerHTML='<div class="muted-note" data-live-na="budgets">No budgets set yet.</div>';
+  else if(el){
     el.innerHTML=BUDGETS.map(function(b){var p=pct(b.used,b.total),c=hColor(p);return'<div class="budget-row"><div class="budget-top"><div class="budget-cat"><span>'+b.icon+'</span> '+b.cat+'</div><div class="budget-right"><span class="budget-fig">'+fmt(b.used)+' of '+fmt(b.total)+'</span><span class="budget-pct" style="color:'+c+'">'+p+'%</span></div></div><div class="budget-track"><div class="budget-bar" style="background:'+c+';" data-pct="'+p+'"></div></div></div>';}).join('');
     raf2(function(){document.querySelectorAll('.budget-bar').forEach(function(b){b.style.width=b.getAttribute('data-pct')+'%';});});
   }
@@ -3154,21 +3418,20 @@ function renderTimeline(){
     di.forEach(function(i){var c=F.classifyTxn(i);dn+=c.income-c.expense-c.financeCost;});
     var nc=dn>=0?'#22C55E':'#EF4444';
     var rows=di.map(function(i){
-      var ac=(i.fromAcct||i.toAcct)?' &middot; '+(i.fromAcct?acctLabel(i.fromAcct):'')+(i.toAcct?' &gt; '+acctLabel(i.toAcct):''):'';
+      var ac=(i.fromAcct||i.toAcct)?' &middot; '+(i.fromAcct?esc(acctLabel(i.fromAcct)):'')+(i.toAcct?' &gt; '+esc(acctLabel(i.toAcct)):''):'';
       var amtc='tl-amount'+(isIn(i.type)?' income':i.type==='transfer'?' transfer':i.type==='owner_withdrawal'?' owner_withdrawal':i.type==='investment'?' investment':'');
       var note=i.voided?' &middot; REVERSED':i.type==='loan_repayment'&&i.alloc?' &middot; P '+fmt(i.alloc.principal||0)+' / I+F '+fmt((i.alloc.interest||0)+(i.alloc.fees||0)):'';
-      return'<div class="tl-item'+(i.voided?' voided':'')+'"'+(i.agreementId?' data-open-agr="'+esc(i.agreementId)+'" style="cursor:pointer;"':'')+'><div class="tl-dot '+i.type+'"></div><div class="tl-body"><div class="tl-desc">'+esc(i.desc)+'</div><div class="tl-meta">'+i.time+' &middot; '+esc(i.cat)+ac+note+(i.demo?' &middot; sample':'')+'</div></div><div class="'+amtc+'">'+txSign(i)+fmt(i.amount)+'</div></div>';
+      return'<div class="tl-item'+(i.voided?' voided':'')+'"'+(i.agreementId?' data-open-agr="'+esc(i.agreementId)+'" style="cursor:pointer;"':'')+'><div class="tl-dot '+cls(i.type)+'"></div><div class="tl-body"><div class="tl-desc">'+esc(i.desc)+'</div><div class="tl-meta">'+esc(i.time)+' &middot; '+esc(i.cat)+ac+note+(i.demo?' &middot; sample':'')+'</div></div><div class="'+amtc+'">'+txSign(i)+fmt(i.amount)+'</div></div>';
     }).join('');
     return'<div class="tl-day-header"><div class="tl-day-label">'+dateLabel(date).toUpperCase()+'</div><div class="tl-day-net" style="color:'+nc+';">Net income less spending: '+(dn>=0?'+':'-')+fmt(Math.abs(dn))+'</div></div>'+rows;
   }).join('');
 }
 
 function renderCalendar(){
-  var obs=obligationsWithin(60),totalObs=sumRem(obs);
-  var totalCash=spendableCash();
-  var surplus=totalCash-totalObs;
+  var obs=obligationsWithin(60),cc=cashCoverFor(obs),totalObs=cc.due;
+  var surplus=cc.leftAfter;
   var cs=qs('cal-summary');
-  if(cs)cs.innerHTML='<div class="grid3" style="margin-bottom:0;"><div class="stat-card"><div class="stat-label">Due (60 days)</div><div class="stat-val" style="color:#EF4444;">'+fmt(totalObs)+'</div></div><div class="stat-card"><div class="stat-label">Cash Now</div><div class="stat-val" style="color:#22C55E;">'+fmt(totalCash)+'</div></div><div class="stat-card"><div class="stat-label">'+(surplus>=0?'Left After':'Gap')+'</div><div class="stat-val" style="color:'+(surplus>=0?'#22C55E':'#EF4444')+';">'+(surplus>=0?'+':'-')+fmt(Math.abs(surplus))+'</div></div></div><div class="muted-note" style="margin-bottom:0;">Planned amounts only &mdash; balances change when a payment is actually recorded. Expected income is not included.</div>';
+  if(cs)cs.innerHTML='<div class="grid3" style="margin-bottom:0;"><div class="stat-card"><div class="stat-label">Due (60 days)</div><div class="stat-val" style="color:#EF4444;">'+fmt(totalObs)+'</div></div><div class="stat-card"><div class="stat-label">Free to Use</div><div class="stat-val" style="color:#22C55E;">'+fmt(cc.freeToUse)+'</div></div><div class="stat-card"><div class="stat-label">'+(surplus>=0?'Left After':'Gap')+'</div><div class="stat-val" style="color:'+(surplus>=0?'#22C55E':'#EF4444')+';">'+(surplus>=0?'+':'-')+fmt(Math.abs(surplus))+'</div></div></div><div class="muted-note" style="margin-bottom:0;">Free to use = Cash Now '+fmt(cc.cashNow)+' less '+fmt(cc.earmarked)+' earmarked. Planned amounts only &mdash; balances change when a payment is actually recorded. Expected income is not included.</div>';
   var cl=qs('calendar-list');if(!cl)return;
   var MON=['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'],FULL=['January','February','March','April','May','June','July','August','September','October','November','December'];
   var lastM='',td=getToday(),h='';
@@ -3182,9 +3445,8 @@ function renderCalendar(){
 }
 
 function renderPressure(){
-  var obs=obligationsWithin(30),totalObs=sumRem(obs);
-  var totalCash=spendableCash();
-  var ps=totalCash>0?Math.min(100,Math.round((totalObs/totalCash)*100)):100;
+  var obs=obligationsWithin(30),cc=cashCoverFor(obs),totalObs=cc.due;
+  var ps=cc.pressure;
   var color=ps<40?'#22C55E':ps<70?'#F5A623':'#EF4444';
   var status=ps<40?'Low Pressure':ps<70?'Moderate Pressure':'High Pressure';
   var el;
@@ -3196,13 +3458,13 @@ function renderPressure(){
   if(el)el.innerHTML=obs.map(function(o){return'<div class="pressure-row"><span class="pressure-item-name">'+o.icon+' '+esc(o.label)+' <span style="color:var(--muted);font-size:10px;">'+dueText(o.dueDate)+'</span></span><span class="pressure-item-amt">'+fmt(o.remaining)+'</span></div>';}).join('')||'<div class="muted-note">Nothing due.</div>';
   el=qs('pressure-total');if(el)el.textContent=fmt(totalObs);
   el=qs('pressure-vs');
-  if(el)el.innerHTML='<div class="stat-card"><div class="stat-label">Available Cash</div><div class="stat-val" style="color:#22C55E;">'+fmt(totalCash)+'</div></div><div class="stat-card"><div class="stat-label">Obligations</div><div class="stat-val" style="color:#EF4444;">'+fmt(totalObs)+'</div></div>';
+  if(el)el.innerHTML='<div class="stat-card"><div class="stat-label">Cash Now (gross)</div><div class="stat-val" style="color:#7A7880;">'+fmt(cc.cashNow)+'</div></div><div class="stat-card"><div class="stat-label">Free to Use (after earmarks)</div><div class="stat-val" style="color:#22C55E;">'+fmt(cc.freeToUse)+'</div></div><div class="stat-card"><div class="stat-label">Obligations</div><div class="stat-val" style="color:#EF4444;">'+fmt(totalObs)+'</div></div><div class="stat-card"><div class="stat-label">Left After</div><div class="stat-val" style="color:'+(cc.leftAfter>=0?'#22C55E':'#EF4444')+';">'+(cc.leftAfter<0?'-':'+')+fmt(cc.leftAfter)+'</div></div>';
 }
 
 function renderCapital(){
   var views=activeDebtViews(),out=views.reduce(function(s,v){return s+v.bal.outstanding.total;},0);
   var capTx=items.filter(function(t){return !t.demo&&F.classifyTxn(t).capitalIn>0;});
-  var ti=INJECTIONS.reduce(function(s,i){return s+i.amount;},0)+capTx.reduce(function(s,t){return s+t.amount;},0);
+  var ti=(isLive()?0:INJECTIONS.reduce(function(s,i){return s+i.amount;},0))+capTx.reduce(function(s,t){return s+t.amount;},0);
   var due30=sumRem(obligationsWithin(30).filter(function(o){return o.kind==='loan';}));
   var cs=qs('cap-summary');
   if(cs)cs.innerHTML=[{label:'Loans Outstanding',val:fmt(out),color:'#EF4444'},{label:'Capital Injected',val:fmt(ti),color:'#22C55E'},{label:'Loan Repayments (30d)',val:fmt(due30),color:'#F5A623'},{label:'Active Loans',val:views.length,color:'#3B82F6'}].map(function(s){return'<div class="stat-card"><div class="stat-label">'+s.label+'</div><div class="stat-val" style="color:'+s.color+';">'+s.val+'</div></div>';}).join('');
@@ -3220,17 +3482,21 @@ function renderNetWorth(){
   var nw=ta-tl2,nwc=nw>=0?'#22C55E':'#EF4444',goal=10000000,fi=Math.max(0,Math.min(100,Math.round(nw/goal*100)));
   var el;
   el=qs('nw-total');if(el){el.textContent=(nw<0?'-':'')+fmt(nw);el.style.color=nwc;}
-  el=qs('nw-change');if(el){el.textContent='Up +32,500 vs last month (sample trend)';el.style.color='#22C55E';}
+  el=qs('nw-change');if(el){if(isLive()){el.textContent='Not enough recorded history to compare with last month';el.style.color='#7A7880';}else{el.textContent='Up +32,500 vs last month (sample trend)';el.style.color='#22C55E';}}
   el=qs('nw-assets');if(el)el.textContent=fmt(ta);
   el=qs('nw-liabs');if(el)el.textContent=fmt(tl2);
-  el=qs('nw-assets-list');if(el)el.innerHTML=ACCOUNTS.map(function(a){return'<div class="nw-row"><div class="nw-row-label"><span>'+a.icon+'</span><span>'+a.label+'</span></div><div class="nw-row-val" style="color:#22C55E;">'+fmt(a.balance)+'</div></div>';}).join('');
+  el=qs('nw-assets-list');if(el)el.innerHTML=ACCOUNTS.map(function(a){return'<div class="nw-row"><div class="nw-row-label"><span>'+a.icon+'</span><span>'+esc(a.label)+'</span></div><div class="nw-row-val" style="color:#22C55E;">'+fmt(a.balance)+'</div></div>';}).join('');
   el=qs('nw-liabs-list');if(el)el.innerHTML=loans.map(function(v){return'<div class="nw-row" data-open-agr="'+esc(v.agr.id)+'"><div class="nw-row-label"><span>&#127974;</span><span>'+esc(v.agr.name)+'</span></div><div class="nw-row-val" style="color:#EF4444;">'+fmt(v.bal.outstanding.total)+'</div></div>';}).join('')
     +un.map(function(t){return'<div class="nw-row"><div class="nw-row-label"><span>&#9888;</span><span>'+esc(t.desc)+' (terms not recorded, at least)</span></div><div class="nw-row-val" style="color:#EF4444;">'+fmt(t.amount)+'</div></div>';}).join('')
     +(isLive()?[]:OBLIGATIONS_DATA).map(function(o){return'<div class="nw-row"><div class="nw-row-label"><span>'+o.icon+'</span><span>'+o.desc+' (bill)</span></div><div class="nw-row-val" style="color:#EF4444;">'+fmt(o.amount)+'</div></div>';}).join('');
-  el=qs('fi-pct-label');if(el)el.textContent=fi+'%';
+  if(isLive())fi=0; // the ₦10M goal is a sample: no target is set in live mode
+  var fl=document.querySelector('.fi-labels');if(fl)fl.style.display=isLive()?'none':'';
+  el=qs('fi-goal-label');if(el)el.textContent=isLive()?'No net-worth goal set yet.':'Net Worth vs \u20A610M Goal (sample)';
+  el=qs('fi-pct-label');if(el)el.textContent=isLive()?'No target set':fi+'%';
   el=qs('fi-bar');if(el)raf2(function(){el.style.width=fi+'%';});
   el=qs('nw-trend');
-  if(el){var max=Math.max.apply(null,NW_TREND.map(function(t){return t.val;}));el.innerHTML=NW_TREND.map(function(t,i){var h=Math.round((t.val/max)*55)+8,c=i===NW_TREND.length-1?'#F5A623':'#3B82F6';return'<div class="nw-bar-wrap"><div class="nw-bar" style="height:'+h+'px;background:'+c+';"></div><div class="nw-bar-label">'+t.month+'</div></div>';}).join('');}
+  if(el&&isLive())el.innerHTML='<div class="muted-note" data-live-na="nw-trend">Not enough recorded history yet.</div>';
+  else if(el){var max=Math.max.apply(null,NW_TREND.map(function(t){return t.val;}));el.innerHTML=NW_TREND.map(function(t,i){var h=Math.round((t.val/max)*55)+8,c=i===NW_TREND.length-1?'#F5A623':'#3B82F6';return'<div class="nw-bar-wrap"><div class="nw-bar" style="height:'+h+'px;background:'+c+';"></div><div class="nw-bar-label">'+t.month+'</div></div>';}).join('');}
 }
 
 function renderAnalytics(){
@@ -3250,60 +3516,69 @@ function renderAnalytics(){
   var top=sorted.length?sorted[0][0]:'expenses';
   el=qs('insights-list');
   if(el)el.innerHTML=[
-    {icon:'&#128200;',text:top+' is your largest expense category this period.'},
-    {icon:'&#128663;',text:'Combined fleet costs: '+fmt(vtot)+'. FJR1300AE is most economical.'},
-    {icon:'&#9888;',  text:'Sportage Black at '+pct(55000,60000)+'% of monthly vehicle budget.'},
+    {icon:'&#128200;',text:sorted.length?esc(top)+' is your largest expense category this period.':'No expenses recorded yet.'},
+  ].concat(isLive()?[
+    {icon:'&#128663;',text:'Vehicle spending this month, from recorded entries: '+fmt(vtot)+'.'},
+  ]:[
+    {icon:'&#128663;',text:'Combined fleet costs: '+fmt(vtot)+'. FJR1300AE is most economical. (sample)'},
+    {icon:'&#9888;',  text:'Sportage Black at '+pct(55000,60000)+'% of monthly vehicle budget. (sample)'},
+  ]).concat([
     {icon:'&#128161;',text:(unp+nr)+' inbox entries need your attention.'},
     {icon:'&#8358;',  text:'Loan proceeds, capital injections and principal repayments are financing, so they are not counted as income or spending here. Loan interest and fees are.'},
-  ].map(function(ins){return'<div class="insight-row"><div class="insight-icon">'+ins.icon+'</div><div class="insight-text">'+ins.text+'</div></div>';}).join('');
+  ]).map(function(ins){return'<div class="insight-row"><div class="insight-icon">'+ins.icon+'</div><div class="insight-text">'+ins.text+'</div></div>';}).join('');
   raf2(function(){document.querySelectorAll('.cat-bar').forEach(function(b){b.style.width=b.getAttribute('data-p')+'%';});});
 }
 
 function renderAutopilot(){
   var runway=calcRunway(),liquid=runway.liquid;
-  var obs=obligationsWithin(30),totalObs=sumRem(obs);
+  var obs=obligationsWithin(30),cc=cashCoverFor(obs),totalObs=cc.due,free=cc.freeToUse;
   var loanDue=sumRem(obs.filter(function(o){return o.kind==='loan';}));
-  var gap=liquid-totalObs;
+  var gap=cc.leftAfter; // same figure as freeCash(): free-to-use cash less obligations due in 30 days
   var now=new Date();
   var monthStart=now.getFullYear()+'-'+(now.getMonth()+1<10?'0':'')+(now.getMonth()+1)+'-01';
   var wdThisMonth=items.filter(function(i){return i.type==='owner_withdrawal'&&!i.voided&&i.date>=monthStart;}).reduce(function(s,i){return s+i.amount;},0);
-  var vCosts=VEHICLES.reduce(function(s,v){return s+v.logs.filter(function(l){return l.date>=monthStart;}).reduce(function(s2,l){return s2+l.amount;},0);},0);
+  var vCosts=VEHICLES.reduce(function(s,v){return s+vehicleLogs(v).filter(function(l){return l.date>=monthStart;}).reduce(function(s2,l){return s2+l.amount;},0);},0);
   var restock=items.filter(function(i){return i.cat==='Restocking'&&!i.voided&&i.date>=monthStart;}).reduce(function(s,i){return s+i.amount;},0);
   var largest=obs.slice().sort(function(a,b){return b.remaining-a.remaining;})[0];
   var incomeM=items.filter(function(i){return i.date>=monthStart;}).reduce(function(s,i){return s+F.classifyTxn(i).income;},0);
   var wdRatio=wdThisMonth/(incomeM||1);
   var views=activeDebtViews(),overdueLoans=views.reduce(function(s,v){return s+v.bal.overdue;},0);
-  var liquidityScore=Math.min(30,Math.round((liquid/(totalObs||1))*15));
-  var runwayScore=runway.runwayDays>=180?25:runway.runwayDays>=90?15:5;
-  var pressureScore=totalObs<liquid?20:totalObs<liquid*1.5?10:0;
+  var liquidityScore=Math.min(30,Math.round((free/(totalObs||1))*15));
+  var runwayScore=!runway.known?0:runway.runwayDays>=180?25:runway.runwayDays>=90?15:5;
+  var pressureScore=totalObs<free?20:totalObs<free*1.5?10:0;
   var wdScore=wdRatio<0.15?15:wdRatio<0.30?8:0;
   var debtScore=overdueLoans>0?0:loanDue>liquid*0.2?4:views.length===0?10:7;
   var health=Math.min(100,liquidityScore+runwayScore+pressureScore+wdScore+debtScore);
   var hColor2=health>=75?'#22C55E':health>=50?'#F5A623':'#EF4444';
   var warnings=[];
   if(overdueLoans>0)warnings.push('Loan repayments of '+fmt(overdueLoans)+' are overdue.');
-  if(gap<0)warnings.push('Known obligations in the next 30 days exceed available cash by '+fmt(Math.abs(gap))+'.');
-  if(runway.runwayDays<90)warnings.push('Cash runway is critical: less than 90 days of spending covered.');
+  if(gap<0)warnings.push('Known obligations in the next 30 days exceed free-to-use cash (after earmarks) by '+fmt(Math.abs(gap))+'.');
+  if(runway.known&&runway.runwayDays<90)warnings.push('Spending runway is critical: available cash covers less than 90 days of expenses + interest/fees.');
+  var cp=cashNow();
+  cp.overEarmarked.forEach(function(o){warnings.push('Earmarks in '+esc(o.label)+' ('+fmt(o.earmarked)+') exceed its balance ('+fmt(o.balance)+') by '+fmt(o.shortBy)+'.');});
   if(wdRatio>0.30)warnings.push('Owner withdrawals exceed 30% of income: business may be underfunded.');
   if(restock>liquid*0.5)warnings.push('Restocking is consuming more than 50% of available cash.');
   if(loanDue>liquid*0.2)warnings.push('Loan repayments due in 30 days are more than 20% of available cash.');
   if(unlinkedLoanReceipts().length)warnings.push('A loan receipt has no agreement: what you owe on it is unknown. Link it in Loans.');
   var rows=[
     {lbl:'Cash Now (actual)',val:fmt(liquid),color:'#22C55E'},
+    {lbl:'&nbsp;&nbsp;of which earmarked',val:fmt(cp.earmarked),color:'#7A7880'},
+    {lbl:'&nbsp;&nbsp;free to use (after earmarks)',val:fmt(cp.unearmarked),color:'#22C55E'},
+    {lbl:'Restricted (coop, fixed deposit)',val:fmt(cp.restricted),color:'#7A7880'},
     {lbl:'Committed: Next 30 Days',val:fmt(totalObs),color:'#EF4444'},
     {lbl:'&nbsp;&nbsp;of which loan repayments',val:fmt(loanDue),color:'#F5A623'},
     {lbl:'Expected Inflows',val:'Not forecast',color:'#7A7880'},
-    {lbl:'Left After Known Obligations',val:(gap<0?'-':'+')+fmt(gap),color:gap>=0?'#22C55E':'#EF4444'},
+    {lbl:'Left After Known Obligations (free to use)',val:(gap<0?'-':'+')+fmt(gap),color:gap>=0?'#22C55E':'#EF4444'},
     {lbl:'Largest Demand',val:largest?esc(largest.label)+' '+fmt(largest.remaining):'--',color:'#F5A623'},
     {lbl:'Owner W/D This Month',val:fmt(wdThisMonth),color:wdRatio>0.30?'#EF4444':wdRatio>0.15?'#F5A623':'#22C55E'},
     {lbl:'Vehicle Spending',val:fmt(vCosts),color:'#7A7880'},
     {lbl:'Restocking Cash Spent',val:fmt(restock),color:'#7A7880'},
-    {lbl:'Financial Health',val:health+'/100',color:hColor2},
+    {lbl:'Financial Health (rule-of-thumb)',val:runway.known?health+'/100':runway.reason==='short_history'?'Not available: not enough spending history yet':'Not available: no spending recorded yet',color:runway.known?hColor2:'#7A7880'},
   ];
   var body=qs('autopilot-body');if(!body)return;
   body.innerHTML=reminderHTML(3)
     +rows.map(function(r){return'<div class="autopilot-row"><span class="autopilot-lbl">'+r.lbl+'</span><span class="autopilot-val" style="color:'+r.color+';">'+r.val+'</span></div>';}).join('')
-    +'<div class="muted-note" style="margin-bottom:0;">"Left after" assumes no new income arrives. Scheduled repayments are not deducted from your balances until paid.</div>'
+    +'<div class="muted-note" style="margin-bottom:0;">"Left after" is free-to-use cash less obligations due in 30 days, and assumes no new income arrives. Scheduled repayments are not deducted from your balances until paid.</div>'
     +(warnings.length?'<div class="autopilot-warning">&#9888; '+warnings.join('<br>&#9888; ')+'</div>':'<div class="autopilot-ok">&#10003; All financial indicators are within acceptable ranges.</div>');
 }
 
@@ -3391,18 +3666,50 @@ function renderAll(){
 }
 
 /* ═══════════════ BACKUP: EXPORT / IMPORT ═══════════════ */
+/* CSV export. Every value that can come from typing or from an imported backup is a text
+   cell: if it could start a spreadsheet formula (= + - @, also after leading spaces, tabs,
+   line breaks, other control or zero-width characters, or as the full-width forms), it gets
+   a leading apostrophe so spreadsheets keep it as text (the OWASP CSV-injection guidance).
+   Quoting alone does not stop formulas. Every text cell is quoted, so commas, quotes and
+   line breaks stay inside their cell. Only validated numbers are written bare, so amounts
+   stay numeric, negative ones included. A UTF-8 byte-order mark lets Excel read ₦ and other
+   non-ASCII text correctly. */
+var CSV_FORMULA_START=/^[\s\u0000-\u001f\u007f\u200b-\u200d\u2060\ufeff]*[=+\-@\uff1d\uff0b\uff0d\uff20]/;
+function csvText(v){var s=String(v==null?'':v);if(CSV_FORMULA_START.test(s))s="'"+s;return'"'+s.replace(/"/g,'""')+'"';}
+function csvNum(v){
+  if(typeof v==='number'&&isFinite(v))return String(v);
+  if(typeof v==='string'&&/^-?\d+(\.\d+)?$/.test(v))return v;
+  return csvText(v);
+}
+function csvRows(list){
+  var head=['ID','Date','Time','Description','Category','Type','Amount','From','To','State','Agreement','Principal','Interest','Fees','Unsplit','Reversed'];
+  return [head.map(csvText).join(',')].concat(list.map(function(i){var a=i.alloc||{};
+    function opt(v){return v?csvNum(v):'';} // blank when absent or zero, as before
+    return[csvNum(i.id),csvText(i.date),csvText(i.time),csvText(i.desc),csvText(i.cat),csvText(i.type),csvNum(i.amount),csvText(i.fromAcct||''),csvText(i.toAcct||''),csvText(i.state),csvText(i.agreementId||''),opt(a.principal),opt(a.interest),opt(a.fees),opt(a.unsplit),i.voided?'yes':''].join(',');
+  }));
+}
 function exportCSV(){
-  var rows=[['ID','Date','Time','Description','Category','Type','Amount','From','To','State','Agreement','Principal','Interest','Fees','Unsplit','Reversed']];
-  function q(s){return'"'+String(s==null?'':s).replace(/"/g,'""')+'"';}
-  realItems().forEach(function(i){var a=i.alloc||{};rows.push([i.id,i.date,i.time,q(i.desc),q(i.cat),i.type,i.amount,i.fromAcct||'',i.toAcct||'',q(i.state),i.agreementId||'',a.principal||'',a.interest||'',a.fees||'',a.unsplit||'',i.voided?'yes':'']);});
-  dlFile('koboflow_'+getToday()+'.csv',rows.map(function(r){return r.join(',');}).join('\n'),'text/csv');
+  dlFile('koboflow_'+getToday()+'.csv','\ufeff'+csvRows(realItems()).join('\r\n')+'\r\n','text/csv');
   showToast('CSV exported');
 }
+/* A backup is built from one consistent snapshot of every store (a single read-only
+   transaction). If the database cannot be opened or any read fails, no file is produced:
+   an empty, partial or mixed backup is never offered. */
 function exportJSON(){
-  var data={app:'KoboFlow',version:'3.2',exported:new Date().toISOString(),ledgerSetup:SETUP,transactions:realItems(),agreements:AGR,instalments:INST,allocations:ALLOC,agreementEvents:EVENTS,opportunities:OPPS,
-    accounts:ACCOUNTS.map(function(a){return{id:a.id,label:a.label,opening:a.opening};})};
-  dlFile('koboflow_backup_'+getToday()+'.json',JSON.stringify(data,null,2),'application/json');
-  showToast('JSON backup exported');
+  return db.snapshot(['transactions','agreements','instalments','allocations','agreementEvents','opportunities','meta']).then(function(r){
+    var txs=r.transactions.filter(function(t){return !t.demo;});
+    txs.sort(function(a,b){var x=(b.date||'')+(b.time||''),y=(a.date||'')+(a.time||'');return x>y?1:x<y?-1:0;});
+    var ls=r.meta.find(function(m){return m.id==='ledgerSetup';}),setup=ls&&ls.mode==='live'?ls:null;
+    var data={app:'KoboFlow',version:'3.2',exported:new Date().toISOString(),ledgerSetup:setup,transactions:txs,agreements:r.agreements,instalments:r.instalments,allocations:r.allocations,agreementEvents:r.agreementEvents,opportunities:r.opportunities,
+      accounts:ACCOUNTS.map(function(a){return{id:a.id,label:a.label,opening:a.opening};})};
+    dlFile('koboflow_backup_'+getToday()+'.json',JSON.stringify(data,null,2),'application/json');
+    showToast('JSON backup exported');
+    return data;
+  }).catch(function(err){
+    console.error(err);
+    reportFailure('Backup NOT created: a reliable backup could not be produced from '+db.name+' ('+errText(err)+'). No file was saved. Run Settings → Storage Check.');
+    return null;
+  });
 }
 function dlFile(name,content,mime){
   var a=document.createElement('a');
@@ -3474,7 +3781,24 @@ function importJSON(file){
 }
 window.__kfPlanImport=planImport;
 
-function persistTxn(rec){db.transactions.put(rec).catch(function(err){console.error(err);showToast('Not saved to storage: '+(err&&err.message||err));});}
+/* Quick entries are added to the screen only after the database confirms the write.
+   On failure nothing is shown as saved, the user's input is kept for a retry, and a
+   persistent warning explains what happened. A failed write stores nothing, so a retry
+   cannot create a duplicate; the pending flags stop a double tap saving twice. */
+function saveEntry(rec,label,hint){
+  var key=label||'Entry';
+  return commit([{store:'transactions',put:rec}]).then(function(){
+    // A retry of the same entry succeeded: remove its stale "NOT saved" warning so it is not re-entered.
+    var w=qs('dialog-warning');if(w&&w.getAttribute('data-entry')===key){w.style.display='none';w.removeAttribute('data-entry');}
+    return true;
+  },function(err){
+    console.error(err);
+    reportFailure(key+' NOT saved: '+errText(err)+'. '+(hint||'It was not added. Your input is kept so you can try again.'));
+    var w=qs('dialog-warning');if(w)w.setAttribute('data-entry',key);
+    return false;
+  });
+}
+var capPending={};
 
 var capInput=qs('capture-input'),capWrap=qs('capture-wrap'),capPreview=qs('capture-preview');
 if(capInput){
@@ -3488,7 +3812,7 @@ if(capInput){
       var tbg=isIn(e.type)?'#0D2E1A':e.type==='transfer'?'#0D1A2E':e.type==='owner_withdrawal'?'#1E0A3C':'#2E0D0D';
       capWrap.classList.add('active');capPreview.classList.add('show');
       var pt=qs('preview-type'),pc=qs('preview-cat'),pa=qs('preview-acct');
-      if(pt){pt.textContent=e.type.replace(/_/g,' ');pt.style.background=tbg;pt.style.color=tc2;}
+      if(pt){pt.textContent=typeLabel(e.type);pt.style.background=tbg;pt.style.color=tc2;}
       if(pc){pc.textContent=e.cat;pc.style.background=ss2.bg;pc.style.color=ss2.color;}
       if(pa){pa.textContent=(e.fromAcct?acctLabel(e.fromAcct):'')+(e.toAcct?' > '+acctLabel(e.toAcct):'');}
     }else{capWrap.classList.remove('active');capPreview.classList.remove('show');}
@@ -3496,16 +3820,20 @@ if(capInput){
   capInput.addEventListener('keydown',function(e){if(e.key==='Enter')doCapture();});
 }
 function doCapture(){
-  var v=capInput.value.trim();if(!v)return;
+  var raw=capInput.value,v=raw.trim();if(!v||capPending[v])return;
   var e=parseEntry(v);if(!e.amount)return;
   var item={id:newTxnId(),amount:e.amount,desc:e.desc,cat:e.cat,type:e.type,vehicle:e.vehicle,fromAcct:resolveAcct(e.fromAcct),toAcct:resolveAcct(e.toAcct),state:e.state,date:getToday(),time:getNow()};
   if((e.fromAcct&&!item.fromAcct)||(e.toAcct&&!item.toAcct))item.state='Needs Review'; // role set to "Not used": no account assumed
-  items.unshift(item);persistTxn(item);
-  capInput.value='';capWrap.classList.remove('active');capPreview.classList.remove('show');
-  var btn=qs('capture-btn');
-  if(btn){btn.textContent='SAVED';btn.classList.add('saved');setTimeout(function(){btn.textContent='SAVE';btn.classList.remove('saved');},1100);}
-  showToast(e.desc+' -- '+fmt(e.amount)+(e.type==='loan_receipt'?' (link it in Loans)':''));
-  renderAll();
+  capPending[v]=true;
+  saveEntry(item,'Quick entry "'+v+'"').then(function(ok){
+    delete capPending[v];
+    if(!ok)return;
+    // Clear only if the box still holds what was saved (the user may have typed the next entry).
+    if(capInput.value===raw){capInput.value='';capWrap.classList.remove('active');capPreview.classList.remove('show');}
+    var btn=qs('capture-btn');
+    if(btn){btn.textContent='SAVED';btn.classList.add('saved');setTimeout(function(){btn.textContent='SAVE';btn.classList.remove('saved');},1100);}
+    showToast(e.desc+' -- '+fmt(e.amount)+(e.type==='loan_receipt'?' (link it in Loans)':''));
+  });
 }
 var capBtn=qs('capture-btn');if(capBtn)capBtn.addEventListener('click',doCapture);
 
@@ -3523,9 +3851,13 @@ var snb=qs('settings-nav-btn');if(snb)snb.addEventListener('click',function(){sh
 
 var fr2=qs('filter-row');
 if(fr2)fr2.addEventListener('click',function(e){var b=e.target.closest('.filter-btn');if(b){activeFilter=b.getAttribute('data-state');renderInbox();}});
+var statePending={};
 function setState(idAttr,state){
-  items=items.map(function(i){if(String(i.id)===idAttr){var n=clone(i);n.state=state;if(!n.demo)persistTxn(n);return n;}return i;});
-  renderAll();
+  var cur=items.find(function(i){return String(i.id)===idAttr;});if(!cur||statePending[idAttr])return;
+  var n=clone(cur);n.state=state;
+  if(n.demo){upsertItem(n);renderAll();return;} // sample rows are never stored
+  statePending[idAttr]=true;
+  saveEntry(n,'Inbox change ('+state+')','The item keeps its previous status. Try again.').then(function(){delete statePending[idAttr];});
 }
 var il2=qs('inbox-list');
 if(il2)il2.addEventListener('click',function(e){
@@ -3555,13 +3887,30 @@ if(vpanels)vpanels.addEventListener('click',function(e){
   var mt=qs('vlog-modal-title');if(mt)mt.textContent='LOG -- '+v.name;
   qs('vlog-modal-overlay').setAttribute('data-vid',vid);
   qs('vlog-modal-overlay').classList.add('open');
-  setTimeout(function(){var el=qs('vlog-amount');if(el)el.focus();},100);
+  autofocusWhenIdle('vlog-modal-overlay','vlog-amount');
 });
 
-var addBtn=qs('add-btn');if(addBtn)addBtn.addEventListener('click',function(){qs('modal-overlay').classList.add('open');setTimeout(function(){var el=qs('modal-amount');if(el)el.focus();},100);});
+/* Focus the first field shortly after a form opens, but never take focus away from a field
+   the user has already tapped or started typing in (the delayed focus used to steal it, and
+   what was typed next landed in the wrong field). data-form-ready="1" marks that this step is
+   finished, whichever way it went. */
+function autofocusWhenIdle(overlayId,fieldId){
+  var ov=qs(overlayId);if(!ov)return;
+  var touched=false;function mark(){touched=true;}
+  var evs=['focusin','pointerdown','keydown','input'];
+  ov.removeAttribute('data-form-ready');
+  evs.forEach(function(t){ov.addEventListener(t,mark,true);});
+  setTimeout(function(){
+    evs.forEach(function(t){ov.removeEventListener(t,mark,true);});
+    var a=document.activeElement,busy=touched||(a&&a!==document.body&&ov.contains(a));
+    var el=qs(fieldId);if(!busy&&el&&ov.classList.contains('open'))el.focus();
+    ov.setAttribute('data-form-ready','1');
+  },100);
+}
+var addBtn=qs('add-btn');if(addBtn)addBtn.addEventListener('click',function(){qs('modal-overlay').classList.add('open');autofocusWhenIdle('modal-overlay','modal-amount');});
 qs('modal-close-btn').addEventListener('click',function(){qs('modal-overlay').classList.remove('open');});
 qs('modal-overlay').addEventListener('click',function(e){if(e.target===qs('modal-overlay'))qs('modal-overlay').classList.remove('open');});
-document.querySelectorAll('.type-chip').forEach(function(btn){btn.addEventListener('click',function(){modalType=btn.getAttribute('data-type');document.querySelectorAll('.type-chip').forEach(function(b){b.classList.remove('active');});btn.classList.add('active');});});
+document.querySelectorAll('.type-chip').forEach(function(btn){btn.addEventListener('click',function(){modalType=btn.getAttribute('data-type');var th=qs('type-chip-hint');if(th)th.style.display=modalType==='obligation'?'':'none';document.querySelectorAll('.type-chip').forEach(function(b){b.classList.remove('active');});btn.classList.add('active');});});
 qs('modal-save-btn').addEventListener('click',function(){
   var amt=parseFloat(qs('modal-amount').value);
   var desc=(qs('modal-desc').value||'').trim();
@@ -3572,10 +3921,13 @@ qs('modal-save-btn').addEventListener('click',function(){
   var type=(modalType==='capital_injection'&&cat==='Loan')?'loan_receipt':modalType;
   var rec={id:newTxnId(),amount:amt,desc:desc,cat:type==='loan_receipt'?'Loan Proceeds':cat,type:type,state:type==='loan_receipt'?'Needs Review':'AI Categorized',date:getToday(),time:getNow(),fromAcct:from,toAcct:to};
   if(type==='capital_injection')rec.fundingKind='capital_injection';
-  items.unshift(rec);persistTxn(rec);
-  qs('modal-overlay').classList.remove('open');
-  qs('modal-amount').value='';qs('modal-desc').value='';
-  showToast('Entry saved');renderAll();
+  var sb=this;if(sb.disabled)return;sb.disabled=true;
+  saveEntry(rec,'Entry "'+desc+'"','It was not added. The form stays open with your values so you can try again.').then(function(ok){
+    sb.disabled=false;if(!ok)return;
+    qs('modal-overlay').classList.remove('open');
+    qs('modal-amount').value='';qs('modal-desc').value='';
+    showToast('Entry saved');
+  });
 });
 
 qs('vlog-modal-close').addEventListener('click',function(){qs('vlog-modal-overlay').classList.remove('open');});
@@ -3587,12 +3939,15 @@ qs('vlog-save-btn').addEventListener('click',function(){
   var cat=qs('vlog-cat').value;
   var desc=(qs('vlog-desc').value||'').trim()||cat;
   if(!amt){alert('Please enter an amount.');return;}
-  v.logs.unshift({id:nextVlogId++,cat:cat,amount:amt,desc:desc,date:getToday(),time:getNow()});
-  var rec={id:newTxnId(),amount:amt,desc:desc+' ('+v.name+')',cat:'Vehicle: '+v.name,type:'expense',state:'AI Categorized',date:getToday(),time:getNow(),fromAcct:resolveAcct('pers_cash'),toAcct:'',vehicle:vid};
-  items.unshift(rec);persistTxn(rec);
-  qs('vlog-modal-overlay').classList.remove('open');
-  qs('vlog-amount').value='';qs('vlog-desc').value='';
-  showToast(v.name+' -- '+fmt(amt));renderAll();
+  var rec={id:newTxnId(),amount:amt,desc:desc+' ('+v.name+')',cat:'Vehicle: '+v.name,type:'expense',state:'AI Categorized',date:getToday(),time:getNow(),fromAcct:resolveAcct('pers_cash'),toAcct:'',vehicle:vid,vehicleCat:cat};
+  var sb=this;if(sb.disabled)return;sb.disabled=true;
+  saveEntry(rec,v.name+' log','It was not added. The form stays open with your values so you can try again.').then(function(ok){
+    sb.disabled=false;if(!ok)return;
+    if(!isLive())v.logs.unshift({id:nextVlogId++,cat:cat,amount:amt,desc:desc,date:rec.date,time:rec.time}); // live: shown from the saved record
+    qs('vlog-modal-overlay').classList.remove('open');
+    qs('vlog-amount').value='';qs('vlog-desc').value='';
+    showToast(v.name+' -- '+fmt(amt));renderAll();
+  });
 });
 
 /* ── Loans, agreements & opportunity wiring ── */
@@ -3651,38 +4006,73 @@ qs('clear-data-btn').addEventListener('click',function(){
   Promise.all(['transactions','agreements','instalments','allocations','agreementEvents','opportunities','meta'].map(function(s){return db[s].clear();})).then(function(){
     items=[];AGR=[];INST=[];ALLOC=[];EVENTS=[];OPPS=[];META={id:'settings',seenReminders:{}};currentAgrId=null;SETUP=null;DEMO_ITEMS=null;applySetup();
     showToast('All data cleared');renderAll();
+  }).catch(function(err){
+    console.error(err);
+    showDialogWarning('Clear All Data FAILED: '+(err&&err.message?err.message:err)+'. Some or all data may still be stored. Run Settings → Storage Check.');
   });
 });
 
 window.__kfOnBlocked=function(err){showToast(err.message);};
 qs('setup-open-btn').addEventListener('click',openSetup);
-qs('setup-add-acct').addEventListener('click',function(){readSetupForm();setupDraft.accounts.push({id:uid('acc'),label:'',institution:'',kind:'',use:'business',primary:false,opening:''});renderSetupRows();});
-qs('setup-add-bucket').addEventListener('click',function(){readSetupForm();setupDraft.buckets.push({id:uid('bkt'),label:'',parentId:'',amount:''});renderSetupRows();});
+qs('setup-add-acct').addEventListener('click',function(){setupDirty=true;readSetupForm();setupDraft.accounts.push({id:uid('acc'),label:'',institution:'',kind:'',use:'business',primary:false,opening:''});renderSetupRows();});
+qs('setup-add-bucket').addEventListener('click',function(){setupDirty=true;readSetupForm();setupDraft.buckets.push({id:uid('bkt'),label:'',parentId:'',amount:''});renderSetupRows();});
 qs('setup-modal').addEventListener('click',function(e){
-  if(e.target===qs('setup-modal')){closeModal('setup-modal');return;}
+  if(e.target===qs('setup-modal')){if(setupSaving){setupResult('<div class="form-warn">Still saving. The form stays open until the save finishes.</div>');return;}closeModal('setup-modal');return;}
+  if(e.target.id==='setup-discard-btn'){openSetup(true);return;}
+  if(e.target.closest('[data-remove-acct],[data-remove-bucket]'))setupDirty=true;
   var ra=e.target.closest('[data-remove-acct]');if(ra){readSetupForm();var a=setupDraft.accounts[+ra.getAttribute('data-remove-acct')];if(SETUP&&SETUP.accounts.some(function(x){return x.id===a.id;}))a.removed=true;else setupDraft.accounts.splice(+ra.getAttribute('data-remove-acct'),1);Object.keys(setupDraft.aliases).forEach(function(k){if(setupDraft.aliases[k]===a.id)delete setupDraft.aliases[k];});renderSetupRows();return;}
   var rb=e.target.closest('[data-remove-bucket]');if(rb){readSetupForm();setupDraft.buckets.splice(+rb.getAttribute('data-remove-bucket'),1);renderSetupRows();}
 });
-qs('setup-modal').addEventListener('input',function(){if(setupPending)setupBack();setupPreview();});
-qs('setup-modal').addEventListener('change',function(e){if(e.target.closest('[data-acct-row]')){readSetupForm();renderSetupRows();}else setupPreview();});
+qs('setup-modal').addEventListener('input',function(){setupDirty=true;if(setupPending)setupBack();setupPreview();});
+qs('setup-modal').addEventListener('change',function(e){setupDirty=true;if(e.target.closest('[data-acct-row]')){readSetupForm();refreshAcctOptions();}setupPreview();});
 qs('setup-save-btn').addEventListener('click',saveSetup);
 qs('setup-confirm').addEventListener('click',function(e){if(e.target.id==='setup-confirm-btn')confirmSetup();else if(e.target.id==='setup-back-btn')setupBack();});
 qs('storage-check-btn').addEventListener('click',storageCheck);
-applySetup();
-recalcBalances();
-renderAll();
+qs('persist-request-btn').addEventListener('click',function(){requestPersistence('manual').then(function(){storageCheck();});});
+// First draw (sample data) before the database is read. If it fails, keep going: the database
+// is still read, the draw is retried with the real data, and any failure is then reported.
+try{applySetup();recalcBalances();renderAll();}catch(earlyErr){console.error('KoboFlow first draw failed:',earlyErr);}
+/* Startup has three separate failure categories, reported separately:
+   1. storage: the database could not be opened or read (data-kf-ready="error");
+   2. process: the data was read but could not be loaded into the app (a malformed record);
+   3. display: the data was loaded but a screen could not be drawn.
+   2 and 3 set data-kf-ready="app-error": storage still works, so Settings, Storage Check
+   and Export stay usable, and the message never claims that storage is unavailable. */
+function startupAppError(stage,err){
+  console.error(err);
+  var m=errText(err);
+  window.__kfStorage={ok:true};window.__kfAppError={stage:stage,error:m};
+  document.body.setAttribute('data-kf-ready','app-error');
+  showToast(stage==='display'?'Display problem: your data is stored':'Problem loading a stored record');
+  showDialogWarning((stage==='display'
+    ?'Display problem: KoboFlow read your data from '+db.name+', but could not draw this screen ('+m+'). '
+    :'Data problem: KoboFlow read '+db.name+', but could not load a stored record into the app ('+m+'). ')
+    +'Storage itself is working and nothing was deleted. Export a backup (Settings → Export) and run Storage Check before changing anything.');
+}
 Promise.all([db.transactions.toArray(),db.agreements.toArray(),db.instalments.toArray(),db.allocations.toArray(),db.agreementEvents.toArray(),db.opportunities.toArray(),db.meta.get('settings'),db.meta.get('ledgerSetup')]).then(function(r){
-  (r[0]||[]).forEach(function(row){if(!items.some(function(i){return i.id===row.id;}))items.push(row);});
-  items.sort(function(a,b){var x=(b.date||'')+(b.time||''),y=(a.date||'')+(a.time||'');return x>y?1:x<y?-1:0;});
-  AGR=r[1]||[];INST=r[2]||[];ALLOC=r[3]||[];EVENTS=r[4]||[];OPPS=r[5]||[];
-  if(r[6])META=r[6];if(!META.seenReminders)META.seenReminders={};
-  if(r[7]&&r[7].mode==='live'){SETUP=r[7];applySetup();}
-  var maxId=items.reduce(function(m,i){return typeof i.id==='number'?Math.max(m,i.id):m;},0);
-  nextId=Math.max(nextId,maxId+1);
-  processReminders();
-  renderAll();
+  var stage='process';
+  try{
+    (r[0]||[]).forEach(function(row){if(!items.some(function(i){return i.id===row.id;}))items.push(row);});
+    items.sort(function(a,b){var x=(b.date||'')+(b.time||''),y=(a.date||'')+(a.time||'');return x>y?1:x<y?-1:0;});
+    AGR=r[1]||[];INST=r[2]||[];ALLOC=r[3]||[];EVENTS=r[4]||[];OPPS=r[5]||[];
+    if(r[6])META=r[6];if(!META.seenReminders)META.seenReminders={};
+    if(r[7]&&r[7].mode==='live'){SETUP=r[7];applySetup();}
+    var maxId=items.reduce(function(m,i){return typeof i.id==='number'?Math.max(m,i.id):m;},0);
+    nextId=Math.max(nextId,maxId+1);
+    stage='display';
+    processReminders();
+    renderAll();
+  }catch(appErr){startupAppError(stage,appErr);requestPersistence('startup');return;}
+  window.__kfStorage={ok:true};
   document.body.setAttribute('data-kf-ready','1');
-}).catch(function(err){console.error(err);showToast('Storage unavailable: changes may not be saved');document.body.setAttribute('data-kf-ready','error');});
+  requestPersistence('startup');
+},function(err){
+  console.error(err);
+  window.__kfStorage={ok:false,error:err&&err.message?err.message:String(err)};
+  document.body.setAttribute('data-kf-ready','error');
+  showToast('Storage unavailable: changes will not be saved');
+  showDialogWarning('Storage unavailable: KoboFlow could not open or read its database ('+db.name+'): '+window.__kfStorage.error+'. Nothing you enter will be saved. See Settings → Storage Check.');
+});
 });
 </script>
 <script>

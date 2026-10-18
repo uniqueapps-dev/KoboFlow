@@ -573,3 +573,143 @@ test('integrity: full loan life-cycle keeps cash, liability and ledger consisten
   assert.equal(end.outstanding.total, 0);
   assert.equal(end.settled, true);
 });
+
+/* ───────────── Stage 0: one cash rule (cashPosition) ───────────── */
+test('account access: cash, bank and wallet are available by default; coop, investment and anything else restricted', () => {
+  for (const k of ['cash', 'bank', 'wallet']) assert.equal(F.accountAccess({ kind: k }), 'immediate', k);
+  for (const k of ['coop', 'investment', 'savings', '', undefined]) assert.equal(F.accountAccess({ kind: k }), 'restricted', String(k));
+  assert.equal(F.accountAccess({ kind: 'bank', access: 'restricted' }), 'restricted', 'a bank-type fixed deposit can be restricted');
+  assert.equal(F.accountAccess({ kind: 'coop', access: 'immediate' }), 'immediate', 'a coop can be marked available');
+  assert.equal(F.accountAccess({ kind: 'coop', access: 'bogus' }), 'restricted', 'unknown override values fall back to the default');
+});
+
+test('cash position: restricted money is excluded from available cash but kept in the total (net worth)', () => {
+  const p = F.cashPosition([
+    { id: 'w', label: 'Wallet', kind: 'wallet', balance: 100000 },
+    { id: 'b', label: 'Bank', kind: 'bank', balance: 50000.5 },
+    { id: 'c', label: 'Coop', kind: 'coop', balance: 80000 },
+    { id: 'fd', label: 'Fixed deposit', kind: 'bank', access: 'restricted', balance: 200000 },
+    { id: 'i', label: 'Investment', kind: 'investment', balance: 10000 },
+  ], []);
+  assert.equal(p.available, 150000.5);
+  assert.equal(p.restricted, 290000);
+  assert.equal(p.total, 440000.5);
+  assert.equal(p.earmarked, 0);
+  assert.equal(p.unearmarked, 150000.5);
+  assert.deepEqual(p.overEarmarked, []);
+});
+
+test('cash position: earmarks are reported, never subtracted from balances; free money never goes negative per account', () => {
+  const accounts = [
+    { id: 'w', label: 'Wallet', kind: 'wallet', balance: 100000 },
+    { id: 'b', label: 'Bank', kind: 'bank', balance: 20000 },
+    { id: 'c', label: 'Coop', kind: 'coop', balance: 50000 },
+  ];
+  const p = F.cashPosition(accounts, [{ parentId: 'w', amount: 30000 }, { parentId: 'b', amount: 25000 }, { parentId: 'c', amount: 5000 }, { parentId: 'gone', amount: 999 }]);
+  assert.equal(p.available, 120000, 'balances unchanged by earmarks');
+  assert.equal(p.accounts.w.balance, 100000);
+  assert.equal(p.earmarked, 55000, 'earmarks in available accounts');
+  assert.equal(p.earmarkedRestricted, 5000, 'earmarks in restricted accounts reported separately');
+  assert.equal(p.unearmarked, 70000, 'wallet 70,000 free; over-earmarked bank contributes 0, not −5,000');
+  assert.deepEqual(p.overEarmarked, [{ id: 'b', label: 'Bank', balance: 20000, earmarked: 25000, shortBy: 5000 }]);
+  assert.deepEqual(accounts.map(a => a.balance), [100000, 20000, 50000], 'inputs not modified');
+});
+
+test('cash position: opening balance is used when no current balance is given; empty input is all zeros', () => {
+  assert.equal(F.cashPosition([{ id: 'w', kind: 'wallet', opening: 5000 }], []).available, 5000);
+  assert.deepEqual(F.cashPosition([], null), { available: 0, restricted: 0, total: 0, earmarked: 0, earmarkedRestricted: 0, unearmarked: 0, overEarmarked: [], accounts: {} });
+});
+
+/* ───────────── Stage 0: spending runway history window ───────────── */
+const spend = (date, amount, extra = {}) => ({ date, amount, type: 'expense', ...extra });
+const MIXED = [
+  spend('2026-10-01', 40000),
+  { date: '2026-10-02', amount: 5500, type: 'loan_repayment', alloc: { principal: 5000, interest: 400, fees: 100 } },
+  { date: '2026-10-03', amount: 20000, type: 'owner_withdrawal' },
+  { date: '2026-10-04', amount: 15000, type: 'transfer' },
+  { date: '2026-10-05', amount: 99000, type: 'income' },
+  spend('2026-10-06', 7000, { voided: true }),
+];
+
+test('spending runway: no spending records in a long enough history is unavailable (no_spending), not 999', () => {
+  const r = F.spendingRunway([{ date: '2026-10-01', amount: 50000, type: 'income' }], 500000, { today: TODAY, historyStart: '2026-06-01' });
+  assert.equal(r.known, false);
+  assert.equal(r.reason, 'no_spending');
+  assert.equal(r.historyDays, 90);
+  assert.equal(r.days, null);
+  assert.equal(r.spending, 0);
+  assert.equal(F.spendingRunway([], 500000, { today: TODAY, historyStart: '2026-06-01' }).reason, 'no_spending');
+});
+
+test('spending runway: under 30 days of history is unavailable (short_history), even with spending recorded', () => {
+  const r = F.spendingRunway([spend('2026-10-14', 1000)], 1000000, { today: TODAY, historyStart: '2026-09-17' });
+  assert.equal(r.historyDays, 29, '17 Sep to 15 Oct inclusive');
+  assert.equal(r.known, false);
+  assert.equal(r.reason, 'short_history');
+  assert.equal(r.days, null, 'no optimistic number is produced');
+  assert.equal(r.dailyBurn, null);
+  assert.equal(r.monthlyBurn, null);
+  // The old rule (÷ 90 days regardless of history) would have given 1,000,000 / (1,000 / 90) = 90,000 days.
+  const s = F.spendingRunway([], 1000000, { today: TODAY, historyStart: TODAY });
+  assert.deepEqual([s.historyDays, s.reason], [1, 'short_history'], 'baseline today: 1 day, short history takes precedence over no spending');
+  assert.equal(F.spendingRunway([], 1, { today: TODAY }).reason, 'short_history', 'no history start: treated as starting today');
+  assert.equal(F.spendingRunway([], 1, { today: TODAY, historyStart: '2026-12-01' }).historyDays, 1, 'a future start is clamped to today');
+});
+
+test('spending runway: exactly 30 days is enough; the average uses the real number of days, not 90', () => {
+  const r = F.spendingRunway([spend('2026-09-16', 3000)], 300000, { today: TODAY, historyStart: '2026-09-16' });
+  assert.equal(r.historyDays, 30);
+  assert.equal(r.known, true);
+  assert.equal(r.dailyBurn, 100, '3,000 / 30 days');
+  assert.equal(r.days, 3000, '300,000 / 100');
+});
+
+test('spending runway: sufficient history, hand-calculated; expenses + interest/fees in, withdrawals, principal, transfers, income and voided out', () => {
+  // History 1 Sep – 15 Oct inclusive = 45 days. Spending = 40,000 expense + 400 interest + 100 fees = 40,500.
+  // Daily 40,500 / 45 = 900; monthly 900 × 30 = 27,000; runway 270,000 / 900 = 300 days.
+  const r = F.spendingRunway(MIXED, 270000, { today: TODAY, historyStart: '2026-09-01' });
+  assert.equal(r.historyDays, 45);
+  assert.equal(r.windowStart, '2026-09-01');
+  assert.equal(r.spending, 40500, 'not 60,500 (withdrawal) nor 45,500 (principal) nor 47,500 (voided)');
+  assert.equal(r.dailyBurn, 900);
+  assert.equal(r.monthlyBurn, 27000);
+  assert.equal(r.days, 300);
+  assert.equal(r.reason, null);
+});
+
+test('spending runway: complete history keeps the 90-day window; entries before it or after today are not used', () => {
+  // Window 18 Jul – 15 Oct inclusive (90 days). In: 18 Jul 30,000 + 15 Oct 60,000 = 90,000 → 1,000/day.
+  const txns = [spend('2026-07-17', 500000), spend('2026-07-18', 30000), spend('2026-10-15', 60000), spend('2026-10-16', 800000)];
+  const r = F.spendingRunway(txns, 365000, { today: TODAY, historyStart: '2025-01-01' });
+  assert.equal(r.historyDays, 90);
+  assert.equal(r.windowStart, '2026-07-18');
+  assert.equal(r.spending, 90000);
+  assert.equal(r.dailyBurn, 1000);
+  assert.equal(r.monthlyBurn, 30000);
+  assert.equal(r.days, 365);
+  assert.deepEqual(txns.map(t => t.amount), [500000, 30000, 60000, 800000], 'inputs not modified');
+});
+
+/* ───────────── Stage 0: cash cover (Pressure, Calendar, Autopilot, Opportunity) ───────────── */
+test('cash cover: obligations are compared with free-to-use cash (after earmarks), each subtracted once', () => {
+  const p = F.cashPosition([
+    { id: 'w', label: 'Wallet', kind: 'wallet', balance: 100000 },
+    { id: 'b', label: 'Bank', kind: 'bank', balance: 500000 },
+    { id: 'c', label: 'Coop', kind: 'coop', balance: 80000 },
+  ], [{ parentId: 'w', amount: 30000 }]);
+  const c = F.cashCover(p, 55455);
+  assert.equal(c.cashNow, 600000, 'gross Cash Now, for display');
+  assert.equal(c.earmarked, 30000);
+  assert.equal(c.freeToUse, 570000, 'Cash Now less earmarks; restricted coop not included');
+  assert.equal(c.due, 55455);
+  assert.equal(c.leftAfter, 514545, '570,000 − 55,455: earmark and obligation each subtracted once');
+  assert.equal(c.pressure, 10, 'round(55,455 / 570,000 × 100)');
+});
+
+test('cash cover: shortfall is negative; no free cash gives full pressure only when something is due', () => {
+  const p = F.cashPosition([{ id: 'w', kind: 'wallet', balance: 20000 }], [{ parentId: 'w', amount: 20000 }]);
+  assert.deepEqual(F.cashCover(p, 5000), { cashNow: 20000, earmarked: 20000, freeToUse: 0, due: 5000, leftAfter: -5000, pressure: 100 });
+  assert.equal(F.cashCover(p, 0).pressure, 0, 'nothing due: no pressure');
+  assert.equal(F.cashCover(F.cashPosition([{ id: 'w', kind: 'wallet', balance: 1000 }], []), 4000).pressure, 100, 'capped at 100');
+  assert.equal(F.cashCover(F.cashPosition([{ id: 'w', kind: 'wallet', balance: 1000.10 }], []), 0.20).leftAfter, 999.9, 'kobo-exact');
+});

@@ -11,6 +11,12 @@ const path = require('path');
 const { execFileSync } = require('child_process');
 const crypto = require('crypto');
 
+// Hermetic runs. context.route() does not see requests made BY a service worker unless this
+// Playwright switch is on. Without it, the app's workers fetched Google Fonts from the real
+// internet during the tests and cached them; whenever those downloads finished before the cache
+// assertions, "test cache holds only test files" failed (the intermittent 116/117 failure).
+process.env.PW_EXPERIMENTAL_SERVICE_WORKER_NETWORK_EVENTS = '1';
+
 const ROOT = path.join(__dirname, '..');
 const gen = require('../scripts/build-test-file.js');
 const sha256 = b => crypto.createHash('sha256').update(b).digest('hex');
@@ -150,7 +156,9 @@ async function openControlled(page, p) {
   assert.ok(await page.evaluate(() => !!navigator.serviceWorker.controller), p + ' is controlled by a service worker');
 }
 const cacheKeys = page => page.evaluate(() => caches.keys());
-const cacheUrls = (page, name) => page.evaluate(n => caches.open(n).then(c => c.keys()).then(k => k.map(r => new URL(r.url).pathname).sort()), name);
+// Same-origin entries as paths; anything from another origin keeps its full URL, so it can never
+// pass a path check by accident and is shown in full when an assertion fails.
+const cacheUrls = (page, name) => page.evaluate(n => caches.open(n).then(c => c.keys()).then(k => k.map(r => { const u = new URL(r.url); return u.origin === location.origin ? u.pathname : u.href; }).sort()), name);
 const until = async (fn, what, ms = 15000) => { const end = Date.now() + ms; while (Date.now() < end) { if (await fn()) return; await new Promise(r => setTimeout(r, 100)); } throw new Error('timed out: ' + what); };
 
 test('production and TEST install separate workers and caches, both work offline, other apps\' caches are untouched', { skip }, async () => {
@@ -175,9 +183,9 @@ test('production and TEST install separate workers and caches, both work offline
   assert.ok(keys.includes('pbsrx-phoenix-v7.6.7-RC3.9.4A') && keys.includes('some-other-app-v1'), 'unrelated caches preserved: ' + keys);
   const prodUrls = await cacheUrls(page, 'koboflow-prod-3.2.0');
   assert.ok(['/KoboFlow/', '/KoboFlow/index.html', '/KoboFlow/manifest.json', '/KoboFlow/icons/icon-192.png', '/KoboFlow/icons/icon-512.png'].every(u => prodUrls.includes(u)), 'production shell cached: ' + prodUrls);
-  assert.ok(prodUrls.every(u => u.startsWith('/KoboFlow/')), 'production cache holds only production files');
+  assert.ok(prodUrls.every(u => u.startsWith('/KoboFlow/')), 'production cache holds only production files: ' + prodUrls);
   const testUrls = await cacheUrls(page, 'koboflow-test-3.2.0');
-  assert.ok(testUrls.every(u => u.startsWith('/koboflow-test/')), 'test cache holds only test files');
+  assert.ok(testUrls.every(u => u.startsWith('/koboflow-test/')), 'test cache holds only test files: ' + testUrls);
   assert.ok(['/koboflow-test/index.html', '/koboflow-test/test-manifest.json', '/koboflow-test/icons/test-icon-512.png'].every(u => testUrls.includes(u)));
 
   // Offline: both apps still open from their own caches.
@@ -256,5 +264,23 @@ test('a new production version replaces only the old production cache', { skip }
     await context.setOffline(false);
   } finally { prodVersion = null; }
   assert.deepEqual(page.errors, []);
+  await context.close();
+});
+
+// Regression test for the intermittent failure: no request may leave the test machine, including
+// requests made by the service workers themselves, so cache contents cannot depend on network timing.
+test('service-worker traffic is routed too: nothing reaches the internet and caches hold no foreign entries', { skip }, async () => {
+  const { context, page } = await ctx();
+  const external = [];
+  context.on('request', r => { if (!r.url().startsWith(base) && /^https?:/.test(r.url())) external.push((r.serviceWorker() ? 'worker ' : 'page ') + new URL(r.url()).host); });
+  for (const p of ['/KoboFlow/', '/koboflow-test/']) await openControlled(page, p);
+  const via = await page.evaluate(() => fetch('https://fonts.gstatic.com/s/kf-probe.woff2', { mode: 'no-cors' }).then(() => 'reached', () => 'blocked'));
+  assert.equal(via, 'blocked', 'a fetch handled by the TEST service worker cannot reach the internet');
+  await new Promise(r => setTimeout(r, 2000)); // give any stray download time to land
+  for (const name of ['koboflow-prod-3.2.0', 'koboflow-test-3.2.0']) {
+    const urls = await cacheUrls(page, name);
+    assert.ok(urls.length > 0 && urls.every(u => u.startsWith('/')), name + ' holds only same-origin entries: ' + urls);
+  }
+  assert.ok(external.some(e => e.startsWith('worker ')), 'worker requests are visible to the router (the switch is active): ' + external);
   await context.close();
 });

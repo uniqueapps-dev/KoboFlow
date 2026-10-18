@@ -428,6 +428,14 @@ test('live setup: Opay as primary, real opening balances, earmarks not double-co
   assert.equal(await page.isVisible('#setup-confirm-btn'), false, 'no confirmation offered for an invalid setup');
   assert.equal(await page.isVisible('#setup-modal.open'), true);
   await page.click('[data-close="setup-modal"]');
+  // Closing does not silently discard the edits: reopening shows them, marked unsaved.
+  await page.click('#setup-open-btn');
+  assert.match(await page.textContent('#setup-unsaved-note'), /Unsaved changes\. These edits from earlier have NOT been saved/);
+  assert.equal(await page.inputValue('#setup-baseline'), baseline);
+  await page.click('#setup-discard-btn'); // explicit choice to start again from the saved state
+  assert.equal(await page.isVisible('#setup-unsaved-note'), false);
+  assert.equal(await page.$$eval('#setup-accounts [data-acct-row]', r => r.length), 1, 'discard shows the saved (default) setup');
+  await page.click('[data-close="setup-modal"]');
 
   await fillSetup(page, { baseline });
   assert.match(await page.textContent('#setup-preview'), /before the baseline/);
