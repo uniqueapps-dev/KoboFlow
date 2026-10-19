@@ -109,7 +109,9 @@ test('guard refuses the live database through instance, prototype, coerced and r
       coercedObject: t(() => indexedDB.open({ toString() { return 'KoboFlowDB'; } })),
     };
     // A name object that changes value between reads: the guard reads it once and passes that exact string on.
-    let n = 0; const flip = { toString() { return n++ === 0 ? 'kf-probe-flip' : 'KoboFlowDB'; } };
+    // (The first value must be inside the allowlisted test namespace; any other name is now refused outright.)
+    let n = 0; const flip = { toString() { return n++ === 0 ? 'KoboFlowDB-test-pre-v4-probe-flip' : 'KoboFlowDB'; } };
+    out.outsideNamespace = t(() => indexedDB.open('kf-probe-flip'));
     out.flipping = await new Promise(res => { try { const q = indexedDB.open(flip); q.onsuccess = () => { const name = q.result.name; q.result.close(); res(name); }; q.onerror = () => res('error'); } catch (e) { res('refused'); } });
     // The patched methods cannot be replaced or redefined.
     const before = IDBFactory.prototype.open;
@@ -121,7 +123,8 @@ test('guard refuses the live database through instance, prototype, coerced and r
     return out;
   });
   assert.deepEqual(r, { instanceOpen: 'refused', protoOpenCall: 'refused', reflectApply: 'refused', protoDelete: 'refused', instanceDelete: 'refused', coercedObject: 'refused',
-    flipping: 'kf-probe-flip', reassignBlocked: true, redefineBlocked: true, afterReassign: 'refused', listed: ['KoboFlowDB-test', 'kf-probe-flip'].filter(x => r.listed.includes(x)) });
+    flipping: 'KoboFlowDB-test-pre-v4-probe-flip', outsideNamespace: 'refused', reassignBlocked: true, redefineBlocked: true, afterReassign: 'refused',
+    listed: ['KoboFlowDB-test', 'KoboFlowDB-test-pre-v4-probe-flip'].filter(x => r.listed.includes(x)) });
   assert.ok(!r.listed.includes('KoboFlowDB'));
   // The app's own operations still work under the guard.
   await page.fill('#capture-input', '2500 fuel fjr');
@@ -192,6 +195,49 @@ test('review bypass: a blank iframe reached through window.frames[n] cannot open
   assert.deepEqual(r, { refused: 'KoboFlow TEST build: refused to create a frame (frames are not allowed in the test build)', frames: 0 });
   assert.ok(!(await realDatabases(context)).includes('KoboFlowDB'), 'live database never created');
   await context.close();
+});
+
+test('fencedframe and portal elements are refused on every creation and insertion route, like other frames', { skip }, async () => {
+  const { context, page } = await ctx();
+  assert.equal(await openApp(page), '1');
+  const r = await page.evaluate(async () => {
+    const out = {};
+    const t = async (k, f) => { try { await f(); out[k] = 'ALLOWED'; } catch (e) { out[k] = /^KoboFlow TEST build: refused/.test(e.message) ? 'refused' : 'other error: ' + e.message; } };
+    const div = () => document.body.appendChild(document.createElement('div'));
+    for (const tag of ['fencedframe', 'portal']) {
+      const T = tag.toUpperCase(), mixed = tag[0].toUpperCase() + tag.slice(1);
+      await t(tag + ' createElement', () => document.createElement(tag));
+      await t(tag + ' createElement upper', () => document.createElement(T));
+      await t(tag + ' createElementNS', () => document.createElementNS('http://www.w3.org/1999/xhtml', mixed));
+      await t(tag + ' createElementNS prefixed', () => document.createElementNS('http://www.w3.org/1999/xhtml', 'h:' + tag));
+      await t(tag + ' innerHTML', () => { div().innerHTML = '<' + T + '></' + T + '>'; });
+      await t(tag + ' outerHTML', () => { div().outerHTML = '<' + tag + '></' + tag + '>'; });
+      await t(tag + ' insertAdjacentHTML', () => document.body.insertAdjacentHTML('beforeend', '<' + tag + '>'));
+      await t(tag + ' DOMParser', () => new DOMParser().parseFromString('<' + tag + '></' + tag + '>', 'text/html'));
+      await t(tag + ' createContextualFragment', () => document.createRange().createContextualFragment('<' + tag + '></' + tag + '>'));
+      await t(tag + ' template', () => { document.createElement('template').innerHTML = '<' + tag + '></' + tag + '>'; });
+      await t(tag + ' closed shadow root', () => { div().attachShadow({ mode: 'closed' }).innerHTML = '<' + tag + '></' + tag + '>'; });
+      await t(tag + ' setHTMLUnsafe', () => div().setHTMLUnsafe('<div><template shadowrootmode="open"><' + tag + '></' + tag + '></template></div>'));
+      await t(tag + ' document.write', () => document.write('<' + tag + '></' + tag + '>'));
+      await t(tag + ' customized built-in', () => { class X extends HTMLElement {} customElements.define('x-kf-' + tag, X, { extends: tag }); });
+    }
+    out.present = document.querySelectorAll('fencedframe,portal').length;
+    out.frames = window.frames.length;
+    out.testDb = await new Promise(ok => { const q = indexedDB.open('KoboFlowDB-test'); q.onsuccess = () => { q.result.close(); ok('opens'); }; q.onerror = () => ok('error'); });
+    return out;
+  });
+  const routes = ['createElement', 'createElement upper', 'createElementNS', 'createElementNS prefixed', 'innerHTML', 'outerHTML', 'insertAdjacentHTML', 'DOMParser', 'createContextualFragment', 'template', 'closed shadow root', 'setHTMLUnsafe', 'document.write', 'customized built-in'];
+  for (const tag of ['fencedframe', 'portal']) for (const k of routes) assert.equal(r[tag + ' ' + k], 'refused', tag + ' ' + k);
+  assert.equal(r.present, 0, 'no fencedframe or portal element exists in the page');
+  assert.equal(r.frames, 0);
+  assert.equal(r.testDb, 'opens');
+  assert.deepEqual(page.errors, []);
+  await context.close();
+});
+
+test('the generated test build lists fencedframe and portal in all three frame checks', () => {
+  const testHtml = fs.readFileSync(path.join(ROOT, 'koboflow-test.html'), 'utf8');
+  assert.match(testHtml, /var FRAME_TAG = \/\^\(iframe\|frame\|frameset\|object\|embed\|fencedframe\|portal\)\$\/i, FRAME_MARKUP = \/<\(i\?frame\|object\|embed\|fencedframe\|portal\)\/i, FRAME_SEL = 'iframe,frame,frameset,object,embed,fencedframe,portal';/);
 });
 
 test('every frame, popup and worker route is refused, the guard cannot be replaced, and KoboFlowDB-test still works', { skip }, async () => {

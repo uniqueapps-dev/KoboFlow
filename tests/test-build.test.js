@@ -243,3 +243,77 @@ test('the test build cannot open, delete or even list production\'s pre-upgrade 
   assert.deepEqual(still, [{ id: 1, amount: 5 }], 'the production copy is untouched');
   await context.close();
 });
+
+/* ───────────── Allowlist: only the test database and its own pre-upgrade copies ───────────── */
+const ALLOWED = ['KoboFlowDB-test', 'KoboFlowDB-test-pre-v4-20261019080000', 'KoboFlowDB-test-pre-v4-20261019080000-2'];
+const REJECTED = [
+  'KoboFlowDB', 'KoboFlowDB-pre-v4-20261019080000', 'KoboFlowDB-pre-v4-20261019080000-2', // production and its copies
+  'KoboFlowDB-restore', 'KoboFlowDB-xyz', 'pbsrx_v2', 'other-app',                         // other production databases, other apps
+  'koboflowdb-test', 'KOBOFLOWDB-TEST', ' KoboFlowDB-test', 'KoboFlowDB-test ', 'KoboFlowDB-test2', // near misses
+  'KoboFlowDB-testX', 'KoboFlowDB-test-pre-v4', 'KoboFlowDB-test-pre-v3-1', 'KoboFlowDB-test-backup', 'xKoboFlowDB-test', '',
+];
+test('test build allowlist: only KoboFlowDB-test and KoboFlowDB-test-pre-v4-* can be opened, deleted or listed', { skip }, async () => {
+  const { context, page } = await ctxPage();
+  // Every rejected name is first created from a neutral page on the same origin, so a refusal is a refusal, not "missing".
+  await page.goto(base + '/blank');
+  await page.evaluate(names => Promise.all(names.filter(Boolean).map(n => new Promise(res => { const q = indexedDB.open(n, 1); q.onupgradeneeded = () => q.result.createObjectStore('keep', { keyPath: 'id' }).put({ id: 'sentinel', name: n }); q.onsuccess = () => { q.result.close(); res(); }; q.onerror = () => res(); }))), REJECTED);
+  await page.goto(base + '/koboflow-test.html');
+  await page.waitForSelector('body[data-kf-ready="1"]');
+  const r = await page.evaluate(({ allowed, rejected }) => {
+    const tryOp = (fn) => { try { fn(); return 'allowed'; } catch (e) { return e.message; } };
+    const out = { allowed: {}, rejected: {}, coerced: {} };
+    for (const n of allowed) out.allowed[n] = { open: tryOp(() => { const q = indexedDB.open(n); q.onsuccess = () => q.result.close(); }), del: n === 'KoboFlowDB-test' ? 'skipped (in use)' : tryOp(() => indexedDB.deleteDatabase(n)) };
+    for (const n of rejected) out.rejected[n] = { open: tryOp(() => indexedDB.open(n)), openV: tryOp(() => indexedDB.open(n, 99)), del: tryOp(() => indexedDB.deleteDatabase(n)), proto: tryOp(() => IDBFactory.prototype.open.call(indexedDB, n)) };
+    // Names that only become a production name when converted to text.
+    out.coerced.obj = tryOp(() => indexedDB.open({ toString: () => 'KoboFlowDB-restore' }));
+    out.coerced.arr = tryOp(() => indexedDB.open(['KoboFlowDB-xyz']));
+    let calls = 0; out.coerced.flip = tryOp(() => indexedDB.open({ toString: () => (calls++ ? 'KoboFlowDB-xyz' : 'KoboFlowDB-test') }));
+    out.flipCalls = calls;
+    return out;
+  }, { allowed: ALLOWED, rejected: REJECTED });
+  for (const n of ALLOWED) { assert.equal(r.allowed[n].open, 'allowed', n); assert.ok(['allowed', 'skipped (in use)'].includes(r.allowed[n].del), n); }
+  for (const n of REJECTED) for (const op of ['open', 'openV', 'del', 'proto']) assert.match(r.rejected[n][op], /KoboFlow TEST build: refused to (open|delete) (the live database or its safety copy|a database outside the test namespace \(only KoboFlowDB-test and its pre-upgrade copies\))/, `${op} "${n}"`);
+  assert.match(r.rejected['KoboFlowDB-restore'].open, /outside the test namespace/);
+  assert.match(r.rejected.KoboFlowDB.open, /the live database or its safety copy/);
+  assert.match(r.coerced.obj, /outside the test namespace/);
+  assert.match(r.coerced.arr, /outside the test namespace/);
+  assert.equal(r.coerced.flip, 'allowed', 'the name is converted once and that exact text is used');
+  assert.equal(r.flipCalls, 1);
+  // Listing shows only the test namespace.
+  const listed = await page.evaluate(() => indexedDB.databases().then(d => d.map(x => x.name).sort()));
+  assert.ok(listed.length > 0 && listed.every(n => n === 'KoboFlowDB-test' || n.startsWith('KoboFlowDB-test-pre-v4-')), listed.join(', '));
+  // Nothing rejected was deleted or changed.
+  await page.goto(base + '/blank');
+  const still = await page.evaluate(names => Promise.all(names.filter(Boolean).map(n => new Promise(res => { const q = indexedDB.open(n); q.onsuccess = () => { const g = q.result.transaction('keep').objectStore('keep').get('sentinel'); g.onsuccess = () => { q.result.close(); res(g.result && g.result.name === n); }; }; q.onerror = () => res(false); }))), REJECTED);
+  assert.ok(still.every(Boolean), 'every rejected database is untouched');
+  // And the app itself still works in its namespace.
+  await page.goto(base + '/koboflow-test.html');
+  await page.waitForSelector('body[data-kf-ready="1"]');
+  assert.equal(await page.evaluate(() => window.__kfDbName), 'KoboFlowDB-test');
+  await context.close();
+});
+
+test('test build allowlist is in the generated file, with production\'s own name used only for its message', () => {
+  const html = fs.readFileSync(TEST_FILE, 'utf8');
+  assert.match(html, /var LIVE = "KoboFlowDB", OWN = "KoboFlowDB-test";\n  function allowed\(n\)\{ return n === OWN \|\| n\.indexOf\(OWN \+ '-pre-v4-'\) === 0; \}/);
+  assert.match(html, /if \(!allowed\(n\)\) refuse\(/);
+  assert.match(html, /return d\.filter\(function\(x\)\{ return allowed\(String\(x\.name\)\); \}\);/);
+});
+
+test('under the allowlist the test build still upgrades its own v3 database, with its own verified copy listed', { skip }, async () => {
+  const { context, page } = await ctxPage();
+  await page.goto(base + '/blank');
+  await page.evaluate(() => new Promise(res => { const q = indexedDB.open('KoboFlowDB-test', 3); q.onupgradeneeded = () => { const d = q.result; d.createObjectStore('transactions', { keyPath: 'id', autoIncrement: true }).put({ id: 1, amount: 2500, desc: 'Fictional v3 entry', cat: 'Food', type: 'expense', state: 'Linked', date: '2026-10-01', time: '09:00', fromAcct: '', toAcct: '' }); d.createObjectStore('meta', { keyPath: 'id' }); }; q.onsuccess = () => { q.result.close(); res(); }; }));
+  await page.goto(base + '/koboflow-test.html');
+  await page.waitForSelector('body[data-kf-ready="1"]');
+  const dbs = await page.evaluate(() => indexedDB.databases().then(d => d.map(x => [x.name, x.version]).sort()));
+  assert.equal(dbs.find(d => d[0] === 'KoboFlowDB-test')[1], 4);
+  const copy = dbs.find(d => /^KoboFlowDB-test-pre-v4-\d{14}$/.test(d[0]));
+  assert.ok(copy, 'own copy made: ' + JSON.stringify(dbs));
+  assert.equal(copy[1], 3);
+  await page.click('#settings-nav-btn'); await page.click('#storage-check-btn');
+  await page.waitForFunction(() => /safety copies/.test(document.getElementById('storage-check-out').textContent));
+  assert.equal(await page.getAttribute(`[data-copy="${copy[0]}"]`, 'data-copy-status'), 'verified');
+  assert.doesNotMatch(await page.textContent('#storage-check-out'), /\?db=/, 'no ?db= advice in the test build');
+  await context.close();
+});
