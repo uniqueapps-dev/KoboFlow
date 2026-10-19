@@ -76,6 +76,13 @@ test('service workers use separate exact cache prefixes and one version source',
   assert.doesNotMatch(testHtml, /\.\/sw\.js|\.\/manifest\.json|icons\/icon-\d+\.png/, 'test page references no production PWA file');
 });
 
+test('the TEST service worker describes its own testing origin, not production\'s shared origin; production sw.js is unchanged', () => {
+  const sw = Object.fromEntries(gen.buildTestSite())['test-sw.js'].toString();
+  assert.doesNotMatch(sw, /uniqueapps-dev/, 'no production origin named in the TEST worker');
+  assert.match(sw, /Isolation rules — this TEST worker is intended to be served from its own testing origin,\n   separate from production\./);
+  assert.match(fs.readFileSync(path.join(ROOT, 'sw.js'), 'utf8'), /Isolation rules — several apps share the uniqueapps-dev\.github\.io origin and\n   therefore share one CacheStorage:/, 'production comment kept');
+});
+
 test('test-site build is reproducible and traceable to its source commit', () => {
   const a = gen.buildTestSite(), b = gen.buildTestSite();
   assert.deepEqual(a.map(([p, buf]) => [p, sha256(buf)]), b.map(([p, buf]) => [p, sha256(buf)]), 'same source → same bytes');
