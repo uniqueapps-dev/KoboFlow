@@ -314,6 +314,40 @@
     });
   }
 
+  /* Like atomic(), but first checks, inside the same transaction, that each record still
+     equals what the caller last read: checks = [{store, key, expect: JSON text}]. If any
+     record differs (changed in another tab, say), nothing is written and the promise
+     rejects with err.code = 'changed'. */
+  function atomicIf(checks, ops) {
+    return new Promise(function(resolve, reject) {
+      openDB(function(database) {
+        if (!database) { reject(_err || new Error('Storage unavailable')); return; }
+        var names = [], stale = null, left = checks.length;
+        checks.concat(ops).forEach(function(o){ if (names.indexOf(o.store) < 0) names.push(o.store); });
+        try {
+          var tx = database.transaction(names, 'readwrite');
+          var writeAll = function() { ops.forEach(function(o){ tx.objectStore(o.store).put(o.put); }); };
+          tx.oncomplete = function(){ resolve(true); };
+          tx.onerror = tx.onabort = function(){ reject(stale || tx.error || new Error('Save failed')); };
+          if (!left) { writeAll(); return; }
+          checks.forEach(function(c){
+            var r = tx.objectStore(c.store).get(c.key);
+            r.onsuccess = function(){
+              if (stale) return;
+              if (JSON.stringify(r.result) !== c.expect) {
+                stale = new Error('it was changed elsewhere (for example in another tab) after you opened it');
+                stale.code = 'changed';
+                try { tx.abort(); } catch (x) {}
+                return;
+              }
+              if (--left === 0) { try { writeAll(); } catch (err) { stale = err; try { tx.abort(); } catch (x) {} } }
+            };
+          });
+        } catch(err) { reject(err); }
+      });
+    });
+  }
+
   /* Reads a pre-upgrade copy for download. Never creates or changes a database. */
   function readCopy(name) {
     return new Promise(function(resolve, reject) {
@@ -355,6 +389,7 @@
     var self = this;
     STORES.concat(Object.keys(V3_STORES), Object.keys(V4_STORES)).forEach(function(n){ self[n] = makeTable(n); });
     this.atomic  = atomic;
+    this.atomicIf= atomicIf;
     this.info    = info;
     this.snapshot= snapshot;
     this.readCopy= readCopy;
@@ -1628,6 +1663,7 @@ button{cursor:pointer;}
 .btn-row button.danger{background:var(--reddim);border-color:var(--red);color:var(--red);}
 .btn-row button:disabled{opacity:.4;}
 .tl-item.voided{opacity:.45;}
+.act-edit{background:var(--surf2);color:var(--amber);border:1px solid var(--border);margin-left:6px;}
 .tl-item.voided .tl-desc{text-decoration:line-through;}
 .form-err{background:var(--reddim);border:1px solid var(--red);color:var(--red);border-radius:8px;padding:8px 10px;font-size:11px;margin:6px 0;line-height:1.5;}
 .form-warn{background:var(--amberdim);border:1px solid var(--amber);color:var(--amber);border-radius:8px;padding:8px 10px;font-size:11px;margin:6px 0;line-height:1.5;}
@@ -2204,6 +2240,31 @@ body.kf-live .sample-tag{display:inline-block;}
     </div>
   </div>
 
+  <div class="modal-overlay" id="edit-modal">
+    <div class="modal-box">
+      <div class="modal-head"><div class="modal-title">EDIT ENTRY</div><button class="modal-close" id="edit-close-btn" aria-label="Close without saving">&#215;</button></div>
+      <div id="edit-note"></div>
+      <div class="form-group"><label>Type</label><select id="edit-type" class="form-input"></select></div>
+      <div class="grid2" style="margin-bottom:0;">
+        <div class="form-group"><label>Amount (&#8358;)</label><input id="edit-amount" class="form-input" type="number" inputmode="decimal" min="0" step="0.01"/></div>
+        <div class="form-group"><label>Category</label><select id="edit-cat" class="form-input"></select></div>
+      </div>
+      <div class="form-group"><label>Description</label><input id="edit-desc" class="form-input" type="text"/></div>
+      <div class="grid2" style="margin-bottom:0;">
+        <div class="form-group"><label>Date</label><input id="edit-date" class="form-input" type="date"/></div>
+        <div class="form-group"><label>Time</label><input id="edit-time" class="form-input" type="time"/></div>
+      </div>
+      <div class="grid2" style="margin-bottom:0;">
+        <div class="form-group"><label>From account</label><select id="edit-from" class="form-input"></select></div>
+        <div class="form-group"><label>To account</label><select id="edit-to" class="form-input"></select></div>
+      </div>
+      <div class="hint" id="edit-acct-hint"></div>
+      <div id="edit-msg"></div>
+      <button class="modal-save" id="edit-save-btn">SAVE CHANGES</button>
+      <button class="modal-save" id="edit-cancel-btn" style="background:var(--surf2);color:var(--text);margin-top:8px;">CANCEL</button>
+    </div>
+  </div>
+
   <div class="modal-overlay" id="agr-modal">
     <div class="modal-box">
       <div class="modal-head"><div class="modal-title" id="agr-modal-title">NEW AGREEMENT</div><button class="modal-close" data-close="agr-modal">&#215;</button></div>
@@ -2643,6 +2704,8 @@ function renderInbox(){
     var icCls='inbox-icon'+(isIn(i.type)?' income':i.type==='transfer'?' transfer':i.type==='owner_withdrawal'?' owner_withdrawal':'');
     var icCh=isIn(i.type)?'+':i.type==='transfer'?'~':i.type==='owner_withdrawal'?'v':'-';
     var acts=i.state==='Needs Review'?'<div class="action-btns"><button class="act-btn act-approve" data-approve="'+esc(i.id)+'">OK</button><button class="act-btn act-dismiss" data-dismiss="'+esc(i.id)+'">X</button></div>':'';
+    var edit=editRule(i).ok?'<button class="act-btn act-edit" data-edit-txn="'+esc(i.id)+'" aria-label="Edit this entry">EDIT</button>':i.agreementId&&!i.voided&&!i.demo?'<button class="act-btn act-edit" data-dir-open-agr="'+esc(i.agreementId)+'" aria-label="Open its loan agreement">LOAN</button>':'';
+    if(edit)acts+='<div class="action-btns">'+edit+'</div>';
     // An uncertain spending entry can be given its real category (e.g. which vehicle the fuel was for).
     var fix=i.state==='Needs Review'&&(i.type==='expense'||i.type==='obligation')?'<div class="reclass-row" style="display:flex;gap:6px;margin-top:6px;"><select class="form-input" data-reclass-sel="'+esc(i.id)+'" aria-label="Correct category" style="padding:6px;font-size:12px;"><option value="">Correct the category&hellip;</option>'
       +budgetCats().map(function(c){return'<option>'+esc(c)+'</option>';}).join('')+'</select><button class="act-btn act-approve" data-reclass="'+esc(i.id)+'">SAVE</button></div>':'';
@@ -2877,8 +2940,8 @@ function newTxnId(){return nextId++;}
    Memory is only updated after the write succeeds, so a failed save changes nothing. */
 var BILLS=[];
 var STORE_ARR={bills:function(){return BILLS;},agreements:function(){return AGR;},instalments:function(){return INST;},allocations:function(){return ALLOC;},agreementEvents:function(){return EVENTS;},opportunities:function(){return OPPS;}};
-function commit(ops){
-  return db.atomic(ops).then(function(){
+function commit(ops,checks){
+  return (checks?db.atomicIf(checks,ops):db.atomic(ops)).then(function(){
     // The write is durable from here on. A failure while updating the screen must not be
     // reported as a failed save: that would invite a retry and a duplicate record.
     try{
@@ -4011,7 +4074,10 @@ function renderTimeline(){
       var ac=(i.fromAcct||i.toAcct)?' &middot; '+(i.fromAcct?esc(acctLabel(i.fromAcct)):'')+(i.toAcct?' &gt; '+esc(acctLabel(i.toAcct)):''):'';
       var amtc='tl-amount'+(isIn(i.type)?' income':i.type==='transfer'?' transfer':i.type==='owner_withdrawal'?' owner_withdrawal':i.type==='investment'?' investment':'');
       var note=i.voided?' &middot; REVERSED':i.type==='loan_repayment'&&i.alloc?' &middot; P '+fmt(i.alloc.principal||0)+' / I+F '+fmt((i.alloc.interest||0)+(i.alloc.fees||0)):'';
-      return'<div class="tl-item'+(i.voided?' voided':'')+'"'+(i.agreementId?' data-open-agr="'+esc(i.agreementId)+'" style="cursor:pointer;"':'')+'><div class="tl-dot '+cls(i.type)+'"></div><div class="tl-body"><div class="tl-desc">'+esc(i.desc)+'</div><div class="tl-meta">'+esc(i.time)+' &middot; '+esc(i.cat)+ac+note+(i.demo?' &middot; sample':'')+'</div></div><div class="'+amtc+'">'+txSign(i)+fmt(i.amount)+'</div></div>';
+      // A saved entry that can be edited opens the edit form on tap; loan entries open their agreement.
+      var ed=editRule(i).ok,open=i.agreementId?' data-open-agr="'+esc(i.agreementId)+'" style="cursor:pointer;"':ed?' data-edit-txn="'+esc(i.id)+'" style="cursor:pointer;"':'';
+      var hint=i.agreementId&&!i.voided?' &middot; tap to open the loan':'';
+      return'<div class="tl-item'+(i.voided?' voided':'')+'"'+open+'><div class="tl-dot '+cls(i.type)+'"></div><div class="tl-body"><div class="tl-desc">'+esc(i.desc)+'</div><div class="tl-meta">'+esc(i.time)+' &middot; '+esc(i.cat)+ac+note+hint+(i.demo?' &middot; sample':'')+'</div></div><div class="'+amtc+'">'+txSign(i)+fmt(i.amount)+'</div>'+(ed?'<button class="act-btn act-edit" data-edit-txn="'+esc(i.id)+'" aria-label="Edit this entry">EDIT</button>':'')+'</div>';
     }).join('');
     return'<div class="tl-day-header"><div class="tl-day-label">'+dateLabel(date).toUpperCase()+'</div><div class="tl-day-net" style="color:'+nc+';">Net income less spending: '+(dn>=0?'+':'-')+fmt(Math.abs(dn))+'</div></div>'+rows;
   }).join('');
@@ -4570,7 +4636,8 @@ function txSig(t){return[t.date,t.time,t.amount,t.type,t.desc,t.fromAcct||'',t.t
 function planImport(data){
   var rep={added:{},skipped:0,conflicts:0,rejected:0,notes:[]},ops=[];
   function add(store,rec){ops.push({store:store,put:rec});rep.added[store]=(rep.added[store]||0)+1;}
-  var sigs={};items.forEach(function(t){sigs[txSig(t)]=true;});
+  // An edited entry also claims its earlier signatures, so an older backup cannot bring the pre-edit version back.
+  var sigs={};items.forEach(function(t){sigs[txSig(t)]=true;(t.edits||[]).forEach(function(e){if(e&&e.prevSig)sigs[e.prevSig]=true;});});
   var ids={};items.forEach(function(t){ids[t.id]=t;});
   var isV3=data&&typeof data.version==='string'&&parseFloat(data.version)>=3;
   var txs=(data&&Array.isArray(data.transactions))?data.transactions:null;
@@ -4724,6 +4791,7 @@ function reclassify(idAttr,cat){
   saveEntry(n,'Category correction','The entry keeps its previous category. Try again.').then(function(){delete statePending[idAttr];});
 }
 if(il2)il2.addEventListener('click',function(e){
+  var et=e.target.closest('[data-edit-txn]');if(et){openEdit(et.getAttribute('data-edit-txn'));return;}
   var rc=e.target.closest('[data-reclass]');
   if(rc){var id=rc.getAttribute('data-reclass'),sel=document.querySelector('[data-reclass-sel="'+(window.CSS&&CSS.escape?CSS.escape(id):id)+'"]');if(!sel||!sel.value){showToast('Choose the correct category first.');return;}reclassify(id,sel.value);return;}
   var ab=e.target.closest('[data-approve]'),db2=e.target.closest('[data-dismiss]');
@@ -4822,6 +4890,142 @@ qs('modal-save-btn').addEventListener('click',function(){
     showToast('Entry saved');
   });
 });
+
+/* ── Editing a saved entry ──
+   An edit changes the original record in place: same id, no second record, so nothing is
+   counted twice. Balances, cash, free cash, reports and bills are recalculated from the entries,
+   so they follow the edit. The record keeps a list of its changes (edits[]) with its previous
+   import signature, so re-importing an older backup cannot bring the old version back as a
+   duplicate. Loan-agreement entries are not edited here: the agreement keeps its own copy of
+   them (split, schedule), so they are corrected in Loans. The write only happens if the stored
+   record is still exactly the one the form was opened with. */
+var EDIT_TYPES=['expense','income','transfer','owner_withdrawal','investment','capital_injection','obligation'];
+var EDIT_TYPE_NAMES={expense:'Expense',income:'Income',transfer:'Transfer',owner_withdrawal:'Owner withdrawal',investment:'Investment',capital_injection:'Capital injection',obligation:'Bill paid',loan_receipt:'Loan received (not linked yet)'};
+var EDIT_FIELDS=['type','amount','desc','cat','date','time','fromAcct','toAcct'];
+var EDIT_FIELD_NAMES={type:'Type',amount:'Amount',desc:'Description',cat:'Category',date:'Date',time:'Time',fromAcct:'From',toAcct:'To'};
+// Which accounts each type uses: [from, to], each 'req' (required), 'opt' (optional) or 'no' (must be empty).
+var EDIT_ACCTS={expense:['req','no'],obligation:['req','no'],income:['no','req'],loan_receipt:['no','req'],transfer:['req','req'],owner_withdrawal:['req','opt'],investment:['req','opt'],capital_injection:['opt','req']};
+var EDIT_ACCT_HINT={expense:'Money leaves the From account. Leave To empty.',obligation:'Money leaves the From account. Leave To empty.',income:'Money arrives in the To account. Leave From empty.',loan_receipt:'Money arrives in the To account. Leave From empty.',transfer:'Money moves between two of your accounts: choose both. They must be different.',owner_withdrawal:'Money leaves the From account. To (your personal account) is optional.',investment:'Money leaves the From account. To (for example a fixed deposit) is optional.',capital_injection:'Money arrives in the To account. From (for example your personal account) is optional.'};
+var editCtx=null;
+// full: also look up the bill date (only when the form opens; lists only need to know an entry is editable).
+function editRule(t,full){
+  if(!t)return{ok:false,why:'This entry no longer exists.'};
+  if(t.demo)return{ok:false,why:'This is a sample entry. Samples are not saved, so they cannot be edited.'};
+  if(t.voided)return{ok:false,why:'This entry was reversed. Reversed entries are kept unchanged as history.'};
+  if(t.agreementId||t.type==='loan_repayment')return{ok:false,loan:!!t.agreementId,why:'This entry belongs to a loan agreement, which keeps its own record of it (the repayment split and the schedule). Correct or reverse it from the agreement in Loans, so the loan balance stays right.'};
+  if(t.type==='loan_receipt')return{ok:true,lockType:true,lockCat:true,note:'Loan money not linked to an agreement yet. You can correct it here; it stays a loan receipt. Once it is linked in Loans, it is corrected there.'};
+  if(EDIT_TYPES.indexOf(t.type)<0)return{ok:false,why:'Entries of this type cannot be edited.'};
+  if(t.billId){
+    if(!full)return{ok:true};
+    var f=findOcc(t.billOcc);
+    return{ok:true,lockType:true,lockAmount:!f,note:f?'Payment for the bill "'+f.bill.name+'" due '+fmtD(f.occ.dueDate)+'. It stays linked to that date and cannot be more than is due on it. To move it to another bill or date, unlink it on the Bills screen.':'This payment is linked to a bill date that no longer exists, so its amount cannot be changed here. Unlink it on the Bills screen first.'};
+  }
+  return{ok:true};
+}
+function editAcctOptions(sel){
+  var o='<option value="">-- None --</option>'+ACCOUNTS.map(function(a){return'<option value="'+esc(a.id)+'"'+(a.id===sel?' selected':'')+'>'+esc(a.label)+'</option>';}).join('');
+  // An account id the setup no longer lists (e.g. a legacy one) is kept as recorded, never silently changed.
+  if(sel&&!ACCOUNTS.some(function(a){return a.id===sel;}))o+='<option value="'+esc(sel)+'" selected>'+esc(acctLabel(sel)||sel)+' (as recorded)</option>';
+  return o;
+}
+function editShow(k,v){
+  if(v===null||v===undefined||v==='')return'(none)';
+  if(k==='amount')return fmt(v);if(k==='date')return fmtD(v);
+  if(k==='fromAcct'||k==='toAcct')return acctLabel(v)||v;
+  if(k==='type')return EDIT_TYPE_NAMES[v]||typeLabel(v);
+  return String(v);
+}
+function editSyncHint(){var h=qs('edit-acct-hint');if(h)h.textContent=EDIT_ACCT_HINT[qs('edit-type').value]||'';}
+function editMsg(h){var m=qs('edit-msg');if(m)m.innerHTML=h||'';}
+function openEdit(idAttr){
+  var t=items.find(function(i){return String(i.id)===String(idAttr);}),r=editRule(t,true);
+  if(!r.ok){
+    if(r.loan&&getAgr(t.agreementId)){if(kfConfirm(r.why+'\n\nOpen the agreement now?'))openAgreement(t.agreementId);}
+    else alert(r.why);
+    return;
+  }
+  editCtx={id:t.id,snap:JSON.stringify(t),rule:r};
+  var types=r.lockType?[t.type]:EDIT_TYPES,ts=qs('edit-type');
+  ts.innerHTML=types.map(function(k){return'<option value="'+esc(k)+'"'+(k===t.type?' selected':'')+'>'+esc(EDIT_TYPE_NAMES[k]||typeLabel(k))+'</option>';}).join('');
+  ts.disabled=!!r.lockType;
+  var cats=Array.prototype.map.call(qs('modal-cat').options,function(o){return o.textContent;}),cur=t.cat||'';
+  if(cats.indexOf(cur)<0)cats.unshift(cur);
+  if(r.lockCat)cats=[cur];
+  var cs=qs('edit-cat');
+  cs.innerHTML=cats.map(function(c){return'<option value="'+esc(c)+'"'+(c===cur?' selected':'')+'>'+esc(c||'(no category)')+'</option>';}).join('');
+  cs.disabled=!!r.lockCat;
+  setVal('edit-amount',t.amount);qs('edit-amount').disabled=!!r.lockAmount;
+  setVal('edit-desc',t.desc);setVal('edit-date',t.date);setVal('edit-time',t.time);
+  qs('edit-date').max=getToday();
+  qs('edit-from').innerHTML=editAcctOptions(t.fromAcct||'');qs('edit-to').innerHTML=editAcctOptions(t.toAcct||'');
+  qs('edit-note').innerHTML=r.note?'<div class="form-warn">'+esc(r.note)+'</div>':'';
+  editSyncHint();editMsg('');
+  var sb=qs('edit-save-btn');sb.disabled=false;sb.textContent='SAVE CHANGES';
+  openModal('edit-modal');autofocusWhenIdle('edit-modal','edit-amount');
+}
+// Closing writes nothing: the form only ever held a copy of the entry.
+function closeEdit(){if(saving)return;editCtx=null;closeModal('edit-modal');}
+function saveEdit(){
+  if(!editCtx)return;
+  var ctx=editCtx,r=ctx.rule,cur=items.find(function(i){return i.id===ctx.id;});
+  if(!cur||JSON.stringify(cur)!==ctx.snap){editMsg('<div class="form-err">This entry changed after you opened it, so nothing was saved. Close this form and open the entry again.</div>');return;}
+  var v={type:r.lockType?cur.type:qs('edit-type').value,amount:r.lockAmount?cur.amount:F.num(val('edit-amount')),desc:val('edit-desc'),cat:r.lockCat?(cur.cat||''):qs('edit-cat').value,
+    date:val('edit-date'),time:val('edit-time'),fromAcct:qs('edit-from').value,toAcct:qs('edit-to').value};
+  var err=[],tn=EDIT_TYPE_NAMES[v.type]||typeLabel(v.type);
+  if(v.type!==cur.type&&EDIT_TYPES.indexOf(v.type)<0)err.push('Choose a type.');
+  if(!(v.amount>0))err.push('Enter an amount above zero.');
+  else if(v.amount>=1e12)err.push('That amount is too large.');
+  else if(v.amount!==cur.amount)v.amount=Math.round(v.amount*100)/100;
+  if(!v.desc)err.push('Enter a description.');
+  if(!F.parseDate(v.date))err.push('Choose a valid date.');else if(v.date>getToday())err.push('The date cannot be in the future.');
+  if(!v.time&&cur.time)err.push('Enter the time.');
+  var ar=EDIT_ACCTS[v.type]||['opt','opt'];
+  if(ar[0]==='req'&&!v.fromAcct)err.push('Choose the From account.');
+  if(ar[0]==='no'&&v.fromAcct)err.push(tn+' has no From account: set From to None.');
+  if(ar[1]==='req'&&!v.toAcct)err.push('Choose the To account.');
+  if(ar[1]==='no'&&v.toAcct)err.push(tn+' has no To account: set To to None.');
+  if(v.fromAcct&&v.fromAcct===v.toAcct)err.push('From and To must be different accounts.');
+  if(v.type==='capital_injection'&&v.cat==='Loan'&&!(cur.type==='capital_injection'&&cur.cat==='Loan'))err.push('Loan money is not capital. Record it as a loan receipt and link it in Loans.');
+  if(cur.billId&&!r.lockAmount&&v.amount>0&&v.amount!==cur.amount){
+    var f=findOcc(cur.billOcc);
+    if(!f)err.push('This bill date no longer exists, so the amount cannot be changed.');
+    else if(v.amount>f.occ.remaining+cur.amount+0.001)err.push('That is more than is due on this bill date ('+fmt(f.occ.remaining+cur.amount)+' including this payment). Record any extra as a separate entry.');
+  }
+  if(err.length){editMsg('<div class="form-err">'+err.map(esc).join('<br>')+'</div>');return;}
+  var n=clone(cur),changes={};
+  EDIT_FIELDS.forEach(function(k){
+    var a=cur[k]===undefined||cur[k]===null?'':cur[k];if(k==='desc')a=String(a).trim();
+    if(a!==v[k]){changes[k]={from:cur[k]===undefined?null:cur[k],to:v[k]};n[k]=v[k];}
+  });
+  if(!Object.keys(changes).length){closeEdit();showToast('No changes made');return;}
+  if(changes.type){if(n.type==='capital_injection')n.fundingKind=n.fundingKind||'capital_injection';else delete n.fundingKind;}
+  if(changes.cat){ // the vehicle follows the category, as in a category correction
+    var m=/^Vehicle: (.+)$/.exec(n.cat||''),vv=m&&VEHICLES.find(function(x){return x.name===m[1];});
+    if(vv){n.vehicle=vv.id;if(cur.cat==='Vehicle fuel (vehicle not set)'&&!n.vehicleCat)n.vehicleCat='Fuel';}
+    else{delete n.vehicle;delete n.vehicleCat;}
+  }
+  var B=isLive()?SETUP.baselineDate:null,warn='';
+  if(B&&changes.date&&((cur.date<B)!==(n.date<B)))warn=n.date<B?'\n\nThe new date is before your baseline ('+fmtD(B)+'), so this entry will no longer change account balances: your opening balances already include it.':'\n\nThe new date is on or after your baseline ('+fmtD(B)+'), so this entry will now change account balances.';
+  var summary=Object.keys(changes).map(function(k){return EDIT_FIELD_NAMES[k]+': '+editShow(k,changes[k].from)+' -> '+editShow(k,changes[k].to);}).join('\n');
+  if(!kfConfirm('Save these changes to "'+cur.desc+'"?\n\n'+summary+warn))return;
+  var at=nowISO();
+  n.edits=(cur.edits||[]).concat([{at:at,changes:changes,prevSig:txSig(cur)}]);n.updatedAt=at;
+  if(saving){editMsg('<div class="form-err">Another save is still in progress, so nothing was saved yet. Try again in a moment.</div>');return;}
+  var sb=qs('edit-save-btn');if(sb.disabled)return;sb.disabled=true;sb.textContent='SAVING…';
+  guard(function(){return commit([{store:'transactions',put:n}],[{store:'transactions',key:cur.id,expect:ctx.snap}]).then(function(){
+    editCtx=null;closeModal('edit-modal');showToast('Changes saved');
+  },function(e){
+    console.error(e);sb.disabled=false;sb.textContent='SAVE CHANGES';
+    editMsg('<div class="form-err"><b>Changes NOT saved.</b> '+esc(e&&e.code==='changed'?'This entry '+e.message+'. Close this form and open the entry again.':errText(e)+'. The entry is unchanged; your changes are still in the form so you can try again.')+'</div>');
+  });});
+}
+qs('edit-save-btn').addEventListener('click',saveEdit);
+qs('edit-cancel-btn').addEventListener('click',closeEdit);
+qs('edit-close-btn').addEventListener('click',closeEdit);
+qs('edit-modal').addEventListener('click',function(e){if(e.target===qs('edit-modal'))closeEdit();});
+qs('edit-type').addEventListener('change',editSyncHint);
+var tlList=qs('timeline-list');
+if(tlList)tlList.addEventListener('click',function(e){var b=e.target.closest('[data-edit-txn]');if(b)openEdit(b.getAttribute('data-edit-txn'));});
 
 qs('vlog-modal-close').addEventListener('click',function(){qs('vlog-modal-overlay').classList.remove('open');});
 qs('vlog-modal-overlay').addEventListener('click',function(e){if(e.target===qs('vlog-modal-overlay'))qs('vlog-modal-overlay').classList.remove('open');});
