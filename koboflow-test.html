@@ -1024,39 +1024,46 @@ var PARTY_MAX=80;
 var PARTY_FIELD={expense:'paidTo',obligation:'paidTo',owner_withdrawal:'paidTo',investment:'paidTo',loan_repayment:'paidTo',income:'receivedFrom',capital_injection:'receivedFrom',loan_receipt:'receivedFrom'};
 function partyField(type){return PARTY_FIELD[type]||null;}
 // A string with control and direction-override characters removed and spaces collapsed; null if not a string.
-function cleanParty(v){if(typeof v!=='string')return null;return v.replace(/[\u0000-\u001F\u007F\u202A-\u202E\u2066-\u2069]/g,' ').replace(/\s+/g,' ').trim();}
+// Invisible characters with no use in a name (zero-width space, direction marks, word joiners, BOM, soft
+// hyphen) are removed; zero-width (non-)joiners are kept only between visible characters, so a name made
+// only of invisible characters is empty.
+function cleanParty(v){if(typeof v!=='string')return null;return v.replace(/[\u0000-\u001F\u007F\u202A-\u202E\u2066-\u2069]/g,' ').replace(/[\u00AD\u061C\u180E\u200B\u200E\u200F\u2060-\u2064\uFEFF]/g,'').replace(/\s+/g,' ').replace(/^[\s\u200C\u200D]+|[\s\u200C\u200D]+$/g,'');}
 // The names on an entry, normalised (spacing and capitals ignored), for matching.
 // Shortens to the limit without splitting a character made of two code units (e.g. an emoji).
 function clipParty(v){var c=cleanParty(v);if(!c)return c;return c.length<=PARTY_MAX?c:c.slice(0,PARTY_MAX).replace(/[\uD800-\uDBFF]$/,'').trim();}
 function partyKey(t){return[cleanParty(t&&t.paidTo)||'',cleanParty(t&&t.receivedFrom)||''].join('|').toLowerCase();}
-/* Income entries that also name a From account (read only: nothing is changed). Balances move money out
-   of fromAcct and into toAcct for every type, so income with a From account moves money between your
-   accounts like a transfer, while reports still count it as income. That is never consistent with the
-   income rule (money arrives in the To account only), so every such entry needs a decision, but which
-   fix is right depends on what happened, so none is made automatically:
+/* Income entries that also name a From account (read only: nothing is changed). Income normally only
+   adds to the account it is received in; with a From account it may be misclassified. Which fix is right
+   (From -> None, or a Transfer) depends on what happened, so none is made automatically.
    - pattern 'quick': category "Pharmacy Sales" or "Income" with From = personal cash (pers_cash, or the
-     account it is mapped to). Quick entry kept that default From for "pharmacy sales" and "salary" (in
-     the v2 app and until it was fixed here): almost certainly money received, so From should be None.
-   - pattern 'chosen': any other From, picked when the entry was typed. It may be money received (From
-     should be None) or a move between your own accounts (it should be a Transfer).
-   effect, from the balance rule: 'none' (From and To are the same account: it adds nothing to any
-   balance), 'moved' (it takes the amount out of From and adds it to To), 'out_only' (no To: it takes the
-   amount out of From, the opposite of income), 'from_unmapped' (the From account is not set up or is
-   "Not used", so nothing is taken out). beforeBaseline: dated before the baseline, so balances are not
-   affected at all; reports still count it as income. Transfers, voided and sample entries are never
-   flagged. */
+     account it is mapped to): the quick-entry default kept for "pharmacy sales" and "salary" (in the v2
+     app and until it was fixed here). Most likely money received.
+   - pattern 'chosen': any other From, picked when the entry was typed.
+   effect: what the entry does to balances now, by the balance rule (accountBalances only moves accounts
+   that are set up, after the baseline): 'none' (From and To are the same account: nothing changes),
+   'moved' (out of From, into To), 'out_only' (out of From only: To is empty or not set up), 'to_only'
+   (From is not set up: it only adds to To, exactly as income received would), 'no_account' (neither is
+   set up: nothing changes).
+   balanceDiff: whether its balance effect now differs from the same entry recorded as income received
+   (no From account). False before the baseline (balances skip it either way), for 'to_only' and for
+   'no_account'. True for 'none' (income received would have added the amount), 'moved' and 'out_only'.
+   Transfers, income without a From account, voided and sample entries are never flagged. */
 function incomeFromFindings(txns,o){
-  o=o||{};var al=o.aliases||{},ids={},quick={pers_cash:1};
+  o=o||{};var al=o.aliases||{},ids={},quick={pers_cash:1},bl=parseDate(o.baselineDate)?o.baselineDate:'';
   (o.accountIds||[]).forEach(function(id){ids[id]=1;});
   function res(x){return al[x]!==undefined&&al[x]!==null?al[x]:x;}
+  function known(x){return !!x&&(o.accountIds?!!ids[x]:true);}
   if(al.pers_cash)quick[al.pers_cash]=1;
   return(txns||[]).filter(function(t){return t&&!t.demo&&!t.voided&&t.type==='income'&&!!t.fromAcct;}).map(function(t){
-    var f=res(t.fromAcct),to=t.toAcct?res(t.toAcct):'',known=o.accountIds?!!(f&&ids[f]):!!f;
-    var effect=!known?'from_unmapped':!to?'out_only':f===to?'none':'moved';
+    var f=res(t.fromAcct),to=t.toAcct?res(t.toAcct):'',fk=known(f),tk=known(to);
+    var effect=fk&&tk?(f===to?'none':'moved'):fk?'out_only':tk?'to_only':'no_account';
+    var before=!!(bl&&(t.date||'')<bl);
     return{id:t.id,pattern:quick[t.fromAcct]&&(t.cat==='Pharmacy Sales'||t.cat==='Income')?'quick':'chosen',effect:effect,
-      beforeBaseline:!!(parseDate(o.baselineDate)&&(t.date||'')<o.baselineDate)};
+      beforeBaseline:before,balanceDiff:!before&&(effect==='none'||effect==='moved'||effect==='out_only')};
   });
 }
+// The name on an entry for duplicate matching: normalised (spacing and capitals ignored), '' when blank.
+function dupName(t){return(cleanParty(t&&t.paidTo)||cleanParty(t&&t.receivedFrom)||'').toLowerCase();}
 function dataQuality(o){
   o=o||{};var td=o.today||today(),ids={},al=o.aliases||{},out=[],live=(o.txns||[]).filter(function(t){return t&&!t.demo&&!t.voided;});
   (o.accountIds||[]).forEach(function(id){ids[id]=1;});
@@ -1066,13 +1073,28 @@ function dataQuality(o){
   add('future_dated','medium',live.filter(function(t){return(t.date||'')>td;}),function(n){return n+' entr'+(n>1?'ies are':'y is')+' dated in the future. Future-dated entries already move balances; check the dates.';});
   add('unmapped_account','high',live.filter(function(t){var bad=false;[t.fromAcct,t.toAcct].forEach(function(x){if(x){var r=res(x);if(!r||!ids[r])bad=true;}});return bad;}),function(n){return n+' entr'+(n>1?'ies use':'y uses')+' an account that is not set up or is set to "Not used": '+(n>1?'they move':'it moves')+' no balance.';});
   add('missing_account','high',live.filter(function(t){var c=classifyTxn(t);return(c.cashIn>0&&!t.toAcct)||((c.cashOut>0||c.ownerOut>0)&&!t.fromAcct);}),function(n){return n+' entr'+(n>1?'ies have':'y has')+' no account, so '+(n>1?'they are':'it is')+' not in any balance.';});
-  // Who it was paid to / received from is part of the match: the same amount paid on the same day to two
-  // different places is two payments, not a repeat. Entries without names match exactly as before.
-  var g={};live.forEach(function(t){if(t.agreementId)return;var k=[t.date,toK(t.amount),t.type,String(t.desc||'').trim().toLowerCase(),t.fromAcct||'',t.toAcct||'',partyKey(t)].join('|');(g[k]=g[k]||[]).push(t);});
-  var dups=[];Object.keys(g).forEach(function(k){if(g[k].length>1)dups=dups.concat(g[k].slice(1));});
+  // Same date, amount, type, description and accounts as before. The paid-to / received-from name only
+  // separates two entries when BOTH have one and they differ (the same amount paid on the same day to two
+  // different places is two payments). A blank name never hides a repeat: a named and an unnamed copy of
+  // the same entry still match. An entry is a possible repeat if it matches any earlier entry in its group.
+  var g={};live.forEach(function(t){if(t.agreementId)return;var k=[t.date,toK(t.amount),t.type,String(t.desc||'').trim().toLowerCase(),t.fromAcct||'',t.toAcct||''].join('|');(g[k]=g[k]||[]).push(t);});
+  // Judged in the order entries were made (time, then id), so the later copy is the suspected repeat
+  // whatever order the entries are stored or listed in.
+  function made(a,b){var ta=String(a.time||''),tb=String(b.time||'');if(ta!==tb)return ta<tb?-1:1;var ia=Number(a.id),ib=Number(b.id);if(isFinite(ia)&&isFinite(ib)&&ia!==ib)return ia-ib;var sa=String(a.id),sb=String(b.id);return sa<sb?-1:sa>sb?1:0;}
+  var dups=[];Object.keys(g).forEach(function(k){var grp=g[k].slice().sort(made);grp.forEach(function(t,i){
+    var n=dupName(t);if(grp.slice(0,i).some(function(e){var m=dupName(e);return !n||!m||n===m;}))dups.push(t);
+  });});
   add('possible_duplicates','medium',dups,function(n){return n+' entr'+(n>1?'ies look':'y looks')+' like a repeat of another (same date, amount, type, description, accounts and paid-to / received-from name). Check before relying on the totals.';});
-  var iwf={};incomeFromFindings(live,{aliases:al,accountIds:o.accountIds,baselineDate:o.baselineDate}).forEach(function(x){iwf[x.id]=1;});
-  add('income_with_from','high',live.filter(function(t){return iwf[t.id];}),function(n){return n+' income entr'+(n>1?'ies also name':'y also names')+' a From account, so '+(n>1?'they move':'it moves')+' money out of that account like a transfer instead of only adding to the account '+(n>1?'they were':'it was')+' received in. Review each below: set From to None if it was money received, or change it to a Transfer if it was a move between your own accounts. Nothing has been changed.';});
+  // Possibly misclassified income: high severity only if at least one entry leaves balances different from
+  // income received (balanceDiff); otherwise it is shown for review without claiming the figures are off.
+  var iwfL=incomeFromFindings(live,{aliases:al,accountIds:o.accountIds,baselineDate:o.baselineDate}),iwf={},nd=0;
+  iwfL.forEach(function(x){iwf[x.id]=1;if(x.balanceDiff)nd++;});
+  add('income_with_from',nd?'high':'info',live.filter(function(t){return iwf[t.id];}),function(n){
+    var head=n+' income entr'+(n>1?'ies':'y')+' may be misclassified and need'+(n>1?'':'s')+' review: income normally only adds to the account it is received in, but '+(n>1?'these also name':'this also names')+' a From account. ';
+    return head+(nd?(nd===n?(n>1?'They currently leave':'It currently leaves'):nd+' of them currently leave')+' your balances different from income received (see each below), so balance figures may be off until '+(nd>1||n>1?'they are':'it is')+' reviewed.'
+      :(n>1?'None of them changes':'It does not change')+' your balances differently from income received (dated before your baseline, or the From account is not set up), so the balance figures are not affected.')
+      +' Reports count '+(n>1?'them':'it')+' as income either way. If it was money received, set From to None; if it was a move between your own accounts, change it to a Transfer. Nothing has been changed.';
+  });
   if(parseDate(o.baselineDate))add('pre_baseline','info',live.filter(function(t){return(t.date||'')<o.baselineDate;}),function(n){return n+' entr'+(n>1?'ies are':'y is')+' dated before your baseline: kept in history, not in balances.';});
   return out;
 }
@@ -1448,7 +1470,7 @@ var API={toK:toK,fromK:fromK,num:num,fmtDate:fmtDate,parseDate:parseDate,today:t
   isDebt:isDebt,cashReceived:function(t){return fromK(cashReceivedK(t));},buildSchedule:buildSchedule,termsSummary:termsSummary,
   instalmentStates:instalmentStates,agreementBalances:agreementBalances,allocatePayment:allocatePayment,settlementPlan:settlementPlan,
   classifyTxn:classifyTxn,accountDeltas:accountDeltas,accountBalances:accountBalances,upcomingObligations:upcomingObligations,cashForecast:cashForecast,
-  buildReminders:buildReminders,xirr:xirr,ACCOUNT_KINDS:ACCOUNT_KINDS,LEGACY_ACCOUNTS:LEGACY_ACCOUNTS,bucketSummary:bucketSummary,accountAccess:accountAccess,cashPosition:cashPosition,cashCover:cashCover,reservationPlan:reservationPlan,coveredAmount:coveredAmount,BILL_REPEAT:BILL_REPEAT,billDueDates:billDueDates,billAmountOn:billAmountOn,billOccurrences:billOccurrences,billObligations:billObligations,billUnmatchedPayments:billUnmatchedPayments,validateBill:validateBill,dataQuality:dataQuality,incomeFromFindings:incomeFromFindings,PARTY_MAX:PARTY_MAX,dateKey:dateKey,inDateRange:inDateRange,partyField:partyField,cleanParty:cleanParty,partyKey:partyKey,clipParty:clipParty,budgetProgress:budgetProgress,directorPlan:directorPlan,spendingRunway:spendingRunway,validateSetup:validateSetup,cashFlowSummary:cashFlowSummary,oppRepayments:oppRepayments,analyzeOpportunity:analyzeOpportunity,oppToTerms:oppToTerms,parseManualRows:parseManualRows};
+  buildReminders:buildReminders,xirr:xirr,ACCOUNT_KINDS:ACCOUNT_KINDS,LEGACY_ACCOUNTS:LEGACY_ACCOUNTS,bucketSummary:bucketSummary,accountAccess:accountAccess,cashPosition:cashPosition,cashCover:cashCover,reservationPlan:reservationPlan,coveredAmount:coveredAmount,BILL_REPEAT:BILL_REPEAT,billDueDates:billDueDates,billAmountOn:billAmountOn,billOccurrences:billOccurrences,billObligations:billObligations,billUnmatchedPayments:billUnmatchedPayments,validateBill:validateBill,dataQuality:dataQuality,incomeFromFindings:incomeFromFindings,dupName:dupName,PARTY_MAX:PARTY_MAX,dateKey:dateKey,inDateRange:inDateRange,partyField:partyField,cleanParty:cleanParty,partyKey:partyKey,clipParty:clipParty,budgetProgress:budgetProgress,directorPlan:directorPlan,spendingRunway:spendingRunway,validateSetup:validateSetup,cashFlowSummary:cashFlowSummary,oppRepayments:oppRepayments,analyzeOpportunity:analyzeOpportunity,oppToTerms:oppToTerms,parseManualRows:parseManualRows};
 root.KoboFin=API;
 if(typeof module!=='undefined'&&module.exports)module.exports=API;
 })(typeof window!=='undefined'?window:this);
@@ -2800,7 +2822,9 @@ function splitParty(raw){
   var marks=String(raw).match(/\s@/g)||[];
   if(!marks.length)return{text:raw,party:''};
   if(marks.length>1)return{err:'Use " @ " only once: write who it was paid to after it.'};
-  var i=String(raw).search(/\s@/),text=raw.slice(0,i),party=F.cleanParty(raw.slice(i+2))||'';
+  var i=String(raw).search(/\s@/),text=raw.slice(0,i),rest=raw.slice(i+2);
+  if(/^\s*@/.test(rest))return{err:'Use a single "@" before the name (for example "@ Fuel station").'}; // "@@ x" is unclear
+  var party=F.cleanParty(rest)||''; // a name of only spaces or invisible characters is empty
   if(!party)return{err:'Write who it was paid to (or received from) after " @ ", or remove the @.'};
   if(party.length>F.PARTY_MAX)return{err:'The name after " @ " is too long: keep it to '+F.PARTY_MAX+' characters.'};
   return{text:text,party:party};
@@ -4707,11 +4731,14 @@ function incomeFromList(){
   var fs=F.incomeFromFindings(items,{aliases:SETUP.aliases,accountIds:ACCOUNTS.map(function(a){return a.id;}),baselineDate:SETUP.baselineDate}),max=20;
   return'<div data-dq-list="income_with_from">'+fs.slice(0,max).map(function(x){
     var t=items.find(function(i){return i.id===x.id;});if(!t)return'';
-    var eff=x.beforeBaseline?'Dated before your baseline, so balances are not affected; reports still count it as income.'
-      :x.effect==='none'?'Now: From and To are the same account, so it adds nothing to any balance.'
-      :x.effect==='moved'?'Now: it takes '+fmt(t.amount)+' out of '+acctLabel(t.fromAcct)+' and adds it to '+acctLabel(t.toAcct)+'; your total cash does not go up.'
-      :x.effect==='out_only'?'Now: it takes '+fmt(t.amount)+' out of '+acctLabel(t.fromAcct)+', the opposite of income.'
-      :'Now: its From account is not set up, so nothing is taken out.';
+    // The effect as the balance rule applies it now (incomeFromFindings), compared with income received.
+    var A=fmt(t.amount),F0=acctLabel(t.fromAcct),T0=acctLabel(t.toAcct);
+    var eff=x.beforeBaseline?'Dated before your baseline, so it changes no balance either way; reports still count it as income.'
+      :x.effect==='none'?'Now: From and To are the same account, so it changes no balance. Recorded as income received, it would add '+A+' to '+T0+'.'
+      :x.effect==='moved'?'Now: it takes '+A+' out of '+F0+' and adds it to '+T0+', so your total cash does not go up. Recorded as income received, it would only add to '+T0+'.'
+      :x.effect==='out_only'?'Now: '+(t.toAcct?'its To account is not set up, so it':'it has no To account, so it')+' only takes '+A+' out of '+F0+', the opposite of income.'
+      :x.effect==='to_only'?'Now: its From account is not set up, so it only adds '+A+' to '+T0+', the same as income received. Balances are not affected.'
+      :'Now: neither of its accounts is set up, so it changes no balance.';
     return'<div class="muted-note" data-dq-entry="'+esc(t.id)+'" data-dq-pattern="'+x.pattern+'" style="border-left:2px solid var(--red);padding-left:8px;margin:4px 0;">'
       +'<b>'+esc(dateLabel(t.date))+' &middot; '+esc(t.desc)+' &middot; +'+fmt(t.amount)+'</b><br>From '+esc(acctLabel(t.fromAcct)||t.fromAcct)+' &rarr; To '+esc(t.toAcct?acctLabel(t.toAcct)||t.toAcct:'(none)')
       +'<br>'+esc(INCOME_FROM_WHY[x.pattern])+'<br>'+esc(eff)

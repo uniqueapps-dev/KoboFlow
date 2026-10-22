@@ -52,6 +52,12 @@ test('engine: which types carry which name; cleaning, length limit and normalise
   assert.equal(F.partyField('transfer'), null, 'a transfer has two real accounts and no name');
   assert.equal(F.cleanParty('  Fuel\u0000\t station ‮ '), 'Fuel station');
   assert.equal(F.cleanParty(42), null); assert.equal(F.cleanParty({ a: 1 }), null); assert.equal(F.cleanParty(null), null);
+  // Invisible characters: a name made only of them is empty; around a visible name they are removed.
+  for (const inv of ['\u200B', ' \u200B \u200B ', '\u200D\u200C', '\uFEFF\u200E\u200F\u2060\u00AD', '\u061C\u180E', '   ']) assert.equal(F.cleanParty(inv), '', JSON.stringify(inv));
+  assert.equal(F.cleanParty('\u200BShell\u200F'), 'Shell');
+  assert.equal(F.cleanParty('\u200DShell\u200C'), 'Shell', 'joiners at the ends are removed');
+  assert.equal(F.cleanParty('A\u200DB'), 'A\u200DB', 'a joiner between visible characters is kept');
+  assert.equal(F.cleanParty('Ọjà Oyingbo & Sons (Ikeja)'), 'Ọjà Oyingbo & Sons (Ikeja)', 'ordinary names are unchanged');
   assert.equal(F.PARTY_MAX, 80);
   assert.equal(F.clipParty('x'.repeat(200)).length, 80);
   const emoji = 'a'.repeat(79) + '😀'; // the emoji straddles the limit: it is dropped whole, never split
@@ -66,7 +72,20 @@ test('engine: possible duplicates use the names; repeated payments to different 
   assert.equal(dq([Object.assign({ id: 1 }, base), Object.assign({ id: 2 }, base)]), 1, 'no names: flagged as before');
   assert.equal(dq([Object.assign({ id: 1, paidTo: 'Station A' }, base), Object.assign({ id: 2, paidTo: 'Station B' }, base)]), 0, 'two places: two payments');
   assert.equal(dq([Object.assign({ id: 1, paidTo: 'Fuel station' }, base), Object.assign({ id: 2, paidTo: '  fuel   STATION ' }, base)]), 1, 'spacing and capitals do not hide a repeat');
-  assert.equal(dq([Object.assign({ id: 1, paidTo: 'Fuel station' }, base), Object.assign({ id: 2 }, base)]), 0, 'named and unnamed differ');
+  // Names separate two entries only when both have one and they differ; a blank name never hides a repeat.
+  const e = (id, paidTo) => Object.assign({ id }, base, paidTo === undefined ? {} : { paidTo });
+  assert.equal(dq([e(1, 'Fuel station'), e(2, 'Fuel station')]), 1, 'named / same name');
+  assert.equal(dq([e(1, 'Station A'), e(2, 'Station B')]), 0, 'named / different name');
+  assert.equal(dq([e(1, 'Fuel station'), e(2)]), 1, 'named / blank');
+  assert.equal(dq([e(1), e(2, 'Fuel station')]), 1, 'blank / named');
+  assert.equal(dq([e(1), e(2)]), 1, 'blank / blank');
+  assert.equal(dq([e(1, 'Fuel station'), e(2, '   ')]), 1, 'a whitespace-only name is blank');
+  assert.equal(dq([e(1, 'Fuel station'), e(2, '\u200B')]), 1, 'an invisible-only name is blank');
+  // A blank entry may repeat either named one: both named ones are flagged (conservative).
+  assert.equal(dq([e(1), e(2, 'Station A'), e(3, 'Station B')]), 2);
+  // Legitimate repeats are not flagged: a different amount, day, description or account.
+  for (const [what, o] of [['amount', { amount: 5001 }], ['date', { date: '2026-10-02' }], ['description', { desc: 'Fuel top-up' }], ['account', { fromAcct: 'bank' }]])
+    assert.equal(dq([e(1), Object.assign(e(2), o)]), 0, `different ${what}: not a repeat`);
   // A blank name is not a data-quality problem.
   const q = F.dataQuality({ txns: [Object.assign({ id: 1 }, base)], today: '2026-10-21', accountIds: ['opay'] });
   assert.deepEqual(q.map(x => x.key), []);
@@ -492,12 +511,23 @@ test('TEST build: quick entry "@ name" is split off before parsing; unclear entr
   assert.equal(t.desc, 'fictional airtime for me@example.com'); assert.equal('paidTo' in t, false);
   t = await captureSaved(page, context, db, '1500 household');
   assert.equal('paidTo' in t || 'receivedFrom' in t, false);
+  // Ordinary names are kept exactly: punctuation, accents, an "@" inside a name, invisible characters around it removed.
+  t = await captureSaved(page, context, db, '1200 lunch @ Mama Put (Ikeja) & Sons');
+  assert.equal(t.paidTo, 'Mama Put (Ikeja) & Sons'); assert.equal(t.cat, 'Food'); assert.equal(t.desc, 'lunch');
+  t = await captureSaved(page, context, db, '900 household @ \u200BỌjà Oyingbo\u200B');
+  assert.equal(t.paidTo, 'Ọjà Oyingbo'); assert.equal(t.cat, 'Household');
+  t = await captureSaved(page, context, db, '300 lunch @ Shop@Ikeja');
+  assert.equal(t.paidTo, 'Shop@Ikeja');
 
   // Refused, nothing saved, the typed text kept.
   for (const [v, why] of [
     ['10000 savings @ Fictional bank', /between two of your own accounts, so it has no payee/],
     ['200 fuel @ one @ two', /only once/],
     ['200 fuel @   ', /Write who it was paid to/],
+    ['200 fuel @ \u200B\u200B', /Write who it was paid to/],
+    ['200 fuel @@ x', /Use a single "@" before the name/],
+    ['200 fuel @ @x', /only once/], // two " @" markers
+    ['200 fuel @@', /Use a single "@" before the name/],
     ['200 fuel @ ' + 'x'.repeat(81), /too long/],
     ['-500 lunch', /without a minus sign/],
   ]) {
@@ -512,7 +542,7 @@ test('TEST build: quick entry "@ name" is split off before parsing; unclear entr
   await page.fill('#capture-input', '10000 savings @ Fictional bank');
   assert.match(await text(page, '#preview-party'), /no payee/, 'the preview warns before saving');
   // Balances: Opay 100,000 −5,000 −3,000 +50,000 +20,000 −700 −1,500: each entry once.
-  assert.equal(await bal(page, 'Opay'), 159800);
+  assert.equal(await bal(page, 'Opay'), 159800 - 1200 - 900 - 300);
   assert.deepEqual(page.errors, []);
   await context.close();
 });
@@ -557,8 +587,13 @@ test('TEST build: History date range includes both days (late evening too), skip
   // A start after the end is reported and not applied.
   await page.fill('#tl-from', D0); await page.fill('#tl-to', Dm2);
   assert.match(await text(page, '#tl-range-msg'), /start date is after the end date[\s\S]*showing all dates/);
-  assert.match(await shown(), /Fictional before range[\s\S]*|Fictional after range/);
-  assert.match(await shown(), /Fictional impossible date/);
+  // Every entry is shown again, each with its own amount and category.
+  const row = d => page.$$eval('#timeline-list .tl-item', (rs, d) => { const r = rs.find(x => x.querySelector('.tl-desc').textContent === d); return r ? r.textContent.replace(/\s+/g, ' ') : null; }, d);
+  for (const [d, amt] of [['Fictional before range', '₦1,001'], ['Fictional after range', '₦1,007'], ['Fictional impossible date', '₦1,006'], ['Fictional middle day', '₦1,003']]) {
+    const r = await row(d);
+    assert.ok(r, `${d} is listed`);
+    assert.ok(r.includes('Food') && r.includes(amt), `${d}: ${r}`);
+  }
   // Clear.
   await page.click('#tl-range-clear');
   assert.equal(await page.inputValue('#tl-from'), ''); assert.equal(await page.inputValue('#tl-to'), '');
@@ -568,7 +603,7 @@ test('TEST build: History date range includes both days (late evening too), skip
   await context.close();
 });
 
-test('TEST build: repeated payments are all saved; only the same payee repeated is flagged as a possible duplicate', { skip }, async () => {
+test('TEST build: repeated payments are all saved; different payees are not flagged, the same or a blank payee is', { skip }, async () => {
   const { context, page } = await ctx();
   await openApp(page, TEST.url);
   await liveSetup(page);
@@ -581,7 +616,14 @@ test('TEST build: repeated payments are all saved; only the same payee repeated 
   assert.equal((await storedTxns(context, TEST.dbName)).length, 3, 'a likely repeat is still saved: never blocked');
   await nav(page, 'director');
   assert.match(await text(page, '#director-body [data-dir-quality="possible_duplicates"]'), /1 entry looks like a repeat of another/);
-  assert.equal(await bal(page, 'Opay'), 85000);
+  // The same payment without a name: a blank name does not hide the repeat.
+  await addEntry(page, 'expense', { amount: 5000, desc: 'Fictional fuel', cat: 'Other', from: 'acc_opay' });
+  // A legitimate different payment the same day is not a repeat.
+  await addEntry(page, 'expense', { amount: 4000, desc: 'Fictional fuel', cat: 'Other', from: 'acc_opay' });
+  assert.equal((await storedTxns(context, TEST.dbName)).length, 5, 'every payment is saved');
+  await nav(page, 'director');
+  assert.match(await text(page, '#director-body [data-dir-quality="possible_duplicates"]'), /^2 entries look like a repeat of another/);
+  assert.equal(await bal(page, 'Opay'), 76000);
   assert.deepEqual(page.errors, []);
   await context.close();
 });

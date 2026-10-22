@@ -75,6 +75,9 @@ const plusDays = (page, n) => page.evaluate(n => KoboFin.addDays(KoboFin.today()
 async function createEasiMoni(page, { received = true, account = 'pharma_bank' } = {}) {
   await nav(page, 'loans');
   await page.click('#new-agr-btn');
+  // Wait until the form has finished sliding open. Precaution: one full run once missed the "already
+  // received" tick with "element is not stable"; the cause was not reproduced, see the commit message.
+  await page.waitForFunction(() => document.getElementById('agr-modal').classList.contains('open') && document.querySelector('#agr-modal .modal-box').getAnimations().every(a => a.playState === 'finished'));
   await page.fill('#agr-name', 'EasiMoni Test');
   await page.fill('#agr-counterparty', 'EasiMoni');
   await page.fill('#agr-principal', '150000');

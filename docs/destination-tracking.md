@@ -26,8 +26,10 @@ They are **names only, never accounts**:
 | Loan received | Received from (the lender, set automatically for agreement receipts) | To required; no From |
 | Transfer | **none**: both sides are your accounts | From and To both required and different |
 
-- **Format:** names are trimmed. Spaces are collapsed, control and text-direction characters are
-  removed, and the limit is 80 characters. An empty name is not stored.
+- **Format:** names are trimmed. Spaces are collapsed, and control and text-direction characters
+  are removed. So are invisible characters (zero-width space, direction marks, word joiners, BOM,
+  soft hyphen); zero-width joiners are kept only between visible characters. A name of only spaces
+  or invisible characters is empty. The limit is 80 characters, and an empty name is not stored.
 - **Older entries:** they have no name. Nothing is invented for them.
 - **The engine functions** are `partyField`, `cleanParty`, `clipParty`, `partyKey` and
   `PARTY_MAX`, all in the `kobo-finance-engine` block.
@@ -53,8 +55,13 @@ They are **names only, never accounts**:
     Hub" cannot change the type, category or account.
   - An `@` inside a word (an e-mail address) stays in the description.
   - The preview shows "Paid to: …" before saving.
-  - These are refused with a reason, and nothing is saved: more than one ` @ `, nothing after it,
-    a name over 80 characters, a name on a transfer, or a negative amount.
+  - These are refused with a reason, and nothing is saved:
+    - more than one ` @ `;
+    - a repeated marker (`@@ x`, `@@`);
+    - nothing, or only spaces or invisible characters, after it;
+    - a name over 80 characters;
+    - a name on a transfer;
+    - a negative amount.
 - **Edit:**
   - the same field, prefilled;
   - adding, changing or clearing a name appears in the review ("Paid to: (none) → Fuel station");
@@ -82,12 +89,19 @@ They are **names only, never accounts**:
 
 ## Duplicates
 
-The possible-duplicate warning also matches on the names, ignoring capitals and spacing:
+The possible-duplicate warning matches entries as before: same date, amount, type, description and
+accounts. The names refine it conservatively:
 
-- the same amount on the same day to **different** places is two payments, not a repeat;
-- the same place repeated, even typed with different spacing or capitals, is flagged;
-- entries without names match exactly as before;
-- nothing is ever blocked: the warning is advice only.
+- **Both entries named, with different names** (ignoring capitals and spacing): two payments, not a
+  repeat. For example, the same amount on the same day to two different places.
+- **Same name, or a blank name on either side:** still a possible repeat. A blank name never hides
+  a repeat, so a named and an unnamed copy of the same entry are flagged. This covers an older
+  payment without a name next to one named automatically from its bill.
+- **Order:** entries are judged in the order they were made (time, then id), so the later copy is
+  the suspected repeat. A blank entry may repeat either of two differently named ones, so both
+  named ones are then flagged.
+- **Different amount, day, description or account:** never flagged.
+- **Nothing is ever blocked:** the warning is advice only.
 
 ## Backup, import and CSV
 
@@ -117,12 +131,13 @@ The possible-duplicate warning also matches on the names, ignoring capitals and 
 ## Warning: income recorded with a From account
 
 The production v2 app's quick entry has the same default. So real data upgraded from it, and
-entries made with this app before the fix, can contain income with a From account. Balances move
-money out of `fromAcct` and into `toAcct` for every type. Such an entry therefore moves money
-between your accounts like a transfer, while reports still count it as income.
+entries made with this app before the fix, can contain income with a From account. Income normally
+only adds to the account it is received in, so such entries **may be misclassified** and are listed
+for review. The warning does not say they are errors, and it does not say every one changes the
+figures.
 
-**Flagged** (`incomeFromFindings`, reported by `dataQuality` as `income_with_from`, severity
-high): type `income`, a non-empty `fromAcct`, not reversed and not a sample.
+**Flagged** (`incomeFromFindings`, reported by `dataQuality` as `income_with_from`): type
+`income`, a non-empty `fromAcct`, not reversed and not a sample.
 
 **Never flagged:**
 - transfers;
@@ -137,12 +152,26 @@ high): type `income`, a non-empty `fromAcct`, not reversed and not a sample.
 - **"chosen"**: any other From, picked when the entry was typed. It may be money received (From →
   None) or a move between your own accounts (change it to a Transfer).
 
-**What it does to balances now** (from the existing rule, shown for each entry):
-- From and To are the same account: it adds nothing.
-- It takes the amount out of From and adds it to To: total cash does not go up.
-- There is no To: it takes the amount out of From.
-- From is not set up: nothing is taken out.
-- Dated before the baseline: balances are unaffected, but reports still count it.
+**What it does to balances now.** This uses the same accounts the balance engine moves (only
+accounts that are set up, after the baseline) and is shown for each entry, compared with income
+received:
+
+| Effect | What the engine does now | Differs from income received? |
+|---|---|---|
+| `none` | From and To are the same account: no change | yes (income would add the amount) |
+| `moved` | out of From, into To; total cash does not go up | yes |
+| `out_only` | out of From only (To is empty or not set up) | yes |
+| `to_only` | From is not set up: only adds to To | no (the same as income) |
+| `no_account` | neither account is set up: no change | no |
+| before the baseline | no change either way | no |
+
+**Severity** follows that last column (`balanceDiff`):
+- **High:** at least one entry leaves balances different from income received. The headline says
+  how many, the Director adds its "review these entries" advice, and recommendations are marked
+  qualified.
+- **Info:** no entry does. The headline says the balance figures are not affected, and there is
+  no Director advice or qualification.
+- **Either way,** reports count these entries as income.
 
 **Where it appears:** the Director shows the warning and lists up to 20 entries. Each shows its
 date, description, amount, From and To accounts, the reason and the effect, with a **REVIEW**
@@ -154,7 +183,8 @@ the review and CONFIRM AND SAVE: same id, recorded in `edits[]`.
 - change a balance, cash flow, loan record or any Director figure.
 
 A high-severity item only adds "review these entries" advice and marks recommendations as
-qualified.
+qualified. The list shows up to 20 entries, in stored order, followed by "and N more" when there
+are others.
 
 **Possible false flags:**
 - **An income entry where the From account really was meant.** For example, interest credited
