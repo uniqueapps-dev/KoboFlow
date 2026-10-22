@@ -2244,6 +2244,7 @@ body.kf-live .sample-tag{display:inline-block;}
     <div class="modal-box">
       <div class="modal-head"><div class="modal-title">EDIT ENTRY</div><button class="modal-close" id="edit-close-btn" aria-label="Close without saving">&#215;</button></div>
       <div id="edit-note"></div>
+      <div id="edit-fields">
       <div class="form-group"><label>Type</label><select id="edit-type" class="form-input"></select></div>
       <div class="grid2" style="margin-bottom:0;">
         <div class="form-group"><label>Amount (&#8358;)</label><input id="edit-amount" class="form-input" type="number" inputmode="decimal" min="0" step="0.01"/></div>
@@ -2259,8 +2260,18 @@ body.kf-live .sample-tag{display:inline-block;}
         <div class="form-group"><label>To account</label><select id="edit-to" class="form-input"></select></div>
       </div>
       <div class="hint" id="edit-acct-hint"></div>
+      </div>
+      <!-- Review step: the changes are listed here and saved only by a separate tap on CONFIRM AND SAVE.
+           It is part of the page, not a browser dialog, so it shows the same way in every browser. -->
+      <div id="edit-review" style="display:none;" role="region" aria-label="Check your changes">
+        <div class="form-warn"><b>Check your changes.</b> Nothing is saved until you tap CONFIRM AND SAVE.</div>
+        <div id="edit-review-list"></div>
+        <div id="edit-review-warn"></div>
+      </div>
       <div id="edit-msg"></div>
       <button class="modal-save" id="edit-save-btn">SAVE CHANGES</button>
+      <button class="modal-save" id="edit-confirm-btn" style="display:none;">CONFIRM AND SAVE</button>
+      <button class="modal-save" id="edit-back-btn" style="display:none;background:var(--surf2);color:var(--text);margin-top:8px;">BACK TO EDITING</button>
       <button class="modal-save" id="edit-cancel-btn" style="background:var(--surf2);color:var(--text);margin-top:8px;">CANCEL</button>
     </div>
   </div>
@@ -4959,12 +4970,30 @@ function openEdit(idAttr){
   qs('edit-date').max=getToday();
   qs('edit-from').innerHTML=editAcctOptions(t.fromAcct||'');qs('edit-to').innerHTML=editAcctOptions(t.toAcct||'');
   qs('edit-note').innerHTML=r.note?'<div class="form-warn">'+esc(r.note)+'</div>':'';
-  editSyncHint();editMsg('');
-  var sb=qs('edit-save-btn');sb.disabled=false;sb.textContent='SAVE CHANGES';
+  editSyncHint();editMsg('');editStep('form');
   openModal('edit-modal');autofocusWhenIdle('edit-modal','edit-amount');
 }
+/* The form has two steps: 'form' (the fields and SAVE CHANGES) and 'review' (the list of changes,
+   CONFIRM AND SAVE and BACK TO EDITING). Nothing is written before CONFIRM AND SAVE. */
+/* For a moment after the review appears, its buttons ignore taps: the buttons move when the fields are
+   replaced by the review, so the second tap of a double tap on SAVE CHANGES would otherwise land on
+   CONFIRM AND SAVE, BACK TO EDITING or CANCEL. */
+var editReviewSeq=0,editReviewAt=0,EDIT_CONFIRM_DELAY=600;
+function editSettling(){return qs('edit-review').style.display!=='none'&&Date.now()-editReviewAt<EDIT_CONFIRM_DELAY;}
+function editStep(step){
+  var rv=step==='review',cb=qs('edit-confirm-btn');
+  qs('edit-fields').style.display=rv?'none':'';
+  qs('edit-review').style.display=rv?'':'none';
+  qs('edit-back-btn').style.display=rv?'':'none';
+  cb.style.display=rv?'':'none';cb.textContent='CONFIRM AND SAVE';cb.disabled=true;cb.removeAttribute('data-ready');
+  var sb=qs('edit-save-btn');sb.style.display=rv?'none':'';sb.disabled=false;sb.textContent='SAVE CHANGES';
+  if(editCtx&&!rv)editCtx.pending=null;
+  var seq=++editReviewSeq;if(rv)editReviewAt=Date.now(); // a timer from an earlier review never unlocks a later one early
+  if(rv)setTimeout(function(){if(seq===editReviewSeq&&editCtx&&editCtx.pending){cb.disabled=false;cb.setAttribute('data-ready','1');}},EDIT_CONFIRM_DELAY);
+}
 // Closing writes nothing: the form only ever held a copy of the entry.
-function closeEdit(){if(saving)return;editCtx=null;closeModal('edit-modal');}
+function closeEdit(){if(saving||editSettling())return;editCtx=null;closeModal('edit-modal');}
+// SAVE CHANGES: checks the values and shows the review step. It never writes.
 function saveEdit(){
   if(!editCtx)return;
   var ctx=editCtx,r=ctx.rule,cur=items.find(function(i){return i.id===ctx.id;});
@@ -5005,21 +5034,33 @@ function saveEdit(){
     else{delete n.vehicle;delete n.vehicleCat;}
   }
   var B=isLive()?SETUP.baselineDate:null,warn='';
-  if(B&&changes.date&&((cur.date<B)!==(n.date<B)))warn=n.date<B?'\n\nThe new date is before your baseline ('+fmtD(B)+'), so this entry will no longer change account balances: your opening balances already include it.':'\n\nThe new date is on or after your baseline ('+fmtD(B)+'), so this entry will now change account balances.';
-  var summary=Object.keys(changes).map(function(k){return EDIT_FIELD_NAMES[k]+': '+editShow(k,changes[k].from)+' -> '+editShow(k,changes[k].to);}).join('\n');
-  if(!kfConfirm('Save these changes to "'+cur.desc+'"?\n\n'+summary+warn))return;
-  var at=nowISO();
-  n.edits=(cur.edits||[]).concat([{at:at,changes:changes,prevSig:txSig(cur)}]);n.updatedAt=at;
+  if(B&&changes.date&&((cur.date<B)!==(n.date<B)))warn=n.date<B?'The new date is before your baseline ('+fmtD(B)+'), so this entry will no longer change account balances: your opening balances already include it.':'The new date is on or after your baseline ('+fmtD(B)+'), so this entry will now change account balances.';
+  qs('edit-review-list').innerHTML='<div class="hint" style="margin-bottom:4px;">Changes to &ldquo;'+esc(cur.desc)+'&rdquo;:</div>'+Object.keys(changes).map(function(k){
+    return'<div class="kv-row" data-edit-change="'+esc(k)+'"><span class="k">'+esc(EDIT_FIELD_NAMES[k])+'</span><span class="v">'+esc(editShow(k,changes[k].from))+' &rarr; '+esc(editShow(k,changes[k].to))+'</span></div>';
+  }).join('');
+  qs('edit-review-warn').innerHTML=warn?'<div class="form-warn">'+esc(warn)+'</div>':'';
+  editMsg('');ctx.pending={n:n,changes:changes};editStep('review');
+}
+// CONFIRM AND SAVE: the only place an edit is written. The reviewed record is saved once.
+function confirmEdit(){
+  var ctx=editCtx,cb=qs('edit-confirm-btn');
+  if(!ctx||!ctx.pending||cb.disabled)return;
+  var cur=items.find(function(i){return i.id===ctx.id;});
+  if(!cur||JSON.stringify(cur)!==ctx.snap){editStep('form');editMsg('<div class="form-err">This entry changed after you opened it, so nothing was saved. Close this form and open the entry again.</div>');return;}
   if(saving){editMsg('<div class="form-err">Another save is still in progress, so nothing was saved yet. Try again in a moment.</div>');return;}
-  var sb=qs('edit-save-btn');if(sb.disabled)return;sb.disabled=true;sb.textContent='SAVING…';
+  var n=clone(ctx.pending.n),at=nowISO();
+  n.edits=(cur.edits||[]).concat([{at:at,changes:ctx.pending.changes,prevSig:txSig(cur)}]);n.updatedAt=at;
+  cb.disabled=true;cb.textContent='SAVING…';
   guard(function(){return commit([{store:'transactions',put:n}],[{store:'transactions',key:cur.id,expect:ctx.snap}]).then(function(){
     editCtx=null;closeModal('edit-modal');showToast('Changes saved');
   },function(e){
-    console.error(e);sb.disabled=false;sb.textContent='SAVE CHANGES';
+    console.error(e);editStep('form');
     editMsg('<div class="form-err"><b>Changes NOT saved.</b> '+esc(e&&e.code==='changed'?'This entry '+e.message+'. Close this form and open the entry again.':errText(e)+'. The entry is unchanged; your changes are still in the form so you can try again.')+'</div>');
   });});
 }
 qs('edit-save-btn').addEventListener('click',saveEdit);
+qs('edit-confirm-btn').addEventListener('click',confirmEdit);
+qs('edit-back-btn').addEventListener('click',function(){if(!saving&&!editSettling()){editStep('form');editMsg('');}});
 qs('edit-cancel-btn').addEventListener('click',closeEdit);
 qs('edit-close-btn').addEventListener('click',closeEdit);
 qs('edit-modal').addEventListener('click',function(e){if(e.target===qs('edit-modal'))closeEdit();});

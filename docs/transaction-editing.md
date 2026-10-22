@@ -16,8 +16,17 @@ amount, category, description, date, time, From and To account.
   nothing is counted twice.
 - **Cancel writes nothing.** So do the close button and tapping outside: the form only ever holds
   a copy. Saving without changing anything writes nothing either.
-- **The save asks for confirmation first,** listing each change. If the new date crosses the
-  baseline, it also says whether the entry will start or stop changing account balances.
+- **Saving takes two taps.** SAVE CHANGES checks the values and shows a review inside the form,
+  listing each changed field (old → new). Nothing is written until CONFIRM AND SAVE is tapped.
+  BACK TO EDITING returns to the fields with the typed values kept. CANCEL, the close button or
+  tapping outside closes the form without saving. If the new date crosses the baseline, the
+  review also says whether the entry will start or stop changing account balances.
+  - The review is part of the page, not a browser dialog. An earlier version used the browser's
+    `confirm()`. On the Android acceptance test the edit saved with no confirmation shown, and
+    whether a browser dialog appears is up to the browser.
+  - For a moment (600 ms) after the review appears, its buttons ignore taps. The buttons move
+    when the review replaces the fields, so the second tap of a double tap on SAVE CHANGES would
+    otherwise land on one of them.
 - **Every figure is recalculated from the entries,** so all of them follow the edit: account
   balances, Cash Now, free cash, the Director, Cash Flow, budgets, Net Worth, runway and bills.
 - **The record keeps its history** in `edits[]`: `{at, changes: {field: {from, to}}, prevSig}`.
@@ -100,6 +109,13 @@ general "reverse this entry" for other types would be a separate change.
   - balances, Director, Cash Flow, History and Inbox follow the edit;
   - the edit survives a restart;
   - the TEST build never touches the live database.
+- The confirmation path, against both builds:
+  - SAVE CHANGES shows exactly the changed fields and writes nothing;
+  - BACK TO EDITING keeps the typed values;
+  - a double tap on SAVE CHANGES does not save;
+  - CANCEL from the review leaves the original unchanged;
+  - CONFIRM AND SAVE, even double-tapped, applies the edit once;
+  - no browser dialog is used.
 - Cancel, the close button, tapping outside and "no changes".
 - Transfers, owner withdrawals, investments, capital injections and a change of type:
   - each account moves once;

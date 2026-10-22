@@ -117,8 +117,22 @@ const form = page => page.evaluate(() => ({
   cat: document.getElementById('edit-cat').value, date: document.getElementById('edit-date').value, time: document.getElementById('edit-time').value,
   from: document.getElementById('edit-from').value, to: document.getElementById('edit-to').value,
 }));
-const saveEditForm = async page => { await page.click('#edit-save-btn'); await page.waitForFunction(() => !document.getElementById('edit-modal').classList.contains('open')); };
+// Saving is two taps: SAVE CHANGES shows the in-form review of the changes (nothing written yet),
+// then CONFIRM AND SAVE writes them. The review is part of the page, never a browser dialog.
+const closed = page => page.waitForFunction(() => !document.getElementById('edit-modal').classList.contains('open'));
+const reviewChanges = async page => {
+  await page.click('#edit-save-btn');
+  await page.waitForSelector('#edit-review', { state: 'visible' });
+  return (await text(page, '#edit-review')).replace(/\s+/g, ' ').trim();
+};
+// The listed changes, one "Label: from → to" per changed field.
+const reviewRows = page => page.$$eval('#edit-review-list [data-edit-change]', rows => rows.map(r => r.querySelector('.k').textContent.trim() + ': ' + r.querySelector('.v').textContent.trim()));
+const confirmReview = async page => { await page.waitForSelector('#edit-confirm-btn[data-ready="1"]'); await page.click('#edit-confirm-btn'); };
+const saveEditForm = async page => { await reviewChanges(page); await confirmReview(page); await closed(page); };
+// A refused value is reported on SAVE CHANGES, before any review.
 const editError = async page => { await page.click('#edit-save-btn'); await page.waitForSelector('#edit-msg .form-err'); return (await text(page, '#edit-msg')).trim(); };
+// A failure while writing is reported after CONFIRM AND SAVE; the form returns to the fields.
+const confirmError = async page => { await reviewChanges(page); await confirmReview(page); await page.waitForSelector('#edit-msg .form-err'); return (await text(page, '#edit-msg')).trim(); };
 
 for (const b of BUILDS) {
   test(`${b.label}: editing an expense's amount, description and category changes the same record; balances and reports follow`, { skip }, async () => {
@@ -140,8 +154,9 @@ for (const b of BUILDS) {
     await openEditFrom(page, 'timeline', orig.id);
     assert.deepEqual(await form(page), { type: 'expense', typeLocked: false, amount: '5000', desc: 'Fictional lunch', cat: 'Food', date: orig.date, time: orig.time, from: 'acc_opay', to: '' });
     await page.fill('#edit-amount', '7500'); await page.fill('#edit-desc', 'Fictional lunch and drinks'); await page.selectOption('#edit-cat', 'Household');
-    await saveEditForm(page);
-    assert.match(page.dialogs.at(-1), /Amount: ₦5,000 -> ₦7,500[\s\S]*Description: Fictional lunch -> Fictional lunch and drinks[\s\S]*Category: Food -> Household/, 'the confirmation lists every change');
+    await reviewChanges(page);
+    assert.deepEqual(await reviewRows(page), ['Amount: ₦5,000 → ₦7,500', 'Description: Fictional lunch → Fictional lunch and drinks', 'Category: Food → Household'], 'the review lists every change');
+    await confirmReview(page); await closed(page);
 
     const after = await storedTxns(context, b.dbName);
     assert.equal(after.length, 1, 'edited in place: no second record');
@@ -179,6 +194,80 @@ for (const b of BUILDS) {
   });
 }
 
+for (const b of BUILDS) {
+  // Android acceptance defect: SAVE CHANGES saved at once, with no confirmation. The confirmation is now a
+  // review step inside the form (not a browser dialog), and this test drives that real path.
+  test(`${b.label}: SAVE CHANGES first shows the changes for confirmation; confirming saves once, going back or cancelling saves nothing`, { skip }, async () => {
+    const { context, page } = await ctx();
+    await openApp(page, b.url);
+    await liveSetup(page);
+    await addEntry(page, { amount: 5000, desc: 'Fictional acceptance expense', cat: 'Food', from: 'acc_opay' });
+    const [orig] = await storedTxns(context, b.dbName);
+    const unchanged = async why => {
+      assert.deepEqual(await storedTxns(context, b.dbName), [orig], why);
+      await nav(page, 'timeline');
+      assert.match(await text(page, '#timeline-list'), /Fictional acceptance expense[\s\S]*-₦5,000/, why);
+      await nav(page, 'home');
+      assert.equal(await acctBal(page, 'Opay'), 95000, why);
+    };
+    const dialogsBefore = page.dialogs.length;
+
+    // 1. SAVE CHANGES shows the proposed changes and writes nothing.
+    await openEditFrom(page, 'inbox', orig.id);
+    await page.fill('#edit-amount', '6000'); await page.fill('#edit-desc', 'ACCEPTANCE TEST - EDITED.');
+    const review = await reviewChanges(page);
+    assert.match(review, /Check your changes\. Nothing is saved until you tap CONFIRM AND SAVE/);
+    assert.match(review, /Changes to “Fictional acceptance expense”/);
+    assert.deepEqual(await reviewRows(page), ['Amount: ₦5,000 → ₦6,000', 'Description: Fictional acceptance expense → ACCEPTANCE TEST - EDITED.'], 'exactly the changed fields are listed');
+    assert.equal(await page.isVisible('#edit-fields'), false);
+    assert.equal(await page.isVisible('#edit-save-btn'), false);
+    assert.equal(await page.isVisible('#edit-confirm-btn'), true);
+    assert.equal(await page.isVisible('#edit-modal'), true);
+    assert.deepEqual(await storedTxns(context, b.dbName), [orig], 'nothing is saved while the changes are shown');
+
+    // 2. BACK TO EDITING returns to the fields with the typed values; still nothing saved.
+    await page.waitForSelector('#edit-confirm-btn[data-ready="1"]');
+    await page.click('#edit-back-btn');
+    assert.equal(await page.isVisible('#edit-fields'), true);
+    assert.equal(await page.inputValue('#edit-amount'), '6000');
+    assert.equal(await page.inputValue('#edit-desc'), 'ACCEPTANCE TEST - EDITED.');
+    assert.deepEqual(await storedTxns(context, b.dbName), [orig]);
+
+    // 3. A fast double tap on SAVE CHANGES cannot also confirm: the second tap is ignored.
+    await page.dblclick('#edit-save-btn');
+    await page.waitForSelector('#edit-review', { state: 'visible' });
+    await page.waitForTimeout(250);
+    assert.deepEqual(await storedTxns(context, b.dbName), [orig], 'a double tap shows the review, it does not save');
+    assert.equal(await page.isVisible('#edit-modal'), true);
+
+    // 4. CANCEL from the review closes the form and saves nothing.
+    await page.waitForSelector('#edit-confirm-btn[data-ready="1"]');
+    await page.click('#edit-cancel-btn'); await closed(page);
+    await unchanged('cancelled from the review: the original is unchanged');
+
+    // 5. Confirming saves the reviewed changes once, even with a double tap on CONFIRM AND SAVE.
+    await openEditFrom(page, 'timeline', orig.id);
+    assert.equal(await page.inputValue('#edit-desc'), 'Fictional acceptance expense', 'the form reopens with the saved values');
+    await page.fill('#edit-amount', '6000'); await page.fill('#edit-desc', 'ACCEPTANCE TEST - EDITED.');
+    await reviewChanges(page);
+    await page.waitForSelector('#edit-confirm-btn[data-ready="1"]');
+    await page.dblclick('#edit-confirm-btn');
+    await closed(page);
+    await page.waitForTimeout(300);
+    const after = await storedTxns(context, b.dbName);
+    assert.equal(after.length, 1, 'no second record');
+    assert.equal(after[0].id, orig.id);
+    assert.equal(after[0].amount, 6000); assert.equal(after[0].desc, 'ACCEPTANCE TEST - EDITED.');
+    assert.equal(after[0].edits.length, 1, 'applied once');
+    assert.deepEqual(Object.keys(after[0].edits[0].changes).sort(), ['amount', 'desc']);
+    await nav(page, 'home');
+    assert.equal(await acctBal(page, 'Opay'), 94000, 'the balance moved once');
+    assert.equal(page.dialogs.length, dialogsBefore, 'no browser dialog is used anywhere in the edit flow');
+    assert.deepEqual(page.errors, []);
+    await context.close();
+  });
+}
+
 test('TEST build: Cancel, the close button, tapping outside and "no changes" all leave the record exactly as it was', { skip }, async () => {
   const { context, page } = await ctx();
   await openApp(page, TEST.url);
@@ -211,8 +300,9 @@ test('TEST build: Cancel, the close button, tapping outside and "no changes" all
   assert.deepEqual(await form(page), { type: 'expense', typeLocked: false, amount: '2000', desc: 'Fictional bread', cat: 'Food', date: orig.date, time: orig.time, from: 'acc_opay', to: '' });
   // Saving without changing anything writes nothing and adds no history.
   const dialogs = page.dialogs.length;
-  await saveEditForm(page);
-  assert.equal(page.dialogs.length, dialogs, 'no confirmation: there was nothing to save');
+  await page.click('#edit-save-btn'); await closed(page);
+  assert.equal(page.dialogs.length, dialogs, 'no dialog');
+  assert.equal(await page.isVisible('#edit-review'), false, 'no review: there was nothing to save');
   assert.deepEqual(await storedTxns(context, TEST.dbName), [orig]);
   await nav(page, 'home');
   assert.equal(await acctBal(page, 'Opay'), 98000);
@@ -403,7 +493,7 @@ test('TEST build: invalid values are refused; a failed save and a record changed
   // A failed write: the form stays open with the new values; storage and the screen keep the original.
   await page.fill('#edit-amount', '9000');
   await page.evaluate(() => { window.__fail.write = true; });
-  assert.match(await editError(page), /Changes NOT saved[\s\S]*simulated write failure/);
+  assert.match(await confirmError(page), /Changes NOT saved[\s\S]*simulated write failure/);
   assert.equal(await page.inputValue('#edit-amount'), '9000');
   assert.deepEqual(await storedTxns(context, TEST.dbName), [orig]);
   assert.match(await text(page, '#timeline-list'), /Fictional fuel[\s\S]*-₦8,000/, 'History still shows the saved amount');
@@ -418,7 +508,7 @@ test('TEST build: invalid values are refused; a failed save and a record changed
   const elsewhere = Object.assign({}, txs[0], { desc: 'Fictional fuel (other tab)' });
   await putTxn(context, TEST.dbName, elsewhere);
   await page.fill('#edit-amount', '1');
-  assert.match(await editError(page), /Changes NOT saved[\s\S]*changed elsewhere/);
+  assert.match(await confirmError(page), /Changes NOT saved[\s\S]*changed elsewhere/);
   txs = await storedTxns(context, TEST.dbName);
   assert.deepEqual(txs, [elsewhere]);
   await page.click('#edit-cancel-btn');
@@ -428,8 +518,8 @@ test('TEST build: invalid values are refused; a failed save and a record changed
   await page.reload(); await page.waitForSelector('body[data-kf-ready="1"]');
   await openEditFrom(page, 'timeline', orig.id);
   await page.fill('#edit-date', daysAgo(90));
-  await saveEditForm(page);
-  assert.match(page.dialogs.at(-1), /before your baseline[\s\S]*will no longer change account balances/);
+  assert.match(await reviewChanges(page), /before your baseline[\s\S]*will no longer change account balances/);
+  await confirmReview(page); await closed(page);
   await nav(page, 'home');
   assert.equal(await acctBal(page, 'Opay'), 100000);
   assert.equal((await storedTxns(context, TEST.dbName)).length, 1);
