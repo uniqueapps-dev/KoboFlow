@@ -100,7 +100,9 @@ async function addEntry(page, { type = 'expense', amount, desc, cat, from = '', 
   await page.click(`.type-chip[data-type="${type}"]`);
   await page.fill('#modal-amount', String(amount)); await page.fill('#modal-desc', desc);
   if (cat) await page.selectOption('#modal-cat', cat);
-  await page.selectOption('#modal-from', from); await page.selectOption('#modal-to', to);
+  // Add Entry shows only the accounts the type uses (an expense has no To account).
+  if (await page.isVisible('#modal-from')) await page.selectOption('#modal-from', from);
+  if (await page.isVisible('#modal-to')) await page.selectOption('#modal-to', to);
   await page.click('#modal-save-btn');
   await page.waitForFunction(() => !document.getElementById('modal-overlay').classList.contains('open'));
 }

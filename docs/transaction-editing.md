@@ -8,7 +8,8 @@
   (History) instead, and open the agreement.
 
 The form (`openEdit`, `saveEdit` in `koboflow.html`) is prefilled with the saved values: type,
-amount, category, description, date, time, From and To account.
+amount, category, description, Paid to or Received from (see `docs/destination-tracking.md`), date,
+time, From and To account.
 
 ## What happens on save
 

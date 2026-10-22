@@ -253,6 +253,7 @@ for (const b of BUILDS) {
     await log('green', 5000, 'Repair', 'Fictional repair');
     await page.click('#add-btn'); await page.waitForSelector('#modal-overlay[data-form-ready="1"]');
     await page.fill('#modal-amount', '2000'); await page.fill('#modal-desc', 'Fictional wash'); await page.selectOption('#modal-cat', 'Vehicle: Sportage Black');
+    await page.selectOption('#modal-from', { index: 1 }); // an expense needs the account it is paid from
     await page.click('#modal-save-btn');
     await page.waitForFunction(() => !document.getElementById('modal-overlay').classList.contains('open'));
     await seed(context, b.dbName, [{ id: 92001, amount: 7000, desc: 'Fictional voided fuel', cat: 'Vehicle: FJR1300AE', type: 'expense', vehicle: 'fjr', state: 'Linked', date: today(), time: '10:00', fromAcct: 'acc_opay', toAcct: '', voided: true }]);

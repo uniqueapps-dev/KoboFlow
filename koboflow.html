@@ -905,6 +905,25 @@ function validateBill(b,opts){
 }
 function coveredAmount(obligations,coverage){return fromK(sum(obligations||[],function(o){return Math.min(toK(o.remaining),toK((coverage||{})[o.id]||0));}));}
 /* Records that can distort recommendations. Never rewrites anything; each item says what to check. */
+/* Descriptive "who" fields. paidTo: where money went (a shop, a supplier, a lender). receivedFrom: where it
+   came from (a customer, an investor). They are text only, never an account: no balance, cash, report or
+   reservation function reads them, so they cannot move or create money. Transfers have neither (both sides
+   are your own accounts). */
+/* History date range. An entry belongs to the calendar date written on it (YYYY-MM-DD, local, as every other
+   screen and the baseline compare it); a value with a time part ("2026-10-05T23:30") belongs to the date in
+   it. Both ends are inclusive and compared as whole dates, so a late-evening entry on the end date is in.
+   A missing or impossible date (2026-02-31) belongs to no range: it is never shown inside one. */
+function dateKey(s){if(typeof s!=='string')return null;var m=/^(\d{4})-(\d{2})-(\d{2})(?:T|$)/.exec(s);if(!m)return null;var k=m[0].slice(0,10),d=parseDate(k);return d&&fmtDate(d)===k?k:null;}
+function inDateRange(s,from,to){var k=dateKey(s);return !!k&&(!from||k>=from)&&(!to||k<=to);}
+var PARTY_MAX=80;
+var PARTY_FIELD={expense:'paidTo',obligation:'paidTo',owner_withdrawal:'paidTo',investment:'paidTo',loan_repayment:'paidTo',income:'receivedFrom',capital_injection:'receivedFrom',loan_receipt:'receivedFrom'};
+function partyField(type){return PARTY_FIELD[type]||null;}
+// A string with control and direction-override characters removed and spaces collapsed; null if not a string.
+function cleanParty(v){if(typeof v!=='string')return null;return v.replace(/[\u0000-\u001F\u007F\u202A-\u202E\u2066-\u2069]/g,' ').replace(/\s+/g,' ').trim();}
+// The names on an entry, normalised (spacing and capitals ignored), for matching.
+// Shortens to the limit without splitting a character made of two code units (e.g. an emoji).
+function clipParty(v){var c=cleanParty(v);if(!c)return c;return c.length<=PARTY_MAX?c:c.slice(0,PARTY_MAX).replace(/[\uD800-\uDBFF]$/,'').trim();}
+function partyKey(t){return[cleanParty(t&&t.paidTo)||'',cleanParty(t&&t.receivedFrom)||''].join('|').toLowerCase();}
 function dataQuality(o){
   o=o||{};var td=o.today||today(),ids={},al=o.aliases||{},out=[],live=(o.txns||[]).filter(function(t){return t&&!t.demo&&!t.voided;});
   (o.accountIds||[]).forEach(function(id){ids[id]=1;});
@@ -914,9 +933,11 @@ function dataQuality(o){
   add('future_dated','medium',live.filter(function(t){return(t.date||'')>td;}),function(n){return n+' entr'+(n>1?'ies are':'y is')+' dated in the future. Future-dated entries already move balances; check the dates.';});
   add('unmapped_account','high',live.filter(function(t){var bad=false;[t.fromAcct,t.toAcct].forEach(function(x){if(x){var r=res(x);if(!r||!ids[r])bad=true;}});return bad;}),function(n){return n+' entr'+(n>1?'ies use':'y uses')+' an account that is not set up or is set to "Not used": '+(n>1?'they move':'it moves')+' no balance.';});
   add('missing_account','high',live.filter(function(t){var c=classifyTxn(t);return(c.cashIn>0&&!t.toAcct)||((c.cashOut>0||c.ownerOut>0)&&!t.fromAcct);}),function(n){return n+' entr'+(n>1?'ies have':'y has')+' no account, so '+(n>1?'they are':'it is')+' not in any balance.';});
-  var g={};live.forEach(function(t){if(t.agreementId)return;var k=[t.date,toK(t.amount),t.type,String(t.desc||'').trim().toLowerCase(),t.fromAcct||'',t.toAcct||''].join('|');(g[k]=g[k]||[]).push(t);});
+  // Who it was paid to / received from is part of the match: the same amount paid on the same day to two
+  // different places is two payments, not a repeat. Entries without names match exactly as before.
+  var g={};live.forEach(function(t){if(t.agreementId)return;var k=[t.date,toK(t.amount),t.type,String(t.desc||'').trim().toLowerCase(),t.fromAcct||'',t.toAcct||'',partyKey(t)].join('|');(g[k]=g[k]||[]).push(t);});
   var dups=[];Object.keys(g).forEach(function(k){if(g[k].length>1)dups=dups.concat(g[k].slice(1));});
-  add('possible_duplicates','medium',dups,function(n){return n+' entr'+(n>1?'ies look':'y looks')+' like a repeat of another (same date, amount, type, description and accounts). Check before relying on the totals.';});
+  add('possible_duplicates','medium',dups,function(n){return n+' entr'+(n>1?'ies look':'y looks')+' like a repeat of another (same date, amount, type, description, accounts and paid-to / received-from name). Check before relying on the totals.';});
   if(parseDate(o.baselineDate))add('pre_baseline','info',live.filter(function(t){return(t.date||'')<o.baselineDate;}),function(n){return n+' entr'+(n>1?'ies are':'y is')+' dated before your baseline: kept in history, not in balances.';});
   return out;
 }
@@ -1292,7 +1313,7 @@ var API={toK:toK,fromK:fromK,num:num,fmtDate:fmtDate,parseDate:parseDate,today:t
   isDebt:isDebt,cashReceived:function(t){return fromK(cashReceivedK(t));},buildSchedule:buildSchedule,termsSummary:termsSummary,
   instalmentStates:instalmentStates,agreementBalances:agreementBalances,allocatePayment:allocatePayment,settlementPlan:settlementPlan,
   classifyTxn:classifyTxn,accountDeltas:accountDeltas,accountBalances:accountBalances,upcomingObligations:upcomingObligations,cashForecast:cashForecast,
-  buildReminders:buildReminders,xirr:xirr,ACCOUNT_KINDS:ACCOUNT_KINDS,LEGACY_ACCOUNTS:LEGACY_ACCOUNTS,bucketSummary:bucketSummary,accountAccess:accountAccess,cashPosition:cashPosition,cashCover:cashCover,reservationPlan:reservationPlan,coveredAmount:coveredAmount,BILL_REPEAT:BILL_REPEAT,billDueDates:billDueDates,billAmountOn:billAmountOn,billOccurrences:billOccurrences,billObligations:billObligations,billUnmatchedPayments:billUnmatchedPayments,validateBill:validateBill,dataQuality:dataQuality,budgetProgress:budgetProgress,directorPlan:directorPlan,spendingRunway:spendingRunway,validateSetup:validateSetup,cashFlowSummary:cashFlowSummary,oppRepayments:oppRepayments,analyzeOpportunity:analyzeOpportunity,oppToTerms:oppToTerms,parseManualRows:parseManualRows};
+  buildReminders:buildReminders,xirr:xirr,ACCOUNT_KINDS:ACCOUNT_KINDS,LEGACY_ACCOUNTS:LEGACY_ACCOUNTS,bucketSummary:bucketSummary,accountAccess:accountAccess,cashPosition:cashPosition,cashCover:cashCover,reservationPlan:reservationPlan,coveredAmount:coveredAmount,BILL_REPEAT:BILL_REPEAT,billDueDates:billDueDates,billAmountOn:billAmountOn,billOccurrences:billOccurrences,billObligations:billObligations,billUnmatchedPayments:billUnmatchedPayments,validateBill:validateBill,dataQuality:dataQuality,PARTY_MAX:PARTY_MAX,dateKey:dateKey,inDateRange:inDateRange,partyField:partyField,cleanParty:cleanParty,partyKey:partyKey,clipParty:clipParty,budgetProgress:budgetProgress,directorPlan:directorPlan,spendingRunway:spendingRunway,validateSetup:validateSetup,cashFlowSummary:cashFlowSummary,oppRepayments:oppRepayments,analyzeOpportunity:analyzeOpportunity,oppToTerms:oppToTerms,parseManualRows:parseManualRows};
 root.KoboFin=API;
 if(typeof module!=='undefined'&&module.exports)module.exports=API;
 })(typeof window!=='undefined'?window:this);
@@ -1424,6 +1445,9 @@ button{cursor:pointer;}
 .tl-amount.investment{color:var(--amber);}
 #tl-search{width:100%;background:var(--surf2);border:1px solid var(--border);border-radius:8px;padding:9px 12px;color:var(--text);font-size:13px;outline:none;margin-bottom:10px;}
 #tl-search:focus{border-color:var(--amber);}
+.tl-range{display:flex;gap:6px;align-items:flex-end;margin-bottom:10px;flex-wrap:wrap;}
+.tl-range label{display:flex;flex-direction:column;font-size:10px;color:var(--muted);text-transform:uppercase;letter-spacing:.06em;gap:3px;flex:1;min-width:120px;}
+.tl-range input{background:var(--surf2);border:1px solid var(--border);border-radius:8px;padding:7px 8px;color:var(--text);font-size:13px;}
 .tl-filter-row{display:flex;gap:5px;margin-bottom:14px;overflow-x:auto;scrollbar-width:none;}
 .tl-filter-row::-webkit-scrollbar{display:none;}
 .tl-filter-btn{background:var(--surf2);color:var(--muted);border:none;border-radius:5px;padding:5px 11px;font-size:10px;font-weight:700;letter-spacing:.08em;white-space:nowrap;}
@@ -1716,6 +1740,7 @@ body.kf-live .sample-tag{display:inline-block;}
         <span id="preview-type" class="pill"></span>
         <span id="preview-cat" class="pill"></span>
         <span id="preview-acct" class="pill" style="background:#222228;color:#7A7880;"></span>
+        <span id="preview-party" class="pill" style="background:#222228;color:#C9C7D0;display:none;"></span>
       </div>
     </div>
     <div id="capture-hint">2500 fuel fjr &middot; 15000 fuel green &middot; 50000 owner withdrawal &middot; 150000 restock emzor</div>
@@ -1800,7 +1825,13 @@ body.kf-live .sample-tag{display:inline-block;}
     <div class="screen" id="screen-timeline">
       <div class="screen-title">FINANCIAL TIMELINE</div>
       <div class="screen-sub">What happened to my money?</div>
-      <input id="tl-search" type="text" placeholder="Search entries, categories, vehicles..."/>
+      <input id="tl-search" type="text" placeholder="Search entries, categories, paid to / received from..."/>
+      <div class="tl-range" id="tl-range">
+        <label>From<input id="tl-from" type="date" aria-label="Show entries from this date"/></label>
+        <label>To<input id="tl-to" type="date" aria-label="Show entries up to and including this date"/></label>
+        <button class="tl-filter-btn" id="tl-range-clear" type="button">Clear dates</button>
+      </div>
+      <div id="tl-range-msg" class="muted-note" style="display:none;margin:-4px 0 10px;"></div>
       <div class="tl-filter-row" id="tl-filter-row">
         <button class="tl-filter-btn active" data-f="all">All</button>
         <button class="tl-filter-btn" data-f="income">Income</button>
@@ -2220,6 +2251,7 @@ body.kf-live .sample-tag{display:inline-block;}
       <div id="modal-bill-wrap" style="display:none;margin-bottom:8px;"><select id="modal-bill" class="modal-input" aria-label="Which bill is this payment for?" style="margin-bottom:0;"></select></div>
       <input id="modal-amount" class="modal-input" type="number" inputmode="numeric" placeholder="Amount"/>
       <input id="modal-desc" class="modal-input" type="text" placeholder="Description"/>
+      <div id="modal-party-wrap"><input id="modal-party" class="modal-input" type="text" maxlength="80" list="party-suggest" autocomplete="off" placeholder="Paid to (optional), e.g. Fuel station" aria-label="Paid to (optional)"/></div>
       <select id="modal-cat" class="modal-input">
         <option>Vehicle: FJR1300AE</option><option>Vehicle: Sportage Green</option><option>Vehicle: Sportage Black</option>
         <option>Food</option><option>Household</option><option>Business Overhead</option>
@@ -2227,15 +2259,17 @@ body.kf-live .sample-tag{display:inline-block;}
         <option>Obligations</option><option>Loan</option><option>Savings</option><option selected>Other</option>
       </select>
       <div class="grid2" style="margin-bottom:0;">
-        <div>
+        <div id="modal-from-wrap">
           <div style="font-size:10px;color:var(--muted);text-transform:uppercase;letter-spacing:.08em;margin-bottom:4px;">From Account</div>
           <select id="modal-from" class="modal-input" style="margin-bottom:0;"></select>
         </div>
-        <div>
+        <div id="modal-to-wrap">
           <div style="font-size:10px;color:var(--muted);text-transform:uppercase;letter-spacing:.08em;margin-bottom:4px;">To Account</div>
           <select id="modal-to" class="modal-input" style="margin-bottom:0;"></select>
         </div>
       </div>
+      <div class="muted-note" id="modal-acct-hint" style="margin:8px 0 0;"></div>
+      <datalist id="party-suggest"></datalist>
       <button class="modal-save" id="modal-save-btn" style="margin-top:12px;">SAVE ENTRY</button>
     </div>
   </div>
@@ -2251,6 +2285,7 @@ body.kf-live .sample-tag{display:inline-block;}
         <div class="form-group"><label>Category</label><select id="edit-cat" class="form-input"></select></div>
       </div>
       <div class="form-group"><label>Description</label><input id="edit-desc" class="form-input" type="text"/></div>
+      <div class="form-group" id="edit-party-wrap"><label id="edit-party-label" for="edit-party">Paid to (optional)</label><input id="edit-party" class="form-input" type="text" maxlength="80" list="party-suggest" autocomplete="off"/></div>
       <div class="grid2" style="margin-bottom:0;">
         <div class="form-group"><label>Date</label><input id="edit-date" class="form-input" type="date"/></div>
         <div class="form-group"><label>Time</label><input id="edit-time" class="form-input" type="time"/></div>
@@ -2523,7 +2558,8 @@ function getNow(){return new Date().toTimeString().slice(0,5);}
 /* Local calendar dates (UTC dates were a day off before 1am in Lagos) */
 function getToday(){return KoboFin.today();}
 function getYest(){return KoboFin.addDays(KoboFin.today(),-1);}
-function dateLabel(iso){var t=getToday(),y=getYest();if(iso===t)return'Today';if(iso===y)return'Yesterday';var d=new Date(iso);return d.toLocaleDateString('en-NG',{day:'numeric',month:'short',year:'numeric'});}
+// Read as a local calendar date (new Date('YYYY-MM-DD') would read it as UTC midnight and could show the day before).
+function dateLabel(iso){var t=getToday(),y=getYest();if(iso===t)return'Today';if(iso===y)return'Yesterday';var d=KoboFin.parseDate(iso);return d?d.toLocaleDateString('en-NG',{day:'numeric',month:'short',year:'numeric'}):String(iso||'No date');}
 function qs(id){return document.getElementById(id);}
 function raf2(fn){requestAnimationFrame(function(){requestAnimationFrame(fn);});}
 function showToast(msg){var t=qs('toast');if(!t)return;t.textContent=msg;t.className='show';setTimeout(function(){t.className='';},2200);}
@@ -2615,11 +2651,35 @@ var items=[
 ];
 
 var nextId=200,nextVlogId=100;
-var activeVehicle='fjr',activeFilter='All',modalType='expense',tlFilter='all',tlSearch='';
+var activeVehicle='fjr',activeFilter='All',modalType='expense',tlFilter='all',tlSearch='',tlFrom='',tlTo='';
 var CAT_COLORS=['#F5A623','#3B82F6','#22C55E','#A855F7','#EF4444','#14B8A6','#F97316','#EC4899'];
 var STATES=['All','Unprocessed','AI Categorized','Needs Review','Linked'];
 var SS={'Unprocessed':{bg:'#222228',color:'#7A7880'},'AI Categorized':{bg:'#0D1A2E',color:'#3B82F6'},'Needs Review':{bg:'#3D2A0A',color:'#F5A623'},'Linked':{bg:'#0D2E1A',color:'#22C55E'},'Archived':{bg:'#222228',color:'#4A4858'}};
 
+/* Quick entry "5000 fjr fuel @ Fuel station": the text after " @ " is who it was paid to (or, for money in,
+   received from). It is split off BEFORE the entry is read, so a name such as "Transfer Hub" cannot change
+   the type, category or account. "@" inside a word (an e-mail address) is left as text. Anything unclear
+   is refused with a reason, never guessed: more than one " @ ", nothing after it, a name that is too long,
+   or a name on an entry that has none (a transfer is between two of your own accounts). */
+function splitParty(raw){
+  var marks=String(raw).match(/\s@/g)||[];
+  if(!marks.length)return{text:raw,party:''};
+  if(marks.length>1)return{err:'Use " @ " only once: write who it was paid to after it.'};
+  var i=String(raw).search(/\s@/),text=raw.slice(0,i),party=F.cleanParty(raw.slice(i+2))||'';
+  if(!party)return{err:'Write who it was paid to (or received from) after " @ ", or remove the @.'};
+  if(party.length>F.PARTY_MAX)return{err:'The name after " @ " is too long: keep it to '+F.PARTY_MAX+' characters.'};
+  return{text:text,party:party};
+}
+function captureParse(raw){
+  var sp=splitParty(raw);if(sp.err)return sp;
+  var e=parseEntry(sp.text);
+  if(sp.party){
+    var pf=F.partyField(e.type);
+    if(!pf)return{err:'A '+typeLabel(e.type)+' is between two of your own accounts, so it has no payee: remove the " @ " part.'};
+    e[pf]=sp.party;e.partyField=pf;
+  }
+  return{e:e};
+}
 function parseEntry(raw){
   var parts=raw.trim().split(/\s+/);
   var amount=parseFloat(parts[0].replace(/,/g,''));
@@ -2635,7 +2695,7 @@ function parseEntry(raw){
   }
   if(!vehicle){
     if(/restock|emzor|dana|juhel|fidson|health gear|inventory purchase|supplier stock/.test(rest)){cat='Restocking';fromAcct='pharma_cash';}
-    else if(/pharmacy sales|daily sales|sales summary/.test(rest)){cat='Pharmacy Sales';type='income';toAcct='pharma_cash';}
+    else if(/pharmacy sales|daily sales|sales summary/.test(rest)){cat='Pharmacy Sales';type='income';toAcct='pharma_cash';fromAcct='';} // income has no From account (it used to keep the default and count as a transfer)
     else if(/owner withdrawal|owner w\/d|withdrawal/.test(rest)){cat='Owner Withdrawal';type='owner_withdrawal';fromAcct='pharma_cash';toAcct='pers_cash';}
     else if(/loan received|loan proceeds/.test(rest)){cat='Loan Proceeds';type='loan_receipt';toAcct='pharma_bank';fromAcct='';}
     else if(/capital injection/.test(rest)){cat='Capital Injection';type='capital_injection';toAcct='pharma_bank';fromAcct='';}
@@ -2646,7 +2706,7 @@ function parseEntry(raw){
     else if(/internet|electricity|nepa|ibedc|generator|rent/.test(rest)){cat='Business Overhead';fromAcct='pharma_cash';}
     else if(/household|house|home|kerosene|gas|cooking/.test(rest)){cat='Household';}
     else if(/repair|fix|maintenance|mechanic/.test(rest)){cat='Business Overhead';fromAcct='pharma_cash';}
-    else if(/salary|income|refund|gift/.test(rest)){cat='Income';type='income';toAcct='pers_cash';}
+    else if(/salary|income|refund|gift/.test(rest)){cat='Income';type='income';toAcct='pers_cash';fromAcct='';}
     else if(/invest|fixed deposit/.test(rest)){cat='Investment';type='investment';fromAcct='pers_bank';toAcct='fixed_dep';}
   }
   return{amount:isNaN(amount)?0:amount,desc:desc||'Entry',cat:cat,type:type,vehicle:vehicle||null,fromAcct:fromAcct,toAcct:toAcct,state:type==='loan_receipt'||review?'Needs Review':'AI Categorized'};
@@ -2720,7 +2780,7 @@ function renderInbox(){
     // An uncertain spending entry can be given its real category (e.g. which vehicle the fuel was for).
     var fix=i.state==='Needs Review'&&(i.type==='expense'||i.type==='obligation')?'<div class="reclass-row" style="display:flex;gap:6px;margin-top:6px;"><select class="form-input" data-reclass-sel="'+esc(i.id)+'" aria-label="Correct category" style="padding:6px;font-size:12px;"><option value="">Correct the category&hellip;</option>'
       +budgetCats().map(function(c){return'<option>'+esc(c)+'</option>';}).join('')+'</select><button class="act-btn act-approve" data-reclass="'+esc(i.id)+'">SAVE</button></div>':'';
-    return'<div class="inbox-item'+(i.state==='Needs Review'?' needs-review':'')+'"><div class="'+icCls+'">'+icCh+'</div><div class="inbox-mid"><div style="display:flex;align-items:center;gap:6px;margin-bottom:3px;flex-wrap:wrap;"><span class="inbox-desc-txt">'+esc(i.desc)+'</span>'+pill(i.state,ss2.bg,ss2.color)+pill(typeLabel(i.type),'#222228','#7A7880')+'</div><div class="inbox-meta">'+esc(dateLabel(i.date))+' &middot; '+esc(i.time)+' &middot; '+esc(i.cat)+'</div>'+fix+'</div><div class="inbox-right"><div class="amount-badge '+cls(i.type)+'">'+sign+fmt(i.amount)+'</div>'+acts+'</div></div>';
+    return'<div class="inbox-item'+(i.state==='Needs Review'?' needs-review':'')+'"><div class="'+icCls+'">'+icCh+'</div><div class="inbox-mid"><div style="display:flex;align-items:center;gap:6px;margin-bottom:3px;flex-wrap:wrap;"><span class="inbox-desc-txt">'+esc(i.desc)+'</span>'+pill(i.state,ss2.bg,ss2.color)+pill(typeLabel(i.type),'#222228','#7A7880')+'</div><div class="inbox-meta">'+esc(dateLabel(i.date))+' &middot; '+esc(i.time)+' &middot; '+esc(i.cat)+partyText(i)+'</div>'+fix+'</div><div class="inbox-right"><div class="amount-badge '+cls(i.type)+'">'+sign+fmt(i.amount)+'</div>'+acts+'</div></div>';
   }).join('');
 }
 
@@ -3272,10 +3332,13 @@ function agrFormSync(){
     +sc.warnings.map(function(w){return'<div class="form-warn">'+esc(w)+'</div>';}).join('')+'</div>';
 }
 function fundingCat(nature){return{equity:'Equity Investment',gift:'Gift Received',capital_injection:'Capital Injection',profit_share:'Profit-Share Funding',other_non_loan:'Other Funding'}[nature]||'Funding';}
+// A name for paidTo / receivedFrom taken from a bill or an agreement: cleaned and length-limited, '' if none.
+function partyName(v){return F.clipParty(v)||'';}
 function receiptTxn(agr,amt,acct,date){
   var debt=F.isDebt(agr.terms),tx={id:newTxnId(),amount:amt,desc:(debt?'Loan received: ':'Funding received: ')+agr.name,cat:debt?'Loan Proceeds':fundingCat(agr.terms.nature),
     type:debt?'loan_receipt':'capital_injection',state:'Linked',date:date||getToday(),time:getNow(),fromAcct:'',toAcct:acct,agreementId:agr.id,idemKey:'receipt:'+agr.id,createdAt:nowISO()};
   if(!debt)tx.fundingKind=agr.terms.nature;
+  var who=partyName(agr.counterparty);if(who)tx.receivedFrom=who; // the lender or investor: a name only
   return tx;
 }
 function instRecords(agrId,sched,ver,now){
@@ -3407,6 +3470,7 @@ function paymentOps(a,amount,acct,date,plan,mode,idem,extra){
   extra=extra||{};
   var tx={id:newTxnId(),amount:amount,desc:(extra.settlement?'Early settlement: ':'Loan repayment: ')+a.name,cat:'Loan Repayment',type:'loan_repayment',state:'Linked',date:date,time:getNow(),fromAcct:acct,toAcct:'',agreementId:a.id,
     alloc:{principal:plan.split.principal,interest:plan.split.interest,fees:plan.split.fees,unsplit:plan.split.unsplit},allocMode:mode,idemKey:idem,note:extra.note||'',settlement:!!extra.settlement,createdAt:nowISO()};
+  var who=partyName(a.counterparty);if(who)tx.paidTo=who; // the lender: a name only, the split and allocations are unchanged
   var ops=[{store:'transactions',put:tx}];
   plan.rows.forEach(function(r,k){ops.push({store:'allocations',put:{id:'al_'+tx.id+'_'+k,agreementId:a.id,txnId:tx.id,instalmentId:r.instalmentId,kind:r.kind,principal:r.principal,interest:r.interest,fees:r.fees,unsplit:r.unsplit,date:date,provisional:mode==='provisional',reversed:false}});});
   return{tx:tx,ops:ops};
@@ -4067,12 +4131,27 @@ function renderDashboard(){
 }
 
 function txSign(t){return isIn(t.type)?'+':(t.type==='transfer'||t.type==='owner_withdrawal'||t.type==='investment')?'~':'-';}
+// Paid to / received from, for display after the category ('' when the entry has neither).
+function partyText(i){return i.paidTo?' &middot; paid to '+esc(i.paidTo):i.receivedFrom?' &middot; from '+esc(i.receivedFrom):'';}
+/* The History date range: '' = no limit on that side. A start after the end is reported and not applied
+   (all dates stay shown), so the list never silently shows nothing. */
+function tlRange(){var bad=!!(tlFrom&&tlTo&&tlFrom>tlTo);return{on:!bad&&!!(tlFrom||tlTo),bad:bad};}
 function renderTimeline(){
+  var rg=tlRange(),undated=0,q=(tlSearch||'').toLowerCase();
   var filtered=items.filter(function(i){
+    if(rg.on&&!F.inDateRange(i.date,tlFrom,tlTo)){if(!F.dateKey(i.date))undated++;return false;}
     var mf=tlFilter==='all'||i.type===tlFilter||(tlFilter==='today'&&i.date===getToday())||(tlFilter==='yesterday'&&i.date===getYest())||(tlFilter==='loans'&&(i.agreementId||i.type==='loan_receipt'||i.type==='loan_repayment'||(i.type==='capital_injection'&&i.cat==='Loan')));
-    var ms=!tlSearch||((i.desc||'').toLowerCase().indexOf(tlSearch.toLowerCase())>=0)||((i.cat||'').toLowerCase().indexOf(tlSearch.toLowerCase())>=0);
+    var ms=!q||[i.desc,i.cat,i.paidTo,i.receivedFrom].some(function(x){return typeof x==='string'&&x.toLowerCase().indexOf(q)>=0;});
     return mf&&ms;
   });
+  var rm=qs('tl-range-msg');
+  if(rm){
+    rm.style.display=rg.on||rg.bad?'':'none';
+    rm.style.color=rg.bad?'var(--red)':'';
+    rm.textContent=rg.bad?'The start date is after the end date, so the date range is not applied: showing all dates.'
+      :rg.on?'Showing '+filtered.length+' entr'+(filtered.length===1?'y':'ies')+' dated '+(tlFrom&&tlTo?(tlFrom===tlTo?'on '+fmtD(tlFrom):'from '+fmtD(tlFrom)+' to '+fmtD(tlTo)+', both days included'):tlFrom?'on or after '+fmtD(tlFrom):'on or before '+fmtD(tlTo))+'.'
+        +(undated?' '+undated+' entr'+(undated===1?'y has':'ies have')+' no valid date and '+(undated===1?'is':'are')+' not shown while a range is set.':''):'';
+  }
   var groups={},order=[];
   filtered.forEach(function(i){if(!groups[i.date]){groups[i.date]=[];order.push(i.date);}groups[i.date].push(i);});
   var el=qs('timeline-list');if(!el)return;
@@ -4088,9 +4167,9 @@ function renderTimeline(){
       // A saved entry that can be edited opens the edit form on tap; loan entries open their agreement.
       var ed=editRule(i).ok,open=i.agreementId?' data-open-agr="'+esc(i.agreementId)+'" style="cursor:pointer;"':ed?' data-edit-txn="'+esc(i.id)+'" style="cursor:pointer;"':'';
       var hint=i.agreementId&&!i.voided?' &middot; tap to open the loan':'';
-      return'<div class="tl-item'+(i.voided?' voided':'')+'"'+open+'><div class="tl-dot '+cls(i.type)+'"></div><div class="tl-body"><div class="tl-desc">'+esc(i.desc)+'</div><div class="tl-meta">'+esc(i.time)+' &middot; '+esc(i.cat)+ac+note+hint+(i.demo?' &middot; sample':'')+'</div></div><div class="'+amtc+'">'+txSign(i)+fmt(i.amount)+'</div>'+(ed?'<button class="act-btn act-edit" data-edit-txn="'+esc(i.id)+'" aria-label="Edit this entry">EDIT</button>':'')+'</div>';
+      return'<div class="tl-item'+(i.voided?' voided':'')+'"'+open+'><div class="tl-dot '+cls(i.type)+'"></div><div class="tl-body"><div class="tl-desc">'+esc(i.desc)+'</div><div class="tl-meta">'+esc(i.time)+' &middot; '+esc(i.cat)+partyText(i)+ac+note+hint+(i.demo?' &middot; sample':'')+'</div></div><div class="'+amtc+'">'+txSign(i)+fmt(i.amount)+'</div>'+(ed?'<button class="act-btn act-edit" data-edit-txn="'+esc(i.id)+'" aria-label="Edit this entry">EDIT</button>':'')+'</div>';
     }).join('');
-    return'<div class="tl-day-header"><div class="tl-day-label">'+dateLabel(date).toUpperCase()+'</div><div class="tl-day-net" style="color:'+nc+';">Net income less spending: '+(dn>=0?'+':'-')+fmt(Math.abs(dn))+'</div></div>'+rows;
+    return'<div class="tl-day-header"><div class="tl-day-label">'+esc(dateLabel(date).toUpperCase())+'</div><div class="tl-day-net" style="color:'+nc+';">Net income less spending: '+(dn>=0?'+':'-')+fmt(Math.abs(dn))+'</div></div>'+rows;
   }).join('');
 }
 
@@ -4449,6 +4528,7 @@ function saveBillPay(){
   if(!F.parseDate(date)||date>getToday()){billPayMsg('<div class="form-err">Choose the date it was paid (not in the future).</div>');return;}
   if(!acct){billPayMsg('<div class="form-err">Choose the account it was paid from.</div>');return;}
   var rec={id:newTxnId(),amount:amt,desc:f.bill.name,cat:f.bill.cat||'Utilities',type:'obligation',state:'Linked',date:date,time:getNow(),fromAcct:acct,toAcct:'',billId:f.bill.id,billOcc:o.id,idemKey:billPayCtx.idem,createdAt:nowISO()};
+  var who=partyName(f.bill.name);if(who)rec.paidTo=who; // paid to: the bill
   if(saving){billPayMsg('<div class="form-err">Another save is still in progress, so nothing was recorded yet. Try again in a moment.</div>');return;}
   var sb=qs('bill-pay-save-btn');if(sb.disabled)return;sb.disabled=true;sb.textContent='SAVING…';
   guard(function(){return commit([{store:'transactions',put:rec}]).then(function(){
@@ -4583,10 +4663,11 @@ function csvNum(v){
   return csvText(v);
 }
 function csvRows(list){
-  var head=['ID','Date','Time','Description','Category','Type','Amount','From','To','State','Agreement','Principal','Interest','Fees','Unsplit','Reversed'];
+  // "Paid to" / "Received from" are names, added at the end so the existing columns keep their positions.
+  var head=['ID','Date','Time','Description','Category','Type','Amount','From','To','State','Agreement','Principal','Interest','Fees','Unsplit','Reversed','Paid to','Received from'];
   return [head.map(csvText).join(',')].concat(list.map(function(i){var a=i.alloc||{};
     function opt(v){return v?csvNum(v):'';} // blank when absent or zero, as before
-    return[csvNum(i.id),csvText(i.date),csvText(i.time),csvText(i.desc),csvText(i.cat),csvText(i.type),csvNum(i.amount),csvText(i.fromAcct||''),csvText(i.toAcct||''),csvText(i.state),csvText(i.agreementId||''),opt(a.principal),opt(a.interest),opt(a.fees),opt(a.unsplit),i.voided?'yes':''].join(',');
+    return[csvNum(i.id),csvText(i.date),csvText(i.time),csvText(i.desc),csvText(i.cat),csvText(i.type),csvNum(i.amount),csvText(i.fromAcct||''),csvText(i.toAcct||''),csvText(i.state),csvText(i.agreementId||''),opt(a.principal),opt(a.interest),opt(a.fees),opt(a.unsplit),i.voided?'yes':'',csvText(typeof i.paidTo==='string'?i.paidTo:''),csvText(typeof i.receivedFrom==='string'?i.receivedFrom:'')].join(',');
   }));
 }
 function exportCSV(){
@@ -4642,6 +4723,19 @@ function dlFile(name,content,mime){
   a.download=name;a.style.display='none';document.body.appendChild(a);a.click();document.body.removeChild(a);
 }
 function txSig(t){return[t.date,t.time,t.amount,t.type,t.desc,t.fromAcct||'',t.toAcct||''].join('|');}
+/* Paid to / received from on an imported entry: kept only as text, only in the field its type uses,
+   cleaned and shortened to the limit. Anything else (a number, an object, a name on a transfer) is
+   dropped; the entry itself is still imported. Returns how many names were dropped or shortened. */
+function importParties(rec){
+  var n=0,pf=F.partyField(rec.type);
+  ['paidTo','receivedFrom'].forEach(function(k){
+    if(!Object.prototype.hasOwnProperty.call(rec,k))return;
+    var c=F.cleanParty(rec[k]);
+    if(k!==pf||!c){if(c!==''||typeof rec[k]!=='string')n++;delete rec[k];return;}
+    var cl=F.clipParty(c);if(cl!==c)n++;rec[k]=cl;
+  });
+  return n;
+}
 /* Import is additive and idempotent: records already present (same id, or same
    transaction signature) are skipped; records whose links cannot be resolved are rejected. */
 function planImport(data){
@@ -4663,6 +4757,7 @@ function planImport(data){
     }
     if(sigs[txSig(t)]){rep.skipped++;if(isV3&&ids[t.id]!==undefined)txIdsOk[t.id]=true;return;}
     var rec=clone(t);
+    rep.namesFixed=(rep.namesFixed||0)+importParties(rec);
     if(!isV3||typeof rec.id!=='number'){rec.id=maxId++;delete rec.agreementId;}
     else maxId=Math.max(maxId,rec.id+1);
     sigs[txSig(rec)]=true;txIdsOk[rec.id]=true;add('transactions',rec);
@@ -4691,6 +4786,7 @@ function planImport(data){
     else if(JSON.stringify(SETUP)!==JSON.stringify(ls)){rep.conflicts++;rep.notes.push('The backup has a different account setup; your current setup is kept.');}
     else rep.skipped++;
   }
+  if(rep.namesFixed)rep.notes.push(rep.namesFixed+' "paid to / received from" name'+(rep.namesFixed>1?'s were':' was')+' not valid text, did not fit the entry type or was too long, and '+(rep.namesFixed>1?'were':'was')+' removed or shortened. The entries themselves are imported.');
   rep.nextId=maxId;
   return{ops:ops,report:rep};
 }
@@ -4734,7 +4830,15 @@ if(capInput){
     if(!v){capWrap.classList.remove('active');capPreview.classList.remove('show');return;}
     var parts=v.split(/\s+/);
     if(parts.length>=2&&!isNaN(parseFloat(parts[0]))){
-      var e=parseEntry(v),ss2=SS['AI Categorized'];
+      var cp=captureParse(v),pp=qs('preview-party');
+      if(cp.err){ // shown before saving: an unclear "@" is never saved as a guess
+        capWrap.classList.add('active');capPreview.classList.add('show');
+        ['preview-type','preview-cat','preview-acct'].forEach(function(id){var x=qs(id);if(x)x.textContent='';});
+        if(pp){pp.style.display='';pp.textContent=cp.err;pp.style.color='#EF4444';}
+        return;
+      }
+      var e=cp.e,ss2=SS['AI Categorized'];
+      if(pp){pp.style.display=e.partyField?'':'none';pp.style.color='#C9C7D0';pp.textContent=e.partyField?(e.partyField==='paidTo'?'Paid to: ':'Received from: ')+e[e.partyField]:'';}
       var tc2=isIn(e.type)?'#22C55E':e.type==='transfer'?'#3B82F6':e.type==='owner_withdrawal'?'#A855F7':'#EF4444';
       var tbg=isIn(e.type)?'#0D2E1A':e.type==='transfer'?'#0D1A2E':e.type==='owner_withdrawal'?'#1E0A3C':'#2E0D0D';
       capWrap.classList.add('active');capPreview.classList.add('show');
@@ -4748,8 +4852,11 @@ if(capInput){
 }
 function doCapture(){
   var raw=capInput.value,v=raw.trim();if(!v||capPending[v])return;
-  var e=parseEntry(v);if(!e.amount)return;
+  var cp=captureParse(v);if(cp.err){showToast(cp.err+' Nothing was saved.');return;}
+  var e=cp.e;if(!e.amount)return;
+  if(!(e.amount>0)){showToast('Enter the amount without a minus sign: the type decides whether money goes out or comes in. Nothing was saved.');return;}
   var item={id:newTxnId(),amount:e.amount,desc:e.desc,cat:e.cat,type:e.type,vehicle:e.vehicle,fromAcct:resolveAcct(e.fromAcct),toAcct:resolveAcct(e.toAcct),state:e.state,date:getToday(),time:getNow()};
+  if(e.partyField)item[e.partyField]=e[e.partyField];
   if((e.fromAcct&&!item.fromAcct)||(e.toAcct&&!item.toAcct))item.state='Needs Review'; // role set to "Not used": no account assumed
   capPending[v]=true;
   saveEntry(item,'Quick entry "'+v+'"').then(function(ok){
@@ -4828,6 +4935,11 @@ qs('screen-bills').addEventListener('click',function(e){
 });
 
 var tlSel=qs('tl-search');if(tlSel)tlSel.addEventListener('input',function(){tlSearch=tlSel.value;renderTimeline();});
+['tl-from','tl-to'].forEach(function(id){var el=qs(id);if(el)el.addEventListener('change',function(){
+  var v=el.value||'';v=F.dateKey(v)?v:''; // the date picker gives YYYY-MM-DD or nothing; anything else counts as unset
+  if(id==='tl-from')tlFrom=v;else tlTo=v;renderTimeline();
+});});
+var tlRC=qs('tl-range-clear');if(tlRC)tlRC.addEventListener('click',function(){tlFrom=tlTo='';qs('tl-from').value='';qs('tl-to').value='';renderTimeline();});
 var tlFR=qs('tl-filter-row');
 if(tlFR)tlFR.addEventListener('click',function(e){var b=e.target.closest('.tl-filter-btn');if(b){tlFilter=b.getAttribute('data-f');document.querySelectorAll('.tl-filter-btn').forEach(function(x){x.classList.remove('active');});b.classList.add('active');renderTimeline();}});
 
@@ -4868,7 +4980,26 @@ function autofocusWhenIdle(overlayId,fieldId){
     ov.setAttribute('data-form-ready','1');
   },100);
 }
-var addBtn=qs('add-btn');if(addBtn)addBtn.addEventListener('click',function(){refreshModalBill();qs('modal-overlay').classList.add('open');autofocusWhenIdle('modal-overlay','modal-amount');});
+/* Add Entry shows only what the chosen type uses: its accounts (the same rules as the Edit form, so an
+   expense can never credit a To account) and its optional name field (Paid to / Received from). */
+function modalEntryType(){return(modalType==='capital_injection'&&qs('modal-cat').value==='Loan')?'loan_receipt':modalType;}
+function syncModalType(){
+  var type=modalEntryType(),ar=TYPE_ACCTS[type]||['opt','opt'];
+  [['modal-from-wrap','modal-from',ar[0]],['modal-to-wrap','modal-to',ar[1]]].forEach(function(x){
+    qs(x[0]).style.display=x[2]==='no'?'none':'';if(x[2]==='no')qs(x[1]).value='';
+  });
+  var pf=F.partyField(type),pi=qs('modal-party'),ph=pf==='receivedFrom'?'Received from (optional), e.g. a customer':'Paid to (optional), e.g. Fuel station';
+  qs('modal-party-wrap').style.display=pf?'':'none';pi.placeholder=ph;pi.setAttribute('aria-label',ph);
+  var h=qs('modal-acct-hint');
+  if(h)h.textContent=(TYPE_ACCT_HINT[type]||'')+(pf?' '+(pf==='paidTo'?'Paid to':'Received from')+' is a name only: it is not one of your accounts and never changes a balance.':'');
+}
+// Names already used, offered as suggestions so the same place is spelled the same way.
+function refreshPartySuggest(){
+  var dl=qs('party-suggest');if(!dl)return;var seen={},out=[];
+  items.forEach(function(t){if(t.demo)return;[t.paidTo,t.receivedFrom].forEach(function(v){var c=F.cleanParty(v);if(c&&!seen[c.toLowerCase()]&&out.length<60){seen[c.toLowerCase()]=1;out.push(c);}});});
+  dl.innerHTML=out.map(function(n){return'<option value="'+esc(n)+'"></option>';}).join('');
+}
+var addBtn=qs('add-btn');if(addBtn)addBtn.addEventListener('click',function(){refreshModalBill();syncModalType();refreshPartySuggest();qs('modal-overlay').classList.add('open');autofocusWhenIdle('modal-overlay','modal-amount');});
 qs('modal-close-btn').addEventListener('click',function(){qs('modal-overlay').classList.remove('open');});
 qs('modal-overlay').addEventListener('click',function(e){if(e.target===qs('modal-overlay'))qs('modal-overlay').classList.remove('open');});
 function refreshModalBill(){
@@ -4877,27 +5008,40 @@ function refreshModalBill(){
   w.style.display=occ.length?'':'none';
   sel.innerHTML='<option value="">Not one of my bills</option>'+occ.map(function(o){return'<option value="'+esc(o.id)+'">For bill: '+esc(o.label)+' &middot; due '+fmtD(o.dueDate)+' &middot; '+fmt(o.remaining)+' left</option>';}).join('');
 }
-document.querySelectorAll('.type-chip').forEach(function(btn){btn.addEventListener('click',function(){modalType=btn.getAttribute('data-type');var th=qs('type-chip-hint');if(th)th.style.display=modalType==='obligation'?'':'none';refreshModalBill();document.querySelectorAll('.type-chip').forEach(function(b){b.classList.remove('active');});btn.classList.add('active');});});
+document.querySelectorAll('.type-chip').forEach(function(btn){btn.addEventListener('click',function(){modalType=btn.getAttribute('data-type');var th=qs('type-chip-hint');if(th)th.style.display=modalType==='obligation'?'':'none';refreshModalBill();syncModalType();document.querySelectorAll('.type-chip').forEach(function(b){b.classList.remove('active');});btn.classList.add('active');});});
+qs('modal-cat').addEventListener('change',syncModalType);
 qs('modal-save-btn').addEventListener('click',function(){
   var amt=parseFloat(qs('modal-amount').value);
   var desc=(qs('modal-desc').value||'').trim();
   var cat=qs('modal-cat').value;
   var from=qs('modal-from').value,to=qs('modal-to').value;
-  if(!amt||!desc){alert('Please enter amount and description.');return;}
+  if(!(amt>0)||!isFinite(amt)||!desc){alert('Please enter an amount above zero and a description.');return;}
   if(modalType==='capital_injection'&&cat==='Loan'&&!kfConfirm('Loan money is not capital. Record it as a loan receipt instead? (OK = loan receipt, needs linking to an agreement in Loans)'))return;
   var type=(modalType==='capital_injection'&&cat==='Loan')?'loan_receipt':modalType;
+  // Accounts must suit the type (as in the Edit form): a transfer needs two different accounts of yours,
+  // an expense or bill payment only the account it is paid from, income only the account it arrives in.
+  var ar=TYPE_ACCTS[type]||['opt','opt'],bad=[];
+  if(ar[0]==='no')from='';if(ar[1]==='no')to='';
+  if(ar[0]==='req'&&!from)bad.push('Choose the From account.');
+  if(ar[1]==='req'&&!to)bad.push('Choose the To account.');
+  if(from&&from===to)bad.push('From and To must be different accounts.');
+  var pf=F.partyField(type),party=pf?F.cleanParty(qs('modal-party').value)||'':'';
+  if(party.length>F.PARTY_MAX)bad.push((pf==='paidTo'?'Paid to':'Received from')+' is too long: keep it to '+F.PARTY_MAX+' characters.');
+  if(bad.length){alert(bad.join('\n'));return;}
   var rec={id:newTxnId(),amount:amt,desc:desc,cat:type==='loan_receipt'?'Loan Proceeds':cat,type:type,state:type==='loan_receipt'?'Needs Review':'AI Categorized',date:getToday(),time:getNow(),fromAcct:from,toAcct:to};
   if(type==='capital_injection')rec.fundingKind='capital_injection';
   // "Bill paid" for one of your bills: linked once, so the bill no longer shows it as due.
   var mb=type==='obligation'&&qs('modal-bill-wrap').style.display!=='none'?qs('modal-bill').value:'';
   if(mb){var fo=findOcc(mb);if(!fo){alert('That bill date no longer exists. Choose again.');return;}
     if(amt>fo.occ.remaining+0.001){alert('That is more than is still due on this bill ('+fmt(fo.occ.remaining)+'). Record any extra as a separate entry.');return;}
-    rec.billId=fo.bill.id;rec.billOcc=fo.occ.id;rec.state='Linked';}
+    rec.billId=fo.bill.id;rec.billOcc=fo.occ.id;rec.state='Linked';
+    if(!party)party=partyName(fo.bill.name);} // paid to: the bill, unless you named someone
+  if(party)rec[pf]=party;
   var sb=this;if(sb.disabled)return;sb.disabled=true;
   saveEntry(rec,'Entry "'+desc+'"','It was not added. The form stays open with your values so you can try again.').then(function(ok){
     sb.disabled=false;if(!ok)return;
     qs('modal-overlay').classList.remove('open');
-    qs('modal-amount').value='';qs('modal-desc').value='';
+    qs('modal-amount').value='';qs('modal-desc').value='';qs('modal-party').value='';
     showToast('Entry saved');
   });
 });
@@ -4912,11 +5056,11 @@ qs('modal-save-btn').addEventListener('click',function(){
    record is still exactly the one the form was opened with. */
 var EDIT_TYPES=['expense','income','transfer','owner_withdrawal','investment','capital_injection','obligation'];
 var EDIT_TYPE_NAMES={expense:'Expense',income:'Income',transfer:'Transfer',owner_withdrawal:'Owner withdrawal',investment:'Investment',capital_injection:'Capital injection',obligation:'Bill paid',loan_receipt:'Loan received (not linked yet)'};
-var EDIT_FIELDS=['type','amount','desc','cat','date','time','fromAcct','toAcct'];
-var EDIT_FIELD_NAMES={type:'Type',amount:'Amount',desc:'Description',cat:'Category',date:'Date',time:'Time',fromAcct:'From',toAcct:'To'};
+var EDIT_FIELDS=['type','amount','desc','cat','date','time','fromAcct','toAcct','paidTo','receivedFrom'];
+var EDIT_FIELD_NAMES={type:'Type',amount:'Amount',desc:'Description',cat:'Category',date:'Date',time:'Time',fromAcct:'From',toAcct:'To',paidTo:'Paid to',receivedFrom:'Received from'};
 // Which accounts each type uses: [from, to], each 'req' (required), 'opt' (optional) or 'no' (must be empty).
-var EDIT_ACCTS={expense:['req','no'],obligation:['req','no'],income:['no','req'],loan_receipt:['no','req'],transfer:['req','req'],owner_withdrawal:['req','opt'],investment:['req','opt'],capital_injection:['opt','req']};
-var EDIT_ACCT_HINT={expense:'Money leaves the From account. Leave To empty.',obligation:'Money leaves the From account. Leave To empty.',income:'Money arrives in the To account. Leave From empty.',loan_receipt:'Money arrives in the To account. Leave From empty.',transfer:'Money moves between two of your accounts: choose both. They must be different.',owner_withdrawal:'Money leaves the From account. To (your personal account) is optional.',investment:'Money leaves the From account. To (for example a fixed deposit) is optional.',capital_injection:'Money arrives in the To account. From (for example your personal account) is optional.'};
+var TYPE_ACCTS={expense:['req','no'],obligation:['req','no'],income:['no','req'],loan_receipt:['no','req'],transfer:['req','req'],owner_withdrawal:['req','opt'],investment:['req','opt'],capital_injection:['opt','req']};
+var TYPE_ACCT_HINT={expense:'Money leaves the From account. Leave To empty.',obligation:'Money leaves the From account. Leave To empty.',income:'Money arrives in the To account. Leave From empty.',loan_receipt:'Money arrives in the To account. Leave From empty.',transfer:'Money moves between two of your accounts: choose both. They must be different.',owner_withdrawal:'Money leaves the From account. To (your personal account) is optional.',investment:'Money leaves the From account. To (for example a fixed deposit) is optional.',capital_injection:'Money arrives in the To account. From (for example your personal account) is optional.'};
 var editCtx=null;
 // full: also look up the bill date (only when the form opens; lists only need to know an entry is editable).
 function editRule(t,full){
@@ -4946,7 +5090,13 @@ function editShow(k,v){
   if(k==='type')return EDIT_TYPE_NAMES[v]||typeLabel(v);
   return String(v);
 }
-function editSyncHint(){var h=qs('edit-acct-hint');if(h)h.textContent=EDIT_ACCT_HINT[qs('edit-type').value]||'';}
+function editSyncHint(){
+  var type=qs('edit-type').value,h=qs('edit-acct-hint'),pf=F.partyField(type);
+  if(h)h.textContent=TYPE_ACCT_HINT[type]||'';
+  // One name field, labelled for the type: Paid to (money out) or Received from (money in). Transfers have none.
+  qs('edit-party-wrap').style.display=pf?'':'none';
+  qs('edit-party-label').textContent=(pf==='receivedFrom'?'Received from':'Paid to')+' (optional, a name only: never an account)';
+}
 function editMsg(h){var m=qs('edit-msg');if(m)m.innerHTML=h||'';}
 function openEdit(idAttr){
   var t=items.find(function(i){return String(i.id)===String(idAttr);}),r=editRule(t,true);
@@ -4967,6 +5117,7 @@ function openEdit(idAttr){
   cs.disabled=!!r.lockCat;
   setVal('edit-amount',t.amount);qs('edit-amount').disabled=!!r.lockAmount;
   setVal('edit-desc',t.desc);setVal('edit-date',t.date);setVal('edit-time',t.time);
+  var pf0=F.partyField(t.type);setVal('edit-party',pf0?t[pf0]:'');refreshPartySuggest();
   qs('edit-date').max=getToday();
   qs('edit-from').innerHTML=editAcctOptions(t.fromAcct||'');qs('edit-to').innerHTML=editAcctOptions(t.toAcct||'');
   qs('edit-note').innerHTML=r.note?'<div class="form-warn">'+esc(r.note)+'</div>':'';
@@ -5001,6 +5152,11 @@ function saveEdit(){
   var v={type:r.lockType?cur.type:qs('edit-type').value,amount:r.lockAmount?cur.amount:F.num(val('edit-amount')),desc:val('edit-desc'),cat:r.lockCat?(cur.cat||''):qs('edit-cat').value,
     date:val('edit-date'),time:val('edit-time'),fromAcct:qs('edit-from').value,toAcct:qs('edit-to').value};
   var err=[],tn=EDIT_TYPE_NAMES[v.type]||typeLabel(v.type);
+  // The name goes in the field the (new) type uses; a type without one (transfer) keeps neither, and the
+  // review then shows the name being removed, so nothing disappears silently.
+  var pf=F.partyField(v.type),pv=F.cleanParty(qs('edit-party').value)||'';
+  v.paidTo=pf==='paidTo'?pv:'';v.receivedFrom=pf==='receivedFrom'?pv:'';
+  if(pf&&pv.length>F.PARTY_MAX)err.push(EDIT_FIELD_NAMES[pf]+' is too long: keep it to '+F.PARTY_MAX+' characters.');
   if(v.type!==cur.type&&EDIT_TYPES.indexOf(v.type)<0)err.push('Choose a type.');
   if(!(v.amount>0))err.push('Enter an amount above zero.');
   else if(v.amount>=1e12)err.push('That amount is too large.');
@@ -5008,7 +5164,7 @@ function saveEdit(){
   if(!v.desc)err.push('Enter a description.');
   if(!F.parseDate(v.date))err.push('Choose a valid date.');else if(v.date>getToday())err.push('The date cannot be in the future.');
   if(!v.time&&cur.time)err.push('Enter the time.');
-  var ar=EDIT_ACCTS[v.type]||['opt','opt'];
+  var ar=TYPE_ACCTS[v.type]||['opt','opt'];
   if(ar[0]==='req'&&!v.fromAcct)err.push('Choose the From account.');
   if(ar[0]==='no'&&v.fromAcct)err.push(tn+' has no From account: set From to None.');
   if(ar[1]==='req'&&!v.toAcct)err.push('Choose the To account.');
@@ -5026,6 +5182,7 @@ function saveEdit(){
     var a=cur[k]===undefined||cur[k]===null?'':cur[k];if(k==='desc')a=String(a).trim();
     if(a!==v[k]){changes[k]={from:cur[k]===undefined?null:cur[k],to:v[k]};n[k]=v[k];}
   });
+  ['paidTo','receivedFrom'].forEach(function(k){if(n[k]==='')delete n[k];}); // an empty name is not stored
   if(!Object.keys(changes).length){closeEdit();showToast('No changes made');return;}
   if(changes.type){if(n.type==='capital_injection')n.fundingKind=n.fundingKind||'capital_injection';else delete n.fundingKind;}
   if(changes.cat){ // the vehicle follows the category, as in a category correction

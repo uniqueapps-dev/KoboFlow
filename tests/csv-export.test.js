@@ -24,7 +24,7 @@ const BUILDS = [
   { label: 'TEST build', url: '/koboflow-test/', dbName: 'KoboFlowDB-test' },
   { label: 'production candidate', url: '/KoboFlow/', dbName: 'KoboFlowDB' },
 ];
-const COLS = ['ID', 'Date', 'Time', 'Description', 'Category', 'Type', 'Amount', 'From', 'To', 'State', 'Agreement', 'Principal', 'Interest', 'Fees', 'Unsplit', 'Reversed'];
+const COLS = ['ID', 'Date', 'Time', 'Description', 'Category', 'Type', 'Amount', 'From', 'To', 'State', 'Agreement', 'Principal', 'Interest', 'Fees', 'Unsplit', 'Reversed', 'Paid to', 'Received from'];
 // Formula-like values, each put into a text field that a backup can carry.
 const DANGEROUS = [
   '=1+1', '+2+3', '-4+5', '@SUM(1,2)', '=HYPERLINK("http://example.invalid","click")', "=cmd|' /C calc'!A0",
@@ -94,6 +94,7 @@ async function exportCsv(page) {
 }
 async function addEntry(page, amount, desc) {
   await page.click('#add-btn'); await page.fill('#modal-amount', String(amount)); await page.fill('#modal-desc', desc);
+  await page.selectOption('#modal-from', { index: 1 }); // an expense needs the account it is paid from
   await page.click('#modal-save-btn');
   await page.waitForFunction(() => !document.getElementById('modal-overlay').classList.contains('open'));
 }

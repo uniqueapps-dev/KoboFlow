@@ -178,6 +178,7 @@ for (const b of BUILDS) {
     await page.click('#add-btn');
     await page.fill('#modal-amount', '2750');
     await page.fill('#modal-desc', 'zqxmodal');
+    await page.selectOption('#modal-from', { index: 1 }); // an expense needs the account it is paid from
     await page.click('#modal-save-btn');
     await page.waitForSelector('#dialog-warning', { state: 'visible' });
     assert.match(await warning(page), /Entry "zqxmodal" NOT saved: simulated write failure\. It was not added\. The form stays open/);

@@ -78,6 +78,7 @@ async function liveSetup(page, label) {
 }
 async function addEntry(page, amount, desc) {
   await page.click('#add-btn'); await page.fill('#modal-amount', String(amount)); await page.fill('#modal-desc', desc);
+  await page.selectOption('#modal-from', { index: 1 }); // an expense needs the account it is paid from
   await page.click('#modal-save-btn');
   await page.waitForFunction(() => !document.getElementById('modal-overlay').classList.contains('open'));
 }
