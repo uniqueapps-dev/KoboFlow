@@ -111,8 +111,61 @@ The possible-duplicate warning also matches on the names, ignoring capitals and 
 - **Quick entry for income** ("pharmacy sales", "salary") kept the default From account. With
   both From and To set, it counted as a transfer instead of income. Income now has no From
   account.
-- **Entries already saved that way:** they are not changed automatically. Editing one asks for
-  From to be set to None.
+- **Entries already saved that way:** they are not changed automatically. A read-only warning
+  finds them (next section). Editing one asks for From to be set to None.
+
+## Warning: income recorded with a From account
+
+The production v2 app's quick entry has the same default. So real data upgraded from it, and
+entries made with this app before the fix, can contain income with a From account. Balances move
+money out of `fromAcct` and into `toAcct` for every type. Such an entry therefore moves money
+between your accounts like a transfer, while reports still count it as income.
+
+**Flagged** (`incomeFromFindings`, reported by `dataQuality` as `income_with_from`, severity
+high): type `income`, a non-empty `fromAcct`, not reversed and not a sample.
+
+**Never flagged:**
+- transfers;
+- income without a From account;
+- capital injections (a From account is optional for them);
+- expenses, owner withdrawals, and reversed or sample entries.
+
+**Why each entry was flagged:**
+- **"quick"**: category "Pharmacy Sales" or "Income", with From set to personal cash
+  (`pers_cash`, or the account it is mapped to). This matches the quick-entry default, so it was
+  almost certainly money received: From should be None.
+- **"chosen"**: any other From, picked when the entry was typed. It may be money received (From →
+  None) or a move between your own accounts (change it to a Transfer).
+
+**What it does to balances now** (from the existing rule, shown for each entry):
+- From and To are the same account: it adds nothing.
+- It takes the amount out of From and adds it to To: total cash does not go up.
+- There is no To: it takes the amount out of From.
+- From is not set up: nothing is taken out.
+- Dated before the baseline: balances are unaffected, but reports still count it.
+
+**Where it appears:** the Director shows the warning and lists up to 20 entries. Each shows its
+date, description, amount, From and To accounts, the reason and the effect, with a **REVIEW**
+button. REVIEW opens the normal edit form, and the correction is the user's choice, made through
+the review and CONFIRM AND SAVE: same id, recorded in `edits[]`.
+
+**What the warning never does:**
+- rewrite, reverse, delete or reclassify anything;
+- change a balance, cash flow, loan record or any Director figure.
+
+A high-severity item only adds "review these entries" advice and marks recommendations as
+qualified.
+
+**Possible false flags:**
+- **An income entry where the From account really was meant.** For example, interest credited
+  between two of your accounts. Under the current rules this double counts as income, so it still
+  needs a decision. The "chosen" wording offers both fixes.
+- **A "quick" entry the user typed on purpose with From = personal cash.** It is still
+  inconsistent with the income rule. The wording says "most likely", not "certainly".
+- **Aliases changed since the entry was made.** The "quick" label uses the current mapping of
+  `pers_cash` and the raw `pers_cash` id. An entry made under an older mapping may be labelled
+  "chosen"; it is still flagged.
+- **Entries before the baseline** affect only reports, not balances, and say so.
 - **Negative quick-entry amounts** are refused.
 
 ## Tests
@@ -146,6 +199,15 @@ The possible-duplicate warning also matches on the names, ignoring capitals and 
   with search; start after end; clear.
 - **Duplicates:** repeated payments to different places are not flagged; the same place repeated
   is flagged and still saved.
+- **Income with a From account** (`tests/income-from.test.js`):
+  - engine: legitimate transfers, correct income, capital with a From account, reversed and
+    sample entries are never flagged;
+  - every pattern and effect, with and without aliases;
+  - the warning lists exactly the affected ids;
+  - no financial effect: records unmodified; balances, cash flow and Director figures identical;
+  - screens, both builds: the list shows reason and effect; nothing changes across a restart;
+    REVIEW and cancel write nothing; the user's correction goes through the review and fixes the
+    balance; the list updates.
 - **Import and CSV:**
   - an older backup imports;
   - every kind of bad name is cleaned;
