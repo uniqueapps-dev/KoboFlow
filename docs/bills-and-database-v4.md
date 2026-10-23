@@ -13,7 +13,8 @@ A **bill** record is the definition only:
 | `name`, `cat` | What it is; the category comes from the Add Entry list |
 | `amount` | The amount from the first due date |
 | `firstDue` | The first (next) due date |
-| `repeat` | `none`, `weekly`, `monthly`, `quarterly` or `yearly` |
+| `repeat` | `none`, `weekly`, `monthly`, `quarterly`, `semiannual` (every 6 months), `yearly` or `custom` |
+| `repeatEvery`, `repeatUnit` | Only for `custom`: a whole number with `days` (1–365), `weeks` (1–104) or `months` (1–120). Optional fields; absent on every other bill |
 | `until` | Optional last date |
 | `status`, `cancelledFrom` | `active`, or `cancelled` from a date |
 | `amountChanges[]` | `{from, amount}`: a new amount from a date onward |
@@ -47,12 +48,26 @@ recorded on the Bills screen also carries an `idemKey`, so a double tap or retry
   - monthly, quarterly and yearly bills keep the first due day, clamped to the end of shorter
     months (31 Jan → 28/29 Feb → 31 Mar);
   - a yearly bill due 29 Feb falls on 28 Feb in other years;
-  - weekly bills add 7 days.
+  - weekly bills add 7 days;
+  - every-6-months bills and custom month intervals count calendar months from the first due date,
+    keeping its day, clamped like monthly bills: 31 Aug → 28/29 Feb → 31 Aug, never drifting;
+  - custom day and week intervals add calendar days (7 per week), across month, year and leap-day
+    boundaries;
+  - the Ends on date stops later dates for every repeat (the end date itself is included);
+  - dates are listed only up to the date a screen needs; a safety stop at 20,000 dates replaces
+    the old 600-date stop, which would have cut short a short custom interval;
+  - finding a single date to pay, edit or check a payment against lists dates only up to that
+    date.
 - **Changes:**
   - a changed amount applies from its date; earlier occurrences keep their amount;
   - cancelling stops occurrences from the cancellation date, but earlier unpaid ones stay owed;
   - a single date can be marked "not owed", with a reason, and undone;
-  - once a bill has a live payment, its first due date and repeat are fixed.
+  - once a bill has a live payment, its first due date and repeat (including a custom interval)
+    are fixed.
+- **Compatibility.** Bills saved before custom repeats existed have no custom fields and keep
+  their exact dates. A test compares every existing repeat with the previous release over hundreds
+  of start dates. An older KoboFlow build does not know `semiannual` or `custom`: importing such a
+  bill there is rejected by its bill check, so it is not silently treated as one-time.
 - **Missed dates stay owed.** They show as overdue, rank first in the Director, and count as
   liabilities in Net Worth. Bills not yet due are not liabilities.
 - **Unlink and Reverse are different.** A payment recorded elsewhere and linked to a bill can be

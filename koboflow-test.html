@@ -947,16 +947,37 @@ function reservationPlan(accounts,buckets,obligations){
      (an individual occurrence can be marked "not owed" (skipped), with a reason);
    - once a bill has a payment, its first due date and repeat cannot change (payments would
      lose their occurrence). */
-var BILL_REPEAT={none:'One-time',weekly:'Weekly',monthly:'Monthly',quarterly:'Every 3 months',yearly:'Yearly'};
+var BILL_REPEAT={none:'One-time',weekly:'Weekly',monthly:'Monthly',quarterly:'Every 3 months',semiannual:'Every 6 months',yearly:'Yearly',custom:'Custom'};
+/* Custom repeats: repeat 'custom' with repeatEvery (a whole number) and repeatUnit ('days', 'weeks' or
+   'months'). The fields are optional: bills without them are unchanged. Limits keep schedules sensible:
+   up to a year in days, two years in weeks, ten years in months. */
+var BILL_UNITS={days:{one:'day',many:'days',max:365},weeks:{one:'week',many:'weeks',max:104},months:{one:'month',many:'months',max:120}};
+var BILL_MONTH_STEP={monthly:1,quarterly:3,semiannual:6,yearly:12};
+var BILL_MAX_DATES=20000; // safety stop only; dates normally stop at the requested end date
+function billCustomOk(b){var u=BILL_UNITS[b&&b.repeatUnit],n=b&&b.repeatEvery;return !!u&&typeof n==='number'&&isFinite(n)&&Math.floor(n)===n&&n>=1&&n<=u.max;}
+function billRepeatLabel(b){
+  if(!b||!BILL_REPEAT[b.repeat])return BILL_REPEAT.none;
+  if(b.repeat!=='custom')return BILL_REPEAT[b.repeat];
+  if(!billCustomOk(b))return'Custom (not set)';
+  var u=BILL_UNITS[b.repeatUnit];return b.repeatEvery===1?'Every '+u.one:'Every '+b.repeatEvery+' '+u.many;
+}
+/* Due dates from the first due date up to `until` (and the bill's own end date). Months are calendar
+   months counted from the first due date (not added one after another), keeping its day and using the
+   last day of a shorter month: 31 Jan -> 28/29 Feb -> 31 Mar, and 31 Aug every 6 months -> 28/29 Feb ->
+   31 Aug. Weeks and days are calendar days (7 per week). A custom repeat that is not valid gives only
+   the first date, as a one-time bill would (it cannot be saved or imported that way). */
 function billDueDates(b,until){
   var out=[],f=parseDate(b&&b.firstDue);if(!f)return out;
-  var rep=BILL_REPEAT[b.repeat]?b.repeat:'none',end=b.until&&b.until<until?b.until:until,day=f.getDate();
-  for(var i=0;i<600;i++){
+  var rep=BILL_REPEAT[b.repeat]?b.repeat:'none',end=b.until&&b.until<until?b.until:until,day=f.getDate(),first=String(b.firstDue).slice(0,10);
+  var days=0,months=0;
+  if(rep==='weekly')days=7;else if(BILL_MONTH_STEP[rep])months=BILL_MONTH_STEP[rep];
+  else if(rep==='custom'&&billCustomOk(b)){if(b.repeatUnit==='months')months=b.repeatEvery;else days=b.repeatEvery*(b.repeatUnit==='weeks'?7:1);}
+  for(var i=0;i<BILL_MAX_DATES;i++){
     var d;
-    if(rep==='none'){if(i>0)break;d=String(b.firstDue).slice(0,10);}
-    else if(rep==='weekly')d=addDays(b.firstDue,7*i);
-    else{var step=rep==='monthly'?1:rep==='quarterly'?3:12,tm=f.getMonth()+step*i,y=f.getFullYear()+Math.floor(tm/12),m=tm%12;
-      d=fmtDate(new Date(y,m,Math.min(day,new Date(y,m+1,0).getDate())));}
+    if(i===0)d=first;
+    else if(days)d=addDays(first,days*i);
+    else if(months){var tm=f.getMonth()+months*i,y=f.getFullYear()+Math.floor(tm/12),m=tm%12;d=fmtDate(new Date(y,m,Math.min(day,new Date(y,m+1,0).getDate())));}
+    else break;
     if(d>end)break;out.push(d);
   }
   return out;
@@ -993,7 +1014,9 @@ function billObligations(bills,txns,opts){
 }
 /* Payments that point at a bill or occurrence that does not exist (e.g. a deleted schedule). */
 function billUnmatchedPayments(bills,txns,opts){
-  var ids={};(bills||[]).forEach(function(b){billOccurrences(b,txns,{today:(opts||{}).today,until:'9999-12-31'}).forEach(function(o){ids[o.id]=1;});});
+  // Dates are only needed up to the latest one a payment points at (not to the year 9999).
+  var last={};(txns||[]).forEach(function(t){if(t&&t.billId&&typeof t.billOcc==='string'){var d=t.billOcc.split('@')[1]||'';if(parseDate(d)&&!(last[t.billId]>=d))last[t.billId]=d.slice(0,10);}});
+  var ids={};(bills||[]).forEach(function(b){if(!last[b.id])return;billOccurrences(b,txns,{today:(opts||{}).today,until:last[b.id]}).forEach(function(o){ids[o.id]=1;});});
   return(txns||[]).filter(function(t){return t&&!t.voided&&!t.demo&&t.billId&&!ids[t.billOcc];});
 }
 function validateBill(b,opts){
@@ -1002,10 +1025,11 @@ function validateBill(b,opts){
   if(!(num(b.amount)>0))errors.push('Enter the amount (more than 0).');
   if(!parseDate(b.firstDue))errors.push('Choose the first due date.');
   if(!BILL_REPEAT[b.repeat])errors.push('Choose how often it repeats.');
+  else if(b.repeat==='custom'&&!billCustomOk(b))errors.push('For a custom repeat, enter a whole number and a unit: 1 to '+BILL_UNITS.days.max+' days, 1 to '+BILL_UNITS.weeks.max+' weeks, or 1 to '+BILL_UNITS.months.max+' months.');
   if(b.until&&(!parseDate(b.until)||(parseDate(b.firstDue)&&b.until<b.firstDue)))errors.push('The end date must be on or after the first due date.');
   (b.amountChanges||[]).forEach(function(c){if(!parseDate(c.from)||!(num(c.amount)>0))errors.push('Each amount change needs a date and an amount above 0.');});
   var prev=opts.previous;
-  if(prev&&opts.hasPayments&&(prev.firstDue!==b.firstDue||prev.repeat!==b.repeat))errors.push('This bill already has payments, so its first due date and repeat cannot change. Cancel it and add a new bill instead.');
+  if(prev&&opts.hasPayments&&(prev.firstDue!==b.firstDue||prev.repeat!==b.repeat||(b.repeat==='custom'&&(prev.repeatEvery!==b.repeatEvery||prev.repeatUnit!==b.repeatUnit))))errors.push('This bill already has payments, so its first due date and repeat cannot change. Cancel it and add a new bill instead.');
   return{ok:!errors.length,errors:errors};
 }
 function coveredAmount(obligations,coverage){return fromK(sum(obligations||[],function(o){return Math.min(toK(o.remaining),toK((coverage||{})[o.id]||0));}));}
@@ -1470,7 +1494,7 @@ var API={toK:toK,fromK:fromK,num:num,fmtDate:fmtDate,parseDate:parseDate,today:t
   isDebt:isDebt,cashReceived:function(t){return fromK(cashReceivedK(t));},buildSchedule:buildSchedule,termsSummary:termsSummary,
   instalmentStates:instalmentStates,agreementBalances:agreementBalances,allocatePayment:allocatePayment,settlementPlan:settlementPlan,
   classifyTxn:classifyTxn,accountDeltas:accountDeltas,accountBalances:accountBalances,upcomingObligations:upcomingObligations,cashForecast:cashForecast,
-  buildReminders:buildReminders,xirr:xirr,ACCOUNT_KINDS:ACCOUNT_KINDS,LEGACY_ACCOUNTS:LEGACY_ACCOUNTS,bucketSummary:bucketSummary,accountAccess:accountAccess,cashPosition:cashPosition,cashCover:cashCover,reservationPlan:reservationPlan,coveredAmount:coveredAmount,BILL_REPEAT:BILL_REPEAT,billDueDates:billDueDates,billAmountOn:billAmountOn,billOccurrences:billOccurrences,billObligations:billObligations,billUnmatchedPayments:billUnmatchedPayments,validateBill:validateBill,dataQuality:dataQuality,incomeFromFindings:incomeFromFindings,dupName:dupName,PARTY_MAX:PARTY_MAX,dateKey:dateKey,inDateRange:inDateRange,partyField:partyField,cleanParty:cleanParty,partyKey:partyKey,clipParty:clipParty,budgetProgress:budgetProgress,directorPlan:directorPlan,spendingRunway:spendingRunway,validateSetup:validateSetup,cashFlowSummary:cashFlowSummary,oppRepayments:oppRepayments,analyzeOpportunity:analyzeOpportunity,oppToTerms:oppToTerms,parseManualRows:parseManualRows};
+  buildReminders:buildReminders,xirr:xirr,ACCOUNT_KINDS:ACCOUNT_KINDS,LEGACY_ACCOUNTS:LEGACY_ACCOUNTS,bucketSummary:bucketSummary,accountAccess:accountAccess,cashPosition:cashPosition,cashCover:cashCover,reservationPlan:reservationPlan,coveredAmount:coveredAmount,BILL_REPEAT:BILL_REPEAT,BILL_UNITS:BILL_UNITS,billRepeatLabel:billRepeatLabel,billCustomOk:billCustomOk,billDueDates:billDueDates,billAmountOn:billAmountOn,billOccurrences:billOccurrences,billObligations:billObligations,billUnmatchedPayments:billUnmatchedPayments,validateBill:validateBill,dataQuality:dataQuality,incomeFromFindings:incomeFromFindings,dupName:dupName,PARTY_MAX:PARTY_MAX,dateKey:dateKey,inDateRange:inDateRange,partyField:partyField,cleanParty:cleanParty,partyKey:partyKey,clipParty:clipParty,budgetProgress:budgetProgress,directorPlan:directorPlan,spendingRunway:spendingRunway,validateSetup:validateSetup,cashFlowSummary:cashFlowSummary,oppRepayments:oppRepayments,analyzeOpportunity:analyzeOpportunity,oppToTerms:oppToTerms,parseManualRows:parseManualRows};
 root.KoboFin=API;
 if(typeof module!=='undefined'&&module.exports)module.exports=API;
 })(typeof window!=='undefined'?window:this);
@@ -2582,8 +2606,12 @@ body.kf-live .sample-tag{display:inline-block;}
         <div class="form-group"><label>First due date</label><input id="bill-first" class="form-input" type="date"/></div>
       </div>
       <div class="grid2" style="margin-bottom:0;">
-        <div class="form-group"><label>Repeats</label><select id="bill-repeat" class="form-input"><option value="none">One-time</option><option value="weekly">Weekly</option><option value="monthly">Monthly</option><option value="quarterly">Every 3 months</option><option value="yearly">Yearly</option></select></div>
+        <div class="form-group"><label>Repeats</label><select id="bill-repeat" class="form-input"><option value="none">One-time</option><option value="weekly">Weekly</option><option value="monthly">Monthly</option><option value="quarterly">Every 3 months</option><option value="semiannual">Every 6 months</option><option value="yearly">Yearly</option><option value="custom">Custom</option></select></div>
         <div class="form-group"><label>Ends on (optional)</label><input id="bill-until" class="form-input" type="date"/></div>
+      </div>
+      <div class="grid2" id="bill-custom" style="margin-bottom:0;display:none;">
+        <div class="form-group"><label>Repeat every</label><input id="bill-every" class="form-input" type="number" inputmode="numeric" min="1" step="1" placeholder="e.g. 2"/></div>
+        <div class="form-group"><label>Unit</label><select id="bill-unit" class="form-input"><option value="days">Days</option><option value="weeks">Weeks</option><option value="months">Months</option></select></div>
       </div>
       <div class="hint">For a bill you already pay, enter the NEXT date it is due. Earlier months are not tracked.</div>
       <div data-bill-edit="1" style="display:none;">
@@ -4574,7 +4602,8 @@ function billById(id){return BILLS.find(function(b){return b.id===id;});}
 function billPayments(id){return items.filter(function(t){return !t.demo&&t.billId===id;});}
 function billHasPayments(id){return billPayments(id).some(function(t){return !t.voided;});}
 function billOccs(b,days){return F.billOccurrences(b,items,{today:getToday(),until:F.addDays(getToday(),days||60)});}
-function findOcc(occId){var bid=String(occId).split('@')[0],b=billById(bid);if(!b)return null;var o=F.billOccurrences(b,items,{today:getToday(),until:'9999-12-31'}).find(function(x){return x.id===occId;});return o?{bill:b,occ:o}:null;}
+// Dates are listed only up to the one asked for (an occurrence id is "<billId>@<YYYY-MM-DD>").
+function findOcc(occId){var p=String(occId).split('@'),b=billById(p[0]),d=F.parseDate(p[1])?String(p[1]).slice(0,10):'';if(!b||!d)return null;var o=F.billOccurrences(b,items,{today:getToday(),until:d}).find(function(x){return x.id===occId;});return o?{bill:b,occ:o}:null;}
 function openBillOccs(days){var out=[];BILLS.forEach(function(b){billOccs(b,days).forEach(function(o){if(o.remaining>0)out.push(o);});});return out.sort(function(a,b){return a.dueDate<b.dueDate?-1:1;});}
 // A recorded "Bill paid" that is not linked to any bill but matches an open occurrence closely.
 function unlinkedPaymentsFor(o){return items.filter(function(t){return !t.demo&&!t.voided&&!t.billId&&t.type==='obligation'&&Math.abs(F.daysBetween(t.date,o.dueDate))<=10&&t.amount<=o.remaining+0.001;});}
@@ -4593,7 +4622,7 @@ function renderBills(){
     var all=F.billOccurrences(b,items,{today:getToday(),until:F.addDays(getToday(),400)}),next=all.find(function(o){return o.remaining>0;}),pays=billPayments(b.id).sort(function(x,y){return x.date<y.date?1:-1;});
     var skipped=all.filter(function(o){return o.status==='skipped';});
     return'<div class="agr-card" data-bill="'+esc(b.id)+'"><div style="display:flex;justify-content:space-between;gap:8px;"><b>'+esc(b.name)+'</b><span class="status-pill'+(b.status==='cancelled'?' overdue':' active')+'">'+(b.status==='cancelled'?'Cancelled from '+fmtD(b.cancelledFrom):'Active')+'</span></div>'
-      +'<div class="muted-note" style="margin:4px 0;">'+esc(b.cat||'No category')+' &middot; '+F.BILL_REPEAT[b.repeat]+' &middot; '+fmt(F.billAmountOn(b,getToday()))+(b.until?' &middot; ends '+fmtD(b.until):'')+' &middot; next: '+(next?fmtD(next.dueDate)+' ('+fmt(next.remaining)+')':'nothing due')+'</div>'
+      +'<div class="muted-note" style="margin:4px 0;">'+esc(b.cat||'No category')+' &middot; '+esc(F.billRepeatLabel(b))+' &middot; '+fmt(F.billAmountOn(b,getToday()))+(b.until?' &middot; ends '+fmtD(b.until):'')+' &middot; next: '+(next?fmtD(next.dueDate)+' ('+fmt(next.remaining)+')':'nothing due')+'</div>'
       +(pays.length?'<div class="muted-note" style="margin:4px 0;">Payments: '+pays.map(function(t){return'<span data-bill-payment="'+esc(t.id)+'">'+fmtD(t.date)+' '+fmt(t.amount)+(t.voided?' (reversed)':/^billpay/.test(t.idemKey||'')?' <button class="act-btn act-dismiss" data-bill-reverse="'+esc(t.id)+'">REVERSE</button>':' <button class="act-btn act-dismiss" data-bill-unlink="'+esc(t.id)+'">UNLINK</button>')+'</span>';}).join(' &middot; ')+'</div>':'')
       +(skipped.length?'<div class="muted-note" style="margin:4px 0;">Marked not owed: '+skipped.map(function(o){return fmtD(o.dueDate)+' <button class="act-btn act-approve" data-bill-unskip="'+esc(o.id)+'">OWED AFTER ALL</button>';}).join(' &middot; ')+'</div>':'')
       +'<div class="btn-row"><button data-bill-edit="'+esc(b.id)+'">Edit</button>'+(b.status!=='cancelled'?'<button class="danger" data-bill-cancel="'+esc(b.id)+'">Cancel bill</button>':'')+'</div></div>';
@@ -4609,18 +4638,26 @@ function openBillForm(id){
   if(!b)qs('bill-cat').value='Utilities';
   setVal('bill-name',b?b.name:'');setVal('bill-amount',b?F.billAmountOn(b,getToday()):'');setVal('bill-first',b?b.firstDue:getToday());
   setVal('bill-repeat',b?b.repeat:'monthly');setVal('bill-until',b&&b.until?b.until:'');setVal('bill-amount-from',getToday());
-  qs('bill-first').disabled=locked;qs('bill-repeat').disabled=locked;
+  setVal('bill-every',b&&b.repeat==='custom'?b.repeatEvery:'');setVal('bill-unit',b&&b.repeat==='custom'&&F.BILL_UNITS[b.repeatUnit]?b.repeatUnit:'months');
+  ['bill-first','bill-repeat','bill-every','bill-unit'].forEach(function(id){qs(id).disabled=locked;});billCustomSync();
   document.querySelectorAll('[data-bill-edit="1"]').forEach(function(el){el.style.display=b?'':'none';});
   billMsg(locked?'<div class="muted-note">This bill already has payments, so its first due date and repeat are fixed. Cancel it and add a new one to change them.</div>':'');
   var sb=qs('bill-save-btn');sb.disabled=false;sb.textContent='SAVE BILL';
   openModal('bill-modal');
 }
+// The interval controls show only for Custom.
+function billCustomSync(){var c=qs('bill-custom');if(c)c.style.display=val('bill-repeat')==='custom'?'':'none';}
 function saveBill(){
   if(!billCtx)return;
   var prev=billCtx.prev,hasPay=!!(prev&&billHasPayments(prev.id)),now=nowISO();
   var b=prev?clone(prev):{id:billCtx.id,status:'active',createdAt:now,amountChanges:[],overrides:{},history:[]};
   b.name=String(val('bill-name')||'').trim();b.cat=qs('bill-cat').value;b.until=val('bill-until')||null;
-  if(!prev||!hasPay){b.firstDue=val('bill-first');b.repeat=val('bill-repeat');}
+  if(!prev||!hasPay){
+    b.firstDue=val('bill-first');b.repeat=val('bill-repeat');
+    // A custom interval must be typed as a whole number: "2.5", "-1", "0" or blank are refused, never rounded.
+    if(b.repeat==='custom'){var ev=val('bill-every');b.repeatEvery=/^[0-9]+$/.test(ev)?Number(ev):ev;b.repeatUnit=qs('bill-unit').value;}
+    else{delete b.repeatEvery;delete b.repeatUnit;}
+  }
   var amt=F.num(val('bill-amount')),changes=[];
   if(!prev)b.amount=amt;
   else if(amt!==F.billAmountOn(prev,getToday())){
@@ -4630,7 +4667,7 @@ function saveBill(){
     else b.amountChanges=(prev.amountChanges||[]).filter(function(c){return c.from<from;}).concat([{from:from,amount:amt}]);
     changes.push({field:'amount',from:F.billAmountOn(prev,from),to:amt,effectiveFrom:from});
   }
-  if(prev){['name','cat','until','firstDue','repeat'].forEach(function(k){if((prev[k]||null)!==(b[k]||null))changes.push({field:k,from:prev[k]||null,to:b[k]||null});});}
+  if(prev){['name','cat','until','firstDue','repeat','repeatEvery','repeatUnit'].forEach(function(k){if((prev[k]||null)!==(b[k]||null))changes.push({field:k,from:prev[k]||null,to:b[k]||null});});}
   var v=F.validateBill(b,{previous:prev,hasPayments:hasPay});
   if(!v.ok){billMsg('<div class="form-err">Not saved yet: '+v.errors.map(esc).join('<br>')+'</div>');return;}
   b.updatedAt=now;b.history=(b.history||[]).concat([{at:now,changes:prev?changes:[{field:'created'}]}]);
@@ -5101,6 +5138,7 @@ if(il2)il2.addEventListener('click',function(e){
 /* Bills wiring */
 qs('bill-add-btn').addEventListener('click',function(){if(isLive())openBillForm(null);});
 qs('bill-save-btn').addEventListener('click',saveBill);
+qs('bill-repeat').addEventListener('change',billCustomSync);
 qs('bill-pay-save-btn').addEventListener('click',saveBillPay);
 ['bill-modal','bill-pay-modal'].forEach(function(id){var m=qs(id);m.addEventListener('click',function(e){if(e.target===m&&!saving)closeModal(id);});});
 qs('bill-pay-candidates').addEventListener('click',function(e){var b=e.target.closest('[data-bill-link]');if(b)linkBillPayment(b.getAttribute('data-bill-link'));});
