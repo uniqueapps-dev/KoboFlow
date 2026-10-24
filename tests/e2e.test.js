@@ -215,6 +215,8 @@ test('early settlement with lender figure, then agreement is settled', { skip },
   await page.fill('#settle-reason', 'Payoff quote in app');
   await page.waitForSelector('#settle-preview .form-ok');
   assert.match(await page.textContent('#settle-preview'), /61,820/);
+  await page.check('#settle-confirmed');
+  await page.check('#settle-paid');
   await page.click('#settle-save-btn');
   await page.waitForFunction(() => /Settled/.test(document.querySelector('#agr-detail .screen-sub').textContent));
   const inst = await dbAll(page, 'instalments');

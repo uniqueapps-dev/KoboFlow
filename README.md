@@ -7,6 +7,7 @@ Track Every Kobo. KoboFlow is a financial command center for managing income, ex
 - Open `koboflow.html?db=test` to use a separate test database (a purple "TEST DATABASE" banner shows). Without `?db=` it uses the real `KoboFlowDB` and upgrades it to v4, after making a verified safety copy (see `docs/bills-and-database-v4.md`); the old v2 `index.html` cannot save to an upgraded database.
 - Saved entries can be edited from History and the Financial Inbox (EDIT). The record is changed in place; entries owned by a loan agreement are corrected in Loans. See `docs/transaction-editing.md`.
 - Entries can record who money was paid to or received from (a name only, never an account), and History can be searched by name and filtered by an inclusive date range. See `docs/destination-tracking.md`.
+- Extra principal reduces a loan once: the agreed instalments stay until the lender confirms new ones (the loan shows "Schedule needs review"), an amendment never subtracts it again, and an early settlement is saved only once the lender's figure is confirmed and paid. See `docs/loan-principal-and-settlement.md`.
 - `index.html` — the earlier v2 build, left unchanged.
 
 ## Tests

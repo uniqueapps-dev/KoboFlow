@@ -695,59 +695,121 @@ function termsSummary(t,sched){
 /* ── Instalment state from authoritative allocations ─────────── */
 function liveAllocs(allocs){return(allocs||[]).filter(function(a){return !a.reversed;});}
 function allocTotalK(a){return toK(a.principal)+toK(a.interest)+toK(a.fees)+toK(a.unsplit);}
-function instalmentStates(instalments,allocations,todayStr){
-  var td=todayStr||today(),al=liveAllocs(allocations);
-  return(instalments||[]).filter(function(x){return !x.supersededBy;}).slice().sort(function(a,b){return a.dueDate<b.dueDate?-1:a.dueDate>b.dueDate?1:(a.seq||0)-(b.seq||0);}).map(function(inst){
+/* Extra principal (paid outside the schedule, allocation kind 'extra_principal', no instalmentId).
+   - Until the lender confirms revised terms (a schedule amendment), the original instalments stay
+     as agreed and the extra is counted against the principal of the LAST instalments first, so the
+     next instalments still show what the lender expects while the total never exceeds what is owed.
+   - An amendment records which extra payments its new rows already reflect (extraAbsorbed: the
+     allocation ids). Those are never subtracted again: the revised rows already exclude them.
+   - Amendments saved before this rule have no extraAbsorbed list. Extra payments recorded before
+     such an amendment are treated as reflected in it (the app advised amending after an extra
+     payment) and the schedule is flagged for review. */
+function extraPrincipalInfo(instalments,allocations,txns){
+  var extras=(allocations||[]).filter(function(a){return !a.instalmentId&&a.kind==='extra_principal';});
+  var made={},absorbed={},legacyAt={},legacy={};
+  (txns||[]).forEach(function(t){if(t&&t.createdAt)made[t.id]=String(t.createdAt);});
+  (instalments||[]).forEach(function(i){
+    if(!i||!i.amendmentId)return;
+    if(Array.isArray(i.extraAbsorbed))i.extraAbsorbed.forEach(function(id){absorbed[id]=true;});
+    else if(i.createdAt)legacyAt[i.amendmentId]=String(i.createdAt);
+  });
+  Object.keys(legacyAt).forEach(function(k){var at=legacyAt[k];extras.forEach(function(a){
+    if(absorbed[a.id])return;
+    var m=made[a.txnId],before=m?m<at:(a.date?String(a.date)<=at.slice(0,10):false);
+    if(before){absorbed[a.id]=true;legacy[a.id]=true;}
+  });});
+  var live=extras.filter(function(a){return !a.reversed;});
+  function ids(f){return live.filter(f).map(function(a){return a.id;});}
+  return{open:live.filter(function(a){return !absorbed[a.id];}),absorbedLive:live.filter(function(a){return absorbed[a.id];}),
+    openIds:ids(function(a){return !absorbed[a.id];}),absorbedIds:ids(function(a){return absorbed[a.id];}),
+    legacyIds:ids(function(a){return legacy[a.id];}),
+    absorbedReversed:extras.filter(function(a){return a.reversed&&absorbed[a.id];}).map(function(a){return a.id;})};
+}
+function loanStates(instalments,allocations,todayStr,txns){
+  var td=todayStr||today(),al=liveAllocs(allocations),info=extraPrincipalInfo(instalments,allocations,txns);
+  var rows=(instalments||[]).filter(function(x){return !x.supersededBy;}).slice().sort(function(a,b){return a.dueDate<b.dueDate?-1:a.dueDate>b.dueDate?1:(a.seq||0)-(b.seq||0);}).map(function(inst){
     var mine=al.filter(function(a){return a.instalmentId===inst.id;});
-    var pp=sum(mine,function(a){return toK(a.principal);}),pi=sum(mine,function(a){return toK(a.interest);}),pf=sum(mine,function(a){return toK(a.fees);}),pu=sum(mine,function(a){return toK(a.unsplit);});
-    var totK=toK(inst.total),paidK=pp+pi+pf+pu,remK=inst.waived?0:Math.max(0,totK-paidK);
+    return{inst:inst,pp:sum(mine,function(a){return toK(a.principal);}),pi:sum(mine,function(a){return toK(a.interest);}),pf:sum(mine,function(a){return toK(a.fees);}),pu:sum(mine,function(a){return toK(a.unsplit);}),ex:0};
+  });
+  var pool=sum(info.open,function(a){return toK(a.principal);});
+  for(var k=rows.length-1;k>=0&&pool>0;k--){
+    var r=rows[k],capK=Math.min(toK(r.inst.principal)-r.pp,toK(r.inst.total)-(r.pp+r.pi+r.pf+r.pu));
+    var take=Math.max(0,Math.min(pool,capK));r.ex=take;pool-=take;
+  }
+  var states=rows.map(function(r){
+    var inst=r.inst,pp=r.pp,pi=r.pi,pf=r.pf,pu=r.pu,ex=r.ex;
+    var totK=toK(inst.total),paidK=pp+pi+pf+pu,remK=inst.waived?0:Math.max(0,totK-paidK-ex);
     var d=daysBetween(td,inst.dueDate),status;
     if(inst.waived)status='waived';
     else if(remK<=0)status='paid';
     else if(d<0)status='overdue';
     else if(d===0)status='due_today';
-    else if(paidK>0)status='partial';
+    else if(paidK+ex>0)status='partial';
     else if(d<=7)status='due_soon';
     else status='upcoming';
     return{id:inst.id,inst:inst,seq:inst.seq,dueDate:inst.dueDate,daysToDue:d,status:status,
-      total:fromK(totK),paid:fromK(paidK),remaining:fromK(remK),
+      total:fromK(totK),paid:fromK(paidK),extraApplied:fromK(ex),remaining:fromK(remK),
       paidParts:{principal:fromK(pp),interest:fromK(pi),fees:fromK(pf),unsplit:fromK(pu)},
-      remParts:{principal:fromK(Math.max(0,toK(inst.principal)-pp)),interest:fromK(Math.max(0,toK(inst.interest)-pi)),fees:fromK(Math.max(0,toK(inst.fees)-pf))}};
+      remParts:{principal:fromK(Math.max(0,toK(inst.principal)-pp-ex)),interest:fromK(Math.max(0,toK(inst.interest)-pi)),fees:fromK(Math.max(0,toK(inst.fees)-pf))}};
   });
+  return{states:states,info:info,unappliedK:pool};
+}
+/* Pass {txns} as the fourth argument when available: it dates extra payments against older amendments. */
+function instalmentStates(instalments,allocations,todayStr,opts){
+  return loanStates(instalments,allocations,todayStr,opts&&opts.txns).states;
 }
 var STATUS_LABEL={upcoming:'Upcoming',due_soon:'Due soon',due_today:'Due today',partial:'Partially paid',paid:'Paid',overdue:'Overdue',waived:'Waived'};
 
 /* Balances are always recomputed from schedule + allocations + transactions,
-   never stored, so they are reproducible from authoritative records. */
+   never stored, so they are reproducible from authoritative records.
+   - outstanding.principal / interest / fees: what is still owed of each, per the current schedule;
+     interest and fees are the scheduled (known) amounts, not an estimate of future interest.
+   - outstanding.total: everything still scheduled (remaining instalments); extra principal is in it once.
+   - scheduled: the whole agreement, including extra principal that an amended schedule already reflects.
+   - principalSettled: no principal left; settled: nothing left at all.
+   - review: reasons the schedule needs the user's attention (never changes a figure by itself). */
 function agreementBalances(agr,instalments,allocations,txns,todayStr){
-  var st=instalmentStates(instalments,allocations,todayStr),al=liveAllocs(allocations);
+  var ls=loanStates(instalments,allocations,todayStr,txns),st=ls.states,info=ls.info,al=liveAllocs(allocations);
   var debt=isDebt(agr&&agr.terms?agr.terms:agr);
-  var sch={p:0,i:0,f:0,u:0},paid={p:0,i:0,f:0,u:0},waivedK=0;
+  var sch={p:0,i:0,f:0,u:0},paid={p:0,i:0,f:0,u:0},out={p:0,i:0,f:0},waivedK=0,exApplied=0;
   st.forEach(function(s){
-    var I=s.inst,pp=toK(s.paidParts.principal),pi=toK(s.paidParts.interest),pf=toK(s.paidParts.fees),pu=toK(s.paidParts.unsplit);
+    var I=s.inst,pp=toK(s.paidParts.principal),pi=toK(s.paidParts.interest),pf=toK(s.paidParts.fees),pu=toK(s.paidParts.unsplit),ex=toK(s.extraApplied);
+    exApplied+=ex;paid.p+=pp;paid.i+=pi;paid.f+=pf;paid.u+=pu;
     if(I.waived){
-      waivedK+=Math.max(0,toK(I.total)-(pp+pi+pf+pu));
-      sch.p+=pp;sch.i+=pi;sch.f+=pf;sch.u+=pu; // only what was actually paid stays scheduled
-      paid.p+=pp;paid.i+=pi;paid.f+=pf;paid.u+=pu;
+      waivedK+=Math.max(0,toK(I.total)-(pp+pi+pf+pu+ex));
+      sch.p+=pp+ex;sch.i+=pi;sch.f+=pf;sch.u+=pu; // only what was actually paid stays scheduled
     }else{
       sch.p+=toK(I.principal);sch.i+=toK(I.interest);sch.f+=toK(I.fees);
-      paid.p+=pp;paid.i+=pi;paid.f+=pf;paid.u+=pu;
+      out.p+=toK(s.remParts.principal);out.i+=toK(s.remParts.interest);out.f+=toK(s.remParts.fees);
     }
   });
-  var extraP=sum(al.filter(function(a){return !a.instalmentId&&a.kind==='extra_principal';}),function(a){return toK(a.principal);});
+  var extraK=sum(info.open.concat(info.absorbedLive),function(a){return toK(a.principal);});
+  var absorbedK=sum(info.absorbedLive,function(a){return toK(a.principal);});
+  var openK=sum(info.open,function(a){return toK(a.principal);});
   var late=sum(al.filter(function(a){return !a.instalmentId&&a.kind==='late_charge';}),allocTotalK);
   var remK=sum(st,function(s){return toK(s.remaining);});
-  var outTotal=debt?Math.max(0,remK-extraP):0;
-  var outP=Math.max(0,sch.p-paid.p-extraP),outI=Math.max(0,sch.i-paid.i),outF=Math.max(0,sch.f-paid.f);
+  var outTotal=debt?remK:0;
   var repaid=sum((txns||[]).filter(function(t){return t.type==='loan_repayment'&&!t.voided;}),function(t){return toK(t.amount);});
   var open=st.filter(function(s){return s.remaining>0;});
   var overdueK=sum(open.filter(function(s){return s.status==='overdue';}),function(s){return toK(s.remaining);});
+  var settled=debt&&st.length>0&&outTotal<=0;
+  var principalSettled=debt&&st.length>0&&out.p<=0&&paid.u===0;
+  function m(k){return'₦'+fromK(k).toLocaleString('en-NG');}
+  var review=[];
+  if(debt&&!settled&&openK>0)review.push({code:'extra_unconfirmed',text:m(openK)+' extra principal was paid and the lender has not confirmed revised instalments. The original instalments are still shown; the extra is counted against the principal of the last instalments. When the lender confirms the new schedule, use Amend Schedule.'});
+  if(debt&&info.legacyIds.length)review.push({code:'legacy_amendment',text:'The schedule was amended after '+m(sum(info.absorbedLive.filter(function(a){return info.legacyIds.indexOf(a.id)>=0;}),function(a){return toK(a.principal);}))+' of extra principal. KoboFlow now assumes the lender\'s new instalments already reflect it, so it is not subtracted again. Check this against the lender\'s statement.'});
+  if(debt&&ls.unappliedK>0)review.push({code:'extra_unapplied',text:m(ls.unappliedK)+' of extra principal is more than the principal left in the schedule. Check the payments and ask the lender for a statement.'});
+  if(debt&&info.absorbedReversed.length)review.push({code:'absorbed_reversed',text:'An extra principal payment that the amended schedule reflects was reversed. The amended instalments may now be too low: check them with the lender.'});
+  if(debt&&principalSettled&&!settled)review.push({code:'charges_after_principal',text:'Principal is fully repaid. '+m(out.i+out.f)+' of scheduled interest and fees is still shown as owed. Ask the lender for the payoff figure; if they confirm less, record it with Early Settlement.'});
   return{states:st,
-    scheduled:{principal:fromK(sch.p),interest:fromK(sch.i),fees:fromK(sch.f),total:fromK(sch.p+sch.i+sch.f+sch.u)},
-    paid:{principal:fromK(paid.p+extraP),interest:fromK(paid.i),fees:fromK(paid.f),unsplit:fromK(paid.u),lateCharges:fromK(late)},
-    outstanding:{principal:debt?fromK(outP):0,interest:debt?fromK(outI):0,fees:debt?fromK(outF):0,total:fromK(outTotal),componentsApprox:paid.u>0},
-    extraPrincipal:fromK(extraP),waived:fromK(waivedK),repaidToDate:fromK(repaid),overdue:fromK(overdueK),
-    next:open.length?open[0]:null,settled:debt&&st.length>0&&outTotal<=0};
+    scheduled:{principal:fromK(sch.p+absorbedK),interest:fromK(sch.i),fees:fromK(sch.f),total:fromK(sch.p+sch.i+sch.f+sch.u+absorbedK)},
+    paid:{principal:fromK(paid.p+extraK),interest:fromK(paid.i),fees:fromK(paid.f),unsplit:fromK(paid.u),lateCharges:fromK(late)},
+    outstanding:{principal:debt?fromK(out.p):0,interest:debt?fromK(out.i):0,fees:debt?fromK(out.f):0,total:fromK(outTotal),componentsApprox:paid.u>0},
+    extraPrincipal:fromK(extraK),extraUnconfirmed:fromK(openK),extraAbsorbed:fromK(absorbedK),extraApplied:fromK(exApplied),extraUnapplied:fromK(ls.unappliedK),
+    extraIds:{open:info.openIds,absorbed:info.absorbedIds},
+    waived:fromK(waivedK),repaidToDate:fromK(repaid),overdue:fromK(overdueK),
+    next:open.length?open[0]:null,principalSettled:principalSettled,settled:settled,
+    review:review,needsReview:review.length>0};
 }
 
 /* ── Payment allocation ──────────────────────────────────────── */
@@ -1492,7 +1554,7 @@ function parseManualRows(text){
 var API={toK:toK,fromK:fromK,num:num,fmtDate:fmtDate,parseDate:parseDate,today:today,addDays:addDays,addMonths:addMonths,addPeriods:addPeriods,daysBetween:daysBetween,periodicRate:periodicRate,
   CATEGORIES:CATEGORIES,NATURES:NATURES,STRUCTURES:STRUCTURES,STATUSES:STATUSES,STATUS_LABEL:STATUS_LABEL,OPP_STRUCTURES:OPP_STRUCTURES,REMINDER_TEXT:REMINDER_TEXT,
   isDebt:isDebt,cashReceived:function(t){return fromK(cashReceivedK(t));},buildSchedule:buildSchedule,termsSummary:termsSummary,
-  instalmentStates:instalmentStates,agreementBalances:agreementBalances,allocatePayment:allocatePayment,settlementPlan:settlementPlan,
+  instalmentStates:instalmentStates,extraPrincipalInfo:extraPrincipalInfo,agreementBalances:agreementBalances,allocatePayment:allocatePayment,settlementPlan:settlementPlan,
   classifyTxn:classifyTxn,accountDeltas:accountDeltas,accountBalances:accountBalances,upcomingObligations:upcomingObligations,cashForecast:cashForecast,
   buildReminders:buildReminders,xirr:xirr,ACCOUNT_KINDS:ACCOUNT_KINDS,LEGACY_ACCOUNTS:LEGACY_ACCOUNTS,bucketSummary:bucketSummary,accountAccess:accountAccess,cashPosition:cashPosition,cashCover:cashCover,reservationPlan:reservationPlan,coveredAmount:coveredAmount,BILL_REPEAT:BILL_REPEAT,BILL_UNITS:BILL_UNITS,billRepeatLabel:billRepeatLabel,billCustomOk:billCustomOk,billDueDates:billDueDates,billAmountOn:billAmountOn,billOccurrences:billOccurrences,billObligations:billObligations,billUnmatchedPayments:billUnmatchedPayments,validateBill:validateBill,dataQuality:dataQuality,incomeFromFindings:incomeFromFindings,dupName:dupName,PARTY_MAX:PARTY_MAX,dateKey:dateKey,inDateRange:inDateRange,partyField:partyField,cleanParty:cleanParty,partyKey:partyKey,clipParty:clipParty,budgetProgress:budgetProgress,directorPlan:directorPlan,spendingRunway:spendingRunway,validateSetup:validateSetup,cashFlowSummary:cashFlowSummary,oppRepayments:oppRepayments,analyzeOpportunity:analyzeOpportunity,oppToTerms:oppToTerms,parseManualRows:parseManualRows};
 root.KoboFin=API;
@@ -2679,6 +2741,9 @@ body.kf-live .sample-tag{display:inline-block;}
       </div>
       <div class="form-group"><label>From Account</label><select id="settle-account" class="form-input"></select></div>
       <div class="form-group"><label>Lender Confirmation / Reason</label><input id="settle-reason" class="form-input" type="text" placeholder="e.g. Payoff quote via app, ref 1234"/></div>
+      <label class="check-row"><input type="checkbox" id="settle-confirmed"/> The lender confirmed this is the full amount that closes the loan</label>
+      <label class="check-row"><input type="checkbox" id="settle-paid"/> I have already paid it: the money has left this account (not a plan or a quote)</label>
+      <div class="hint">Only comparing a payoff quote (for example, to qualify for a larger loan)? Enter the figure to see the effect, then close this window: nothing is saved.</div>
       <div id="settle-preview"></div>
       <button class="modal-save" id="settle-save-btn">CONFIRM SETTLEMENT</button>
     </div>
@@ -2691,6 +2756,7 @@ body.kf-live .sample-tag{display:inline-block;}
       <div id="amend-locked"></div>
       <div class="form-group"><label>New Unpaid Instalments (YYYY-MM-DD principal interest fees)</label><textarea id="amend-rows" class="form-input" style="min-height:120px;"></textarea></div>
       <div class="form-group"><label>Reason for Change</label><input id="amend-reason" class="form-input" type="text" placeholder="e.g. Lender rescheduled after extra payment"/></div>
+      <div id="amend-extra"></div>
       <div id="amend-preview"></div>
       <button class="modal-save" id="amend-save-btn">SAVE AMENDMENT</button>
     </div>
@@ -3234,6 +3300,7 @@ function getAgr(id){return AGR.find(function(a){return a.id===id;});}
 function agrInst(id){return INST.filter(function(x){return x.agreementId===id;});}
 function agrAlloc(id){return ALLOC.filter(function(x){return x.agreementId===id;});}
 function agrTxns(id){return items.filter(function(t){return t.agreementId===id;});}
+function agrStates(a,allocs){return F.instalmentStates(agrInst(a.id),allocs||agrAlloc(a.id),getToday(),{txns:agrTxns(a.id)});}
 function agrView(a){
   return{agr:a,debt:F.isDebt(a.terms),bal:F.agreementBalances(a.terms,agrInst(a.id),agrAlloc(a.id),agrTxns(a.id),getToday()),
     receipt:items.find(function(t){return t.id===a.receiptTxnId&&!t.voided;})||null};
@@ -3316,6 +3383,7 @@ function agrCard(v){
   var line=v.debt&&a.status==='active'&&n?'Next: '+fmt(n.remaining)+' &middot; '+fmtD(n.dueDate)+' <span class="status-pill '+cls(n.status)+'">'+F.STATUS_LABEL[n.status]+'</span>'+(maturing?' &middot; <span style="color:var(--amber);">Matures '+fmtD(last.dueDate)+'</span>':''):'';
   return'<div class="agr-card'+(b.overdue>0?' overdue':'')+'" data-open-agr="'+esc(a.id)+'"><div class="loan-top" style="margin-bottom:6px;"><div><div class="loan-name">'+esc(a.name)+'</div><div class="loan-source">'+esc(a.counterparty||'')+' &middot; '+(F.CATEGORIES[a.category]||'')+' &middot; <span class="status-pill '+cls(a.status)+'">'+F.STATUSES[a.status]+'</span></div></div><div style="text-align:right;">'+right+'</div></div>'
     +(line?'<div style="font-size:11px;color:var(--muted);">'+line+'</div>':'')
+    +(v.debt&&a.status==='active'&&b.needsReview?'<div style="font-size:11px;color:var(--amber);">&#9888; Schedule needs review</div>':'')
     +(v.debt&&a.status==='active'?'<div class="loan-progress-track"><div class="loan-progress-bar" data-w="'+paidPct+'" style="width:'+paidPct+'%;"></div></div>':'')+'</div>';
 }
 function renderLoans(){
@@ -3371,6 +3439,7 @@ function renderAgreementDetail(){
   acts.push('<button data-act="edit">'+(a.status==='accepted_awaiting'?'Edit Terms':'Edit Details')+'</button>');
   if(a.status==='accepted_awaiting'&&!live.length)acts.push('<button class="danger" data-act="cancel">Cancel</button>');
   h+='<div class="btn-row">'+acts.join('')+'</div>';
+  if(debt&&a.status==='active'&&b.needsReview)h+='<div class="form-warn" id="agr-review"><b>Schedule needs review.</b>'+b.review.map(function(r){return'<div style="margin-top:5px;" data-review="'+esc(r.code)+'">'+esc(r.text)+'</div>';}).join('')+'</div>';
 
   if(debt){
     var schedTotal=b.scheduled.total,cash=v.receipt?v.receipt.amount:F.cashReceived(t);
@@ -3381,6 +3450,8 @@ function renderAgreementDetail(){
       +kv('Cost of this money',fmt(cost)+(cash>0?' <span style="font-family:var(--dm);font-size:10px;color:var(--muted);">('+(Math.round(cost/cash*10000)/100)+'% of cash, whole term)</span>':''),'#F5A623')
       +kv('Total paid so far',fmt(b.repaidToDate),'#22C55E')
       +kv('Outstanding',fmt(b.outstanding.total),b.outstanding.total>0?'#EF4444':'#22C55E','total')
+      +kv('of which principal',b.principalSettled?'Fully repaid':fmt(b.outstanding.principal)+(b.outstanding.componentsApprox?' (approx.)':''),b.principalSettled?'#22C55E':'')
+      +kv('of which scheduled interest &amp; fees',fmt(b.outstanding.interest+b.outstanding.fees))
       +kv('Next payment',b.next?fmt(b.next.remaining)+' &middot; '+fmtD(b.next.dueDate)+' <span class="status-pill '+cls(b.next.status)+'">'+F.STATUS_LABEL[b.next.status]+'</span>':'None')
       +(b.overdue>0?kv('Overdue now',fmt(b.overdue),'#EF4444'):'')
       +'</div>';
@@ -3388,7 +3459,7 @@ function renderAgreementDetail(){
       +['principal','interest','fees'].map(function(k){return'<tr><td style="text-transform:capitalize;">'+k+'</td><td>'+fmt(b.scheduled[k])+'</td><td>'+fmt(b.paid[k])+'</td><td>'+fmt(b.outstanding[k])+'</td></tr>';}).join('')
       +'</table>'
       +(b.paid.unsplit>0?'<div class="form-warn">'+fmt(b.paid.unsplit)+' was paid with the split not yet known (provisional). Outstanding principal/interest above exclude it; the total outstanding is exact.</div>':'')
-      +(b.extraPrincipal>0?'<div class="muted-note">Includes '+fmt(b.extraPrincipal)+' extra principal paid outside the schedule. Amend the schedule if the lender changed future instalments.</div>':'')
+      +(b.extraPrincipal>0?'<div class="muted-note" id="agr-extra-note">Paid principal includes '+fmt(b.extraPrincipal)+' extra principal paid outside the schedule'+(b.extraAbsorbed>0?': '+fmt(b.extraAbsorbed)+' is already reflected in the amended schedule':'')+(b.extraUnconfirmed>0?(b.extraAbsorbed>0?', and ':': ')+fmt(b.extraUnconfirmed)+' is counted against the last instalments until the lender confirms revised terms':'')+'.</div>':'')
       +(b.waived>0?'<div class="muted-note">'+fmt(b.waived)+' of scheduled amounts waived (see history).</div>':'')
       +(b.paid.lateCharges>0?'<div class="muted-note">Late or extra charges paid: '+fmt(b.paid.lateCharges)+'.</div>':'')
       +(a.splitBasis==='estimated_pro_rata'?'<div class="muted-note">The lender quoted payment totals only, so each instalment\'s principal/interest split is an even estimate. Totals are contractual.</div>':'')
@@ -3420,7 +3491,7 @@ function renderAgreementDetail(){
     var all=agrInst(a.id).slice().sort(function(x,y){return x.dueDate<y.dueDate?-1:1;}),byId={};
     b.states.forEach(function(s){byId[s.id]=s;});
     h+='<div class="card"><div class="card-label">Repayment Schedule</div><table class="sched"><tr><th>Due</th><th>Total</th><th>Paid</th><th>Left</th><th>Status</th></tr>'
-      +b.states.map(function(s){return'<tr><td>'+fmtD(s.dueDate)+'</td><td>'+fmt(s.total)+'</td><td>'+fmt(s.paid)+'</td><td>'+fmt(s.remaining)+'</td><td><span class="status-pill '+cls(s.status)+'">'+F.STATUS_LABEL[s.status]+'</span></td></tr>';}).join('')
+      +b.states.map(function(s){return'<tr><td>'+fmtD(s.dueDate)+'</td><td>'+fmt(s.total)+'</td><td>'+fmt(s.paid+s.extraApplied)+(s.extraApplied>0?'<div style="font-size:9px;color:var(--muted);">incl. '+fmt(s.extraApplied)+' extra principal</div>':'')+'</td><td>'+fmt(s.remaining)+'</td><td><span class="status-pill '+cls(s.status)+'">'+F.STATUS_LABEL[s.status]+'</span></td></tr>';}).join('')
       +'</table>';
     var sup=all.filter(function(x){return x.supersededBy;});
     if(sup.length)h+='<details class="kf-adv"><summary>Replaced instalments ('+sup.length+')</summary><table class="sched">'+sup.map(function(x){return'<tr class="superseded"><td>'+fmtD(x.dueDate)+'</td><td>'+fmt(x.total)+'</td></tr>';}).join('')+'</table></details>';
@@ -3629,10 +3700,10 @@ function openPay(agrId,opts){
 function payPlan(){
   var a=getAgr(payCtx.agrId),mode=val('pay-mode');
   var allocs=agrAlloc(a.id).filter(function(x){return x.txnId!==payCtx.correcting;});
-  var st=F.instalmentStates(agrInst(a.id),allocs,getToday());
+  var st=agrStates(a,allocs);
   var plan=F.allocatePayment(st,nval('pay-amount'),{mode:mode,principal:nval('pay-p'),interest:nval('pay-i'),fees:nval('pay-f'),allowExtra:qs('pay-allow-extra').checked});
   if(plan.ok&&mode==='extra_principal'){
-    var bal=F.agreementBalances(a.terms,agrInst(a.id),allocs,[],getToday());
+    var bal=F.agreementBalances(a.terms,agrInst(a.id),allocs,agrTxns(a.id),getToday());
     if(nval('pay-amount')>bal.outstanding.principal+0.005){plan.ok=false;plan.error='Extra principal cannot exceed the outstanding principal of '+fmt(bal.outstanding.principal)+'.';}
   }
   plan.states=st;return plan;
@@ -3644,7 +3715,7 @@ function paySync(){
   if(!p.ok){pv.innerHTML='<div class="form-err">'+esc(p.error)+'</div>';return;}
   var bySeq={};p.states.forEach(function(s){bySeq[s.id]=s;});
   pv.innerHTML=preBaselineNote(val('pay-date'))+'<div class="form-ok">'+(mode==='provisional'?'Held against the instalments below; principal/interest split to be confirmed later.':'Principal '+fmt(p.split.principal)+' &middot; Interest '+fmt(p.split.interest)+' &middot; Fees '+fmt(p.split.fees))
-    +'<br>'+p.rows.map(function(r){var s=bySeq[r.instalmentId];var amt=r.principal+r.interest+r.fees+r.unsplit;return s?'#'+s.seq+' due '+fmtD(s.dueDate)+': '+fmt(amt)+(amt+0.005>=s.remaining?' (clears it)':' (part)'):(r.kind==='extra_principal'?'Extra principal: ':'Charges beyond schedule: ')+fmt(amt);}).join('<br>')+'</div>';
+    +'<br>'+p.rows.map(function(r){var s=bySeq[r.instalmentId];var amt=r.principal+r.interest+r.fees+r.unsplit;return s?'#'+s.seq+' due '+fmtD(s.dueDate)+': '+fmt(amt)+(amt+0.005>=s.remaining?' (clears it)':' (part)'):(r.kind==='extra_principal'?'Extra principal: ':'Charges beyond schedule: ')+fmt(amt);}).join('<br>')+(p.split.principal>0&&p.rows.some(function(r){return r.kind==='extra_principal';})?'<br>The agreed instalments stay as they are until the lender confirms new ones (then use Amend Schedule).':'')+'</div>';
 }
 function reversalOps(txn,reason){
   var ops=[],now=nowISO(),t=clone(txn);
@@ -3700,16 +3771,17 @@ var settleCtx={};
 function openSettle(agrId){
   var a=getAgr(agrId),v=agrView(a);settleCtx={agrId:agrId,idem:uid('stl')};
   qs('settle-context').innerHTML='<div class="card" style="background:var(--surf2);">'+kv('Outstanding per schedule',fmt(v.bal.outstanding.total),'#EF4444')+kv('of which principal',fmt(v.bal.outstanding.principal))+kv('interest',fmt(v.bal.outstanding.interest))+kv('fees',fmt(v.bal.outstanding.fees))+'</div>';
-  setVal('settle-amount','');setVal('settle-date',getToday());setVal('settle-reason','');
+  setVal('settle-amount','');setVal('settle-date',getToday());setVal('settle-reason','');qs('settle-confirmed').checked=false;qs('settle-paid').checked=false;
   qs('settle-account').innerHTML=acctOptions(defaultAcct(a.accountId||'pharma_bank'));qs('settle-preview').innerHTML='';
   openModal('settle-modal');
 }
-function settlePlan(){var a=getAgr(settleCtx.agrId);return F.settlementPlan(F.instalmentStates(agrInst(a.id),agrAlloc(a.id),getToday()),nval('settle-amount'));}
+function settlePlan(){var a=getAgr(settleCtx.agrId);return F.settlementPlan(agrStates(a),nval('settle-amount'));}
 function settleSync(){
   if(!nval('settle-amount')){qs('settle-preview').innerHTML='';return;}
   var p=settlePlan();if(!p.ok){qs('settle-preview').innerHTML='<div class="form-err">'+esc(p.error)+'</div>';return;}
   var sp={principal:0,interest:0,fees:0};p.rows.forEach(function(r){sp.principal+=r.principal;sp.interest+=r.interest;sp.fees+=r.fees+r.unsplit;});
-  qs('settle-preview').innerHTML='<div class="form-ok">Applied: principal '+fmt(sp.principal)+', interest '+fmt(sp.interest)+', fees '+fmt(sp.fees)+'.'
+  qs('settle-preview').innerHTML='<div class="form-ok">Still scheduled: '+fmt(p.outstanding)+'. Lender\'s figure: '+fmt(nval('settle-amount'))+'.'
+    +'<br>Applied: principal '+fmt(sp.principal)+', interest '+fmt(sp.interest)+', fees '+fmt(sp.fees)+'.'
     +(p.waived>0?'<br>The lender\'s figure is '+fmt(p.waived)+' less than the schedule: that amount will be recorded as waived by the lender.':'')
     +(p.settlementCharge>0?'<br>'+fmt(p.settlementCharge)+' more than the schedule: recorded as a settlement charge (finance cost).':'')+'</div>';
 }
@@ -3718,6 +3790,7 @@ function saveSettle(){guard(function(){
   if(items.some(function(t){return t.idemKey===settleCtx.idem;})){closeModal('settle-modal');return;}
   var p=settlePlan();if(!p.ok){settleSync();return;}
   if(!reason){qs('settle-preview').innerHTML='<div class="form-err">Enter how the lender confirmed this figure. It is kept in the history.</div>';return;}
+  if(!qs('settle-confirmed').checked||!qs('settle-paid').checked){qs('settle-preview').innerHTML='<div class="form-err">Nothing was saved. A settlement is recorded only when the lender has confirmed the figure and you have already paid it. Tick both boxes once that is true.</div>';return;}
   if(!date||date>getToday()){qs('settle-preview').innerHTML='<div class="form-err">The date cannot be in the future.</div>';return;}
   if(!kfConfirm('Settle '+a.name+' with '+fmt(amount)+' from '+acctLabel(acct)+'?'+(p.waived>0?'\n'+fmt(p.waived)+' of scheduled amounts will be marked waived by the lender.':'')+'\nThe agreement will be marked settled.'))return;
   var split={principal:0,interest:0,fees:0,unsplit:0};p.rows.forEach(function(r){split.principal+=r.principal;split.interest+=r.interest;split.fees+=r.fees;split.unsplit+=r.unsplit;});
@@ -3731,9 +3804,13 @@ function saveSettle(){guard(function(){
 /* ═══════════════ SCHEDULE AMENDMENT ═══════════════ */
 var amendCtx={};
 function openAmend(agrId){
-  var a=getAgr(agrId),st=F.instalmentStates(agrInst(a.id),agrAlloc(a.id),getToday());
+  var a=getAgr(agrId),st=agrStates(a);
   var open=st.filter(function(s){return s.paid===0&&s.status!=='waived';}),locked=st.filter(function(s){return open.indexOf(s)<0;});
-  amendCtx={agrId:agrId,open:open};
+  var bal=agrView(a).bal;
+  amendCtx={agrId:agrId,open:open,extraOpen:bal.extraIds.open,extraAbsorbed:bal.extraIds.absorbed,extraAmt:bal.extraUnconfirmed};
+  qs('amend-extra').innerHTML=bal.extraUnconfirmed>0?'<div class="form-group"><label>'+fmt(bal.extraUnconfirmed)+' extra principal paid that no amended schedule reflects yet</label>'
+    +'<label class="check-row"><input type="radio" name="amend-extra" value="included"/> The lender\'s new instalments already take it into account</label>'
+    +'<label class="check-row"><input type="radio" name="amend-extra" value="excluded"/> They do not: keep counting it against the last instalments</label></div>':'';
   qs('amend-locked').innerHTML=locked.length?'<div class="muted-note">Kept as is: '+locked.map(function(s){return fmtD(s.dueDate)+' '+fmt(s.total)+' ('+F.STATUS_LABEL[s.status]+')';}).join('; ')+'</div>':'';
   setVal('amend-rows',open.map(function(s){return s.dueDate+' '+s.inst.principal+' '+s.inst.interest+' '+s.inst.fees;}).join('\n'));
   setVal('amend-reason','');amendSync();openModal('amend-modal');
@@ -3747,21 +3824,27 @@ function parseAmend(){
 }
 function amendSync(){
   var p=parseAmend(),oldT=amendCtx.open?amendCtx.open.reduce(function(s,x){return s+x.total;},0):0,newT=p.rows.reduce(function(s,r){return s+r.total;},0);
-  qs('amend-preview').innerHTML=p.errors.length?'<div class="form-err">'+p.errors.join('<br>')+'</div>':'<div class="form-ok">Unpaid instalments: '+fmt(oldT)+' &rarr; '+fmt(newT)+' ('+p.rows.length+' rows)</div>';
+  var ch=amendExtraChoice(),oldP=amendCtx.open?amendCtx.open.reduce(function(s,x){return s+F.num(x.inst.principal);},0):0,newP=p.rows.reduce(function(s,r){return s+r.principal;},0);
+  var expP=Math.round((oldP-(ch==='included'?amendCtx.extraAmt:0))*100)/100;
+  qs('amend-preview').innerHTML=p.errors.length?'<div class="form-err">'+p.errors.join('<br>')+'</div>':'<div class="form-ok">Unpaid instalments: '+fmt(oldT)+' &rarr; '+fmt(newT)+' ('+p.rows.length+' rows)</div>'
+    +(amendCtx.extraAmt>0&&ch&&Math.abs(newP-expP)>0.005?'<div class="form-warn">Principal in the new rows is '+fmt(newP)+'; with this choice about '+fmt(expP)+' is expected. Check the lender\'s figures.</div>':'');
 }
+function amendExtraChoice(){var r=document.querySelector('input[name="amend-extra"]:checked');return r?r.value:'';}
 function saveAmend(){guard(function(){
-  var a=getAgr(amendCtx.agrId),p=parseAmend(),reason=val('amend-reason');
+  var a=getAgr(amendCtx.agrId),p=parseAmend(),reason=val('amend-reason'),ch=amendExtraChoice();
   if(p.errors.length){amendSync();return;}
   if(!reason){qs('amend-preview').innerHTML='<div class="form-err">Enter the reason for the change.</div>';return;}
+  if(amendCtx.extraOpen.length&&!ch){qs('amend-preview').innerHTML='<div class="form-err">Choose whether the lender\'s new instalments already take the extra principal into account.</div>';return;}
+  var absorbed=amendCtx.extraAbsorbed.concat(ch==='included'?amendCtx.extraOpen:[]);
   var oldT=amendCtx.open.reduce(function(s,x){return s+x.total;},0),newT=p.rows.reduce(function(s,r){return s+r.total;},0);
   if(!kfConfirm('Replace '+amendCtx.open.length+' unpaid instalment(s) totalling '+fmt(oldT)+' with '+p.rows.length+' totalling '+fmt(newT)+'?\nThe old rows are kept in history.'))return;
   var now=nowISO(),amId=uid('amd'),c=clone(a),ops=[];
   c.version=(c.version||1)+1;c.updatedAt=now;c.scheduleBasis='contract';
   amendCtx.open.forEach(function(s){var x=clone(s.inst);x.supersededBy=amId;x.supersededAt=now;ops.push({store:'instalments',put:x});});
   var maxSeq=agrInst(a.id).reduce(function(m,i){return Math.max(m,i.seq||0);},0);
-  p.rows.forEach(function(r,k){ops.push({store:'instalments',put:{id:a.id+'_v'+c.version+'_'+(k+1),agreementId:a.id,seq:maxSeq+k+1,dueDate:r.dueDate,principal:r.principal,interest:r.interest,fees:r.fees,total:r.total,version:c.version,amendmentId:amId,createdAt:now}});});
+  p.rows.forEach(function(r,k){ops.push({store:'instalments',put:{id:a.id+'_v'+c.version+'_'+(k+1),agreementId:a.id,seq:maxSeq+k+1,dueDate:r.dueDate,principal:r.principal,interest:r.interest,fees:r.fees,total:r.total,version:c.version,amendmentId:amId,extraAbsorbed:absorbed.slice(),createdAt:now}});});
   ops.unshift({store:'agreements',put:c});
-  ops.push(evt(a.id,'schedule_amended',{amendmentId:amId,reason:reason,oldTotal:oldT,newTotal:newT,removed:amendCtx.open.map(function(s){return{id:s.id,dueDate:s.dueDate,total:s.total};}),added:p.rows}));
+  ops.push(evt(a.id,'schedule_amended',{amendmentId:amId,reason:reason,oldTotal:oldT,newTotal:newT,removed:amendCtx.open.map(function(s){return{id:s.id,dueDate:s.dueDate,total:s.total};}),added:p.rows,extraIncluded:ch==='included'?amendCtx.extraOpen.slice():[]}));
   ops=ops.concat(statusOps(c,simulate(a.id,ops),'Schedule amended'));
   return commit(ops).then(function(){closeModal('amend-modal');showToast('Schedule amended');}).catch(failSave);
 });}
@@ -4421,7 +4504,7 @@ function renderNetWorth(){
   el=qs('nw-assets');if(el)el.textContent=fmt(ta);
   el=qs('nw-liabs');if(el)el.textContent=fmt(tl2);
   el=qs('nw-assets-list');if(el)el.innerHTML=ACCOUNTS.map(function(a){return'<div class="nw-row"><div class="nw-row-label"><span>'+a.icon+'</span><span>'+esc(a.label)+'</span></div><div class="nw-row-val" style="color:#22C55E;">'+fmt(a.balance)+'</div></div>';}).join('');
-  el=qs('nw-liabs-list');if(el)el.innerHTML=loans.map(function(v){return'<div class="nw-row" data-open-agr="'+esc(v.agr.id)+'"><div class="nw-row-label"><span>&#127974;</span><span>'+esc(v.agr.name)+'</span></div><div class="nw-row-val" style="color:#EF4444;">'+fmt(v.bal.outstanding.total)+'</div></div>';}).join('')
+  el=qs('nw-liabs-list');if(el)el.innerHTML=loans.map(function(v){return'<div class="nw-row" data-open-agr="'+esc(v.agr.id)+'"><div class="nw-row-label"><span>&#127974;</span><span>'+esc(v.agr.name)+'<div style="font-size:10px;color:var(--muted);">principal '+fmt(v.bal.outstanding.principal)+' &middot; scheduled interest &amp; fees '+fmt(v.bal.outstanding.interest+v.bal.outstanding.fees)+'</div></span></div><div class="nw-row-val" style="color:#EF4444;">'+fmt(v.bal.outstanding.total)+'</div></div>';}).join('')
     +un.map(function(t){return'<div class="nw-row"><div class="nw-row-label"><span>&#9888;</span><span>'+esc(t.desc)+' (terms not recorded, at least)</span></div><div class="nw-row-val" style="color:#EF4444;">'+fmt(t.amount)+'</div></div>';}).join('')
     +ob.map(function(o){return'<div class="nw-row" data-nav="bills"><div class="nw-row-label"><span>&#128196;</span><span>'+esc(o.label)+' (overdue bill, due '+fmtD(o.dueDate)+')</span></div><div class="nw-row-val" style="color:#EF4444;">'+fmt(o.remaining)+'</div></div>';}).join('')
     +(isLive()?[]:OBLIGATIONS_DATA).map(function(o){return'<div class="nw-row"><div class="nw-row-label"><span>'+o.icon+'</span><span>'+o.desc+' (bill)</span></div><div class="nw-row-val" style="color:#EF4444;">'+fmt(o.amount)+'</div></div>';}).join('');
