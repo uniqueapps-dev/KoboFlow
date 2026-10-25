@@ -133,9 +133,23 @@ test('a populated v3 database upgrades to v4: every record preserved; a verified
   const rec = after.stores.meta.find(m => m.id === 'dbUpgradeV4');
   assert.equal(rec.from, 3); assert.equal(rec.to, 4); assert.equal(rec.copyDb, cs[0].name); assert.equal(rec.verified, true);
   assert.equal(rec.counts.transactions, before.stores.transactions.length);
-  // Same money on screen, before and after.
+  // Owner decision (2026-10-25): existing accounts must be explicitly reconfirmed after an
+  // upgrade. The previous release saved every account as "business" (its default) with no
+  // confirmation, so straight after the upgrade none of it counts as pharmacy cash, and the
+  // Director says why. Saving Settings → Accounts once confirms them and restores the same money.
   const cash = t => /Cash Now \(actual\)₦[\d,]+/.exec(t)[0];
-  assert.equal(cash(await page.textContent('#autopilot-body')), cash(oldAutopilot));
+  assert.notEqual(cash(oldAutopilot), 'Cash Now (actual)₦0', 'the old app showed real money before the upgrade');
+  assert.equal(cash(await page.textContent('#autopilot-body')), 'Cash Now (actual)₦0', 'unconfirmed accounts are not pharmacy cash after the upgrade');
+  await page.click('.nav-btn[data-screen="director"]');
+  assert.match(await page.textContent('#director-body'), /is set to Business but you have not confirmed it/);
+  await page.click('#settings-nav-btn'); await page.click('#setup-open-btn'); await page.waitForSelector('#setup-modal.open');
+  await page.click('#setup-save-btn'); await page.click('#setup-confirm-btn');
+  await page.waitForFunction(() => !document.getElementById('setup-modal').classList.contains('open'));
+  assert.equal(cash(await page.textContent('#autopilot-body')), cash(oldAutopilot), 'after reconfirming, the same money as before the upgrade');
+  const reconfirmed = await dump(context, 'KoboFlowDB');
+  const ls = reconfirmed.stores.meta.find(m => m.id === 'ledgerSetup');
+  assert.ok(ls.accounts.filter(a => !a.removed).every(a => a.useConfirmedValue === a.use && a.useConfirmedAt), 'every account is now explicitly confirmed');
+  assert.deepEqual(reconfirmed.stores.transactions, before.stores.transactions, 'reconfirming moves no money and changes no entry');
   // Storage Check explains the copy and offers it as a normal backup file.
   await page.click('#settings-nav-btn'); await page.click('#storage-check-btn');
   await page.waitForFunction(() => /safety copy/.test(document.getElementById('storage-check-out').textContent));

@@ -4020,21 +4020,17 @@ var DEMO_ITEMS=null,SETUP=null;
 var KIND_ICON={wallet:'&#128241;',bank:'&#127974;',cash:'&#128181;',coop:'&#129309;',investment:'&#128200;'};
 function isLive(){return !!(SETUP&&SETUP.mode==='live');}
 function resolveAcct(id){return(isLive()&&id&&SETUP.aliases&&SETUP.aliases[id]!==undefined)?(SETUP.aliases[id]||''):id;}
-/* Migration safety (item C, G4): a record saved before this feature existed has no "use" key at
-   all (every save since always writes one, even '' for "not chosen yet" — see confirmSetup()).
-   That genuine absence is the one safe signal for "pre-existing data the owner already relied
-   on" (for example, upgraded from the old index.html): it is grandfathered in as confirmed
-   Business, exactly matching the behaviour it already had, never silently excluded or reset to
-   "not chosen". A brand-new account always has an explicit (even if blank) "use", so it is never
-   mistaken for this case. Applied once, in place, wherever a raw SETUP.accounts record is about
-   to be read as current (runtime ACCOUNTS and the Setup form draft) so every reader — including
-   the "Used For" dropdown and validateSetup's warnings — agrees.
-   A restored backup's account is never read raw here with a genuinely missing "use": importJSON's
-   resetRestoredOwnership() gives it an explicit '' first, so this grandfathering — meant for
-   same-device continuity only — cannot be reached by a cross-install restore. */
+/* Upgrade rule (owner decision, 2026-10-25): existing accounts must be explicitly reconfirmed
+   after an upgrade. Nothing saved before this feature is ever treated as confirmed:
+   - a record with no "use" key at all reads as '' ("not chosen yet");
+   - a record saved by an earlier version as "business" (the old default, so not necessarily
+     the owner's choice) has no confirmation marker, so it reads as unconfirmed Business.
+   Either way the account is excluded from pharmacy-eligible cash and flagged until the owner
+   chooses or confirms it in Settings → Accounts (G4). Applied in memory wherever a raw
+   SETUP.accounts record is about to be read as current (runtime ACCOUNTS and the Setup form
+   draft), so every reader agrees. The stored record is not rewritten until the owner saves. */
 function normalizeAcctOwnership(a){
-  if(a.use!==undefined)return a;
-  a.use='business';a.useConfirmedAt=SETUP&&(SETUP.updatedAt||SETUP.createdAt)||getToday();a.useConfirmedValue='business';
+  if(a.use===undefined)a.use='';
   return a;
 }
 function applySetup(){
@@ -4174,7 +4170,7 @@ function openSetup(fresh){
   var restore=fresh!==true&&setupDraft&&setupDirty&&setupDraftBase===setupBaseKey();
   if(!restore){
     setupDraft=SETUP?clone(SETUP):{mode:'live',baselineDate:getToday(),accounts:[{id:'acc_opay',label:'Opay',institution:'Opay',kind:'wallet',use:'',primary:true,opening:''}],buckets:[],aliases:{},history:[]};
-    setupDraft.accounts.forEach(normalizeAcctOwnership); // same migration-safety grandfathering as applySetup()
+    setupDraft.accounts.forEach(normalizeAcctOwnership); // same upgrade rule as applySetup(): a missing "use" reads as "not chosen yet"
     setupDraft.budgets=setupDraft.budgets||[];setupDraft.planning=setupDraft.planning||{workingCapitalFloor:null,netWorthGoal:null};
     setupDirty=false;setupDraftBase=setupBaseKey();
   }
@@ -5137,10 +5133,9 @@ function importParties(rec){
    that THIS owner looked at the account just now — are cleared. Until re-confirmed, the account
    is excluded from pharmacy-eligible cash exactly like any other unconfirmed account
    (F.pharmacyEligibleAccounts), never silently treated as still-confirmed.
-   A genuinely legacy account (no "use" key at all — see normalizeAcctOwnership) is given an
-   explicit '' here, the same "not chosen yet" a brand-new account gets: that one-time same-device
-   grandfathering is for continuity on the device that already relied on the balance, and must not
-   extend across a restore onto a different install, where no such continuity exists. */
+   A legacy account with no "use" key at all is given an explicit '' here, the same "not chosen
+   yet" a brand-new account gets (see normalizeAcctOwnership: nothing from before this feature is
+   ever treated as confirmed). */
 function resetRestoredOwnership(ls){
   var out=clone(ls);
   (out.accounts||[]).forEach(function(a){

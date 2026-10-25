@@ -287,13 +287,13 @@ for (const b of BUILDS) {
   });
 }
 
-/* ───────────── Legacy-account normalization vs. the backup/import boundary (M-3, H-1) ─────────────
-   normalizeAcctOwnership()'s same-device grandfathering (a record saved before this feature
-   existed, with no "use" key at all) must stay read-time-only and must never be reachable through
-   a restored backup, where resetRestoredOwnership() gives such an account an explicit "not chosen
-   yet" instead — the same requirement a brand-new account already meets. */
+/* ───────────── Legacy accounts and the backup/import boundary (M-3, H-1) ─────────────
+   Owner decision (2026-10-25): existing accounts must be explicitly reconfirmed after an upgrade.
+   A record saved before this feature existed (no "use" key at all) is read as "not chosen yet",
+   never as confirmed Business, both on the same device and through a restored backup — the same
+   requirement a brand-new account already meets. The stored record is not rewritten on read. */
 for (const b of BUILDS) {
-  test(`${b.label}: a genuinely pre-feature account (no "use" key at all) is read as confirmed Business at runtime, without the stored record being touched`, { skip }, async () => {
+  test(`${b.label}: a genuinely pre-feature account (no "use" key at all) is read as "not chosen yet" and excluded until chosen, without the stored record being touched`, { skip }, async () => {
     const { context, page } = await ctx();
     await openApp(page, b.url);
     await page.evaluate(n => new Promise((res, rej) => {
@@ -310,10 +310,10 @@ for (const b of BUILDS) {
     }), b.dbName);
     await page.reload();
     await page.waitForSelector('body[data-kf-ready="1"]');
-    assert.match(await page.textContent('#autopilot-body'), /Cash Now \(actual\)₦300,000/, 'the legacy account counts in full, exactly as it always did before this feature existed');
+    assert.match(await page.textContent('#autopilot-body'), /Cash Now \(actual\)₦0/, 'the legacy account is excluded from pharmacy cash until the owner chooses its "Used For"');
     await openEdit(page);
-    assert.equal(await row(page, 0).locator('[data-f=use]').inputValue(), 'business');
-    assert.match(await row(page, 0).locator('[data-use-status]').textContent(), /Confirmed/);
+    assert.equal(await row(page, 0).locator('[data-f=use]').inputValue(), '', 'shown as "Not chosen yet", never pre-chosen as Business');
+    assert.match(await row(page, 0).locator('[data-use-status]').textContent(), /Not chosen yet/);
     await page.click('[data-close="setup-modal"]');
     const p2 = await context.newPage();
     await p2.goto(base + '/probe');
@@ -354,7 +354,7 @@ for (const b of BUILDS) {
     const ops = await page.evaluate(d => window.__kfPlanImport(d).ops, data);
     const metaOp = ops.find(o => o.store === 'meta' && o.put.id === 'ledgerSetup');
     assert.ok(metaOp, 'the account setup was accepted for import');
-    assert.equal(metaOp.put.accounts[0].use, '', 'given an explicit "not chosen yet", not left absent — same-device grandfathering must not reach across a restore');
+    assert.equal(metaOp.put.accounts[0].use, '', 'given an explicit "not chosen yet", not left absent, and never confirmed Business');
     assert.equal(metaOp.put.accounts[0].useConfirmedAt, null);
     assert.equal(metaOp.put.accounts[0].useConfirmedValue, null);
   });

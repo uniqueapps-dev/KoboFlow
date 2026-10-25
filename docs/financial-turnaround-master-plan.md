@@ -1,12 +1,13 @@
 # KoboFlow: financial turnaround master plan
 
-- **Status:** draft for the owner's review, revision 7. Records the confirmed U2–U5 decisions,
+- **Status:** draft for the owner's review, revision 8. Records the confirmed U2–U5 decisions,
   then U4a, U5a, U5b, U9 and U12, then the approved financial-safety corrections and the owner's H5
   decision, then the final-review corrections (G1–G5, H1–H3, S1–S4) and the owner's U13 decision,
   then the owner's integrated sales, collections, receivables and bucket direction, then the
   owner's U14 and U15 decisions (revision 6), then an implementation-scope clarification recording
   what an integrated implementation pass actually delivered against stages 1, 2, 3 and 5 below
-  (revision 7; change log in section 13).
+  (revision 7), then the owner's upgrade-reconfirmation decision (revision 8; change log in
+  section 13).
   Planning only: no code was changed for this document.
 - **Branch:** `claude/koboflow-loan-management-qn2vql`.
 - **Checkpoint:** `cb5f209bc50224044435bf857b892c0ec62f0325`, which contains the loan principal and
@@ -1909,6 +1910,20 @@ Confirmed by the owner (2026-10-25, revision 6):
   never shown as validated. Any change to PBSRx itself remains a separate task requiring its own
   explicit authorization.
 
+Confirmed by the owner (2026-10-25, eighth revision):
+- **Upgrade reconfirmation (applies G4 to existing data):** existing accounts must be explicitly
+  reconfirmed after an upgrade. Nothing saved before the ownership feature is treated as
+  confirmed.
+  - An account saved by an earlier version as "business", the old default, is unconfirmed
+    Business.
+  - An account with no "Used For" at all is "not chosen yet".
+  - Both are excluded from pharmacy-eligible cash, and flagged at high severity, until the owner
+    chooses or confirms them in Settings → Accounts.
+  - Saving Settings → Accounts once confirms the values shown, moves no money and changes no
+    entry.
+  - This replaces the earlier same-device exception that treated an account with no "Used For"
+    as confirmed Business. That exception was never approved in this plan.
+
 The owner's restated and confirmed requirements were given in the requests themselves. Apart from
 the PBSRx bucket code noted in section 3, they are not verified against any earlier written
 specification.
@@ -2031,6 +2046,7 @@ Every finding in `docs/turnaround-readiness-audit.md` and where it is handled:
 | 5 | 2026-10-24 | G1–G5, H1–H3, S1–S4, U13; U14 recorded as open | Final consistency review |
 | 6 | 2026-10-25 | Three money figures and provenance labels (§1); Director inputs (§2C); collections in cash collected, and bucket build-versus-activation, target versus funding (§3); credit-sale, collection, pending and failed rules (§5); PBSRx `344b565` findings and smallest safe fixes (§8); Stages 6, 7 and 8 scope and tests; scenarios E35–E41; U14 narrowed, then decided; U15 added, then decided; revision header corrected from 5 to 6 | Owner's continuation and integration direction; PBSRx inspection; the owner's U14 and U15 decisions (§11) |
 | 7 | 2026-10-25 | Implementation-scope note added to the Stage summary (§9): records that an integrated, independently-audited implementation pass delivered Stage 1 in full plus the interim parts of Stage 2, Stage 3's core separation, and Stage 5's H5 Net Worth change, together as one unit; Stage 2/3/5 status cells updated to point to the note; no stage marked complete, no later-stage requirement touched | An independent Stage 1 financial-safety audit found the delivered work spans more of this plan's own stage sequence than its "Stage 1" status cell alone showed, which would mislead anyone using this document to track what is done |
+| 8 | 2026-10-25 | Upgrade-reconfirmation decision recorded (§11): existing accounts must be explicitly reconfirmed after an upgrade; the unapproved same-device "no Used For means confirmed Business" exception removed | Verifying `80eeb52` showed that accounts saved by the previous release (all "business" by default) silently lost their pharmacy cash on upgrade, while a separate exception treated accounts with no "Used For" as confirmed. The owner chose explicit reconfirmation for both |
 
 ---
 
