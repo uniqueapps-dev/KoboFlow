@@ -1,10 +1,10 @@
 # KoboFlow: financial turnaround master plan
 
-- **Status:** draft for the owner's review, revision 5. Records the confirmed U2–U5 decisions,
+- **Status:** draft for the owner's review, revision 6. Records the confirmed U2–U5 decisions,
   then U4a, U5a, U5b, U9 and U12, then the approved financial-safety corrections and the owner's H5
   decision, then the final-review corrections (G1–G5, H1–H3, S1–S4) and the owner's U13 decision,
-  then the owner's integrated sales, collections, receivables and bucket direction (revision 6;
-  change log in section 13).
+  then the owner's integrated sales, collections, receivables and bucket direction, then the
+  owner's U14 and U15 decisions (revision 6; change log in section 13).
   Planning only: no code was changed for this document.
 - **Branch:** `claude/koboflow-loan-management-qn2vql`.
 - **Checkpoint:** `cb5f209bc50224044435bf857b892c0ec62f0325`, which contains the loan principal and
@@ -273,7 +273,10 @@ It must **reduce cognitive load**, not just display records. That means:
 
     Test fixtures, illustrative figures, targets, recorded allocations, funded amounts and real
     available cash are always labelled as what they are. Whether recorded allocations of real money
-    may be used live before a validated sales basis exists is still U14.
+    may be used live before a validated sales basis exists is decided by U14 (section 11): yes, for
+    explicitly recorded, owner-confirmed allocations such as a Reserve allocation, provided the
+    ownership, confirmation, funding and reconciliation safeguards are met; live sales-based bucket
+    targets and allocation recommendations still wait for stage 8.
   - **Target and funding are separate calculations.** A target is never money in an account, proof
     of collection, or permission to spend. Funding is the actual pharmacy cash allocated to a
     bucket, never more than available pharmacy cash.
@@ -525,7 +528,7 @@ KoboFlow records receivables itself.
 
 | Event | Sales | Receivable | Cash |
 |---|---|---|---|
-| A pharmacy sale on credit | Recorded as a sale **by PBSRx only** (the source of truth for pharmacy sales); KoboFlow never records a second sales figure | Created once, for the unpaid amount (where it is recorded until PBSRx supports credit sales: U15) | No change |
+| A pharmacy sale on credit | Recorded as a sale **by PBSRx only** (the source of truth for pharmacy sales); KoboFlow never records a second sales figure | Created once, for the unpaid amount, as a KoboFlow receivable with a stable source reference where available, until PBSRx supports credit sales (U15, decided) | No change |
 | A customer pays an earlier debt in full | No change (not a new sale) | The existing receivable is reduced to zero and closed | Increases once, by the amount received |
 | A customer pays part of a debt | No change | Reduced by exactly the amount received; the rest stays open | Increases once, by the amount received |
 | A transfer is promised or pending | No change | Stays open, marked "payment pending", with the expected date | **No change.** Pending money is never available cash |
@@ -540,7 +543,8 @@ KoboFlow records receivables itself.
   - PBSRx has no customer credit-sale or receivables feature;
   - a POS sale paid less than the amount due is still saved as a full sale, and the unpaid
     remainder is recorded nowhere;
-  - where a pharmacy credit sale is recorded until PBSRx supports it is **unresolved (U15)**.
+  - where a pharmacy credit sale is recorded until PBSRx supports it is **decided (U15, section
+    11)**: a KoboFlow receivable, reconciled to PBSRx by source id once that integration exists.
 
 ## 6. Loans and liabilities
 
@@ -1377,7 +1381,7 @@ candidate):
   - the PBSRx credit-sales feed (stage 8);
   - automatic reminders to debtors;
   - recording pharmacy sales figures in KoboFlow (PBSRx is the source);
-  - deciding U15.
+  - reopening the U15 decision (already settled by the owner, section 11).
 - **Tests:**
   - create, partial receipt, full receipt, reschedule, cancel, overdue;
   - double-tap and restart are idempotent;
@@ -1431,8 +1435,9 @@ candidate):
       - plan history;
       - the informational receipts view.
     - **Not activated before it:** live allocation recommendations on real data.
-    - Whether recorded allocations of real money may be used live meanwhile, for example for
-      Reserve protection, is still **unresolved (U14, narrowed in revision 6)**;
+    - Recorded allocations of real money may be used live meanwhile — for example an owner-entered
+      Reserve allocation — once the ownership, confirmation, funding and reconciliation safeguards
+      in the U14 decision (section 11) are met;
   - database change approval for plan history (U1);
   - U2, U3, U4, U4a, U12 and U13 are decided;
   - U6 and U11 are still open;
@@ -1633,7 +1638,7 @@ modes:
   recommendation is shown (U13);
 - **after the validated sales basis is recorded (stage 8):** live.
 
-Live use of recorded allocations before stage 8 depends on U14.
+Live use of recorded allocations before stage 8 follows the U14 decision (section 11).
 Each scenario states expected figures in advance and checks that these screens agree: Director,
 forecast, buckets, Net Worth, Calendar, loans and receivables.
 
@@ -1847,6 +1852,38 @@ are not new answers to any open question unless stated:
   (U13 unchanged);
 - the integrated consistency rules (section 1).
 
+Confirmed by the owner (2026-10-25, revision 6):
+- **U14:** the whole five-bucket feature is built and fixture-tested before the sales basis has
+  been validated (unchanged from the revision-6 narrowing above). Explicitly recorded, confirmed
+  allocations of real money — for example an owner-entered Reserve allocation — may be tracked
+  **live** before the sales basis has been validated, provided all of the following safeguards are
+  applied:
+  - **ownership:** the money is confirmed pharmacy-owned before it is tracked as an allocation;
+  - **confirmation:** the allocation exists only after an explicit owner action, never an inferred
+    or default state;
+  - **funding:** the allocation is backed by actual recorded cash, never by an unfunded target or
+    a figure derived from an unvalidated sales basis; and
+  - **reconciliation:** the allocation reconciles to actual cash, with any mismatch disclosed, not
+    assumed away.
+
+  Live sales-based bucket targets and allocation recommendations are **not** activated by this
+  decision: they still wait for the sales basis to be validated under stage 8 (U13 unchanged). A
+  bucket target or allocation record is never itself cash, proof of collection, or permission to
+  spend. An unconfirmed allocation must never be represented as funded cash. Reserve stays
+  protected: using it still requires explicit owner approval, with the reason, consequences and
+  alternatives made clear before any approval.
+- **U15:** KoboFlow will track receivables, including pharmacy receivables, with stable source
+  references where available and the duplicate and reconciliation safeguards in section 5. PBSRx
+  remains the authoritative source for pharmacy sales; KoboFlow must not create a competing
+  pharmacy sales ledger or present an unverified receivable as a validated sale. A credit sale does
+  not increase cash. Collecting an existing debt increases cash and reduces the existing
+  receivable; it does not create a new sale. A partial payment reduces the receivable only by the
+  amount actually received. A pending or failed transfer is not a cash receipt. Duplicate receipts
+  and duplicate payment allocations are prevented. A receivable without a reliable PBSRx source
+  reference, or that cannot be reconciled, stays visibly unverified or awaiting reconciliation,
+  never shown as validated. Any change to PBSRx itself remains a separate task requiring its own
+  explicit authorization.
+
 The owner's restated and confirmed requirements were given in the requests themselves. Apart from
 the PBSRx bucket code noted in section 3, they are not verified against any earlier written
 specification.
@@ -1863,8 +1900,6 @@ specification.
 | U8 | Build an estimate-only break-even with owner-entered margin before PBSRx is validated? (If yes: labelled "estimate, not validated" and never used by the Director as fact) | Stage 9 ordering |
 | U10 | Add a "refund" entry type, or route refunds to review only? | Stage 4 |
 | U11 | Which bucket pays loan instalments, bills, rent and salaries, and how is an unspent Owner allocation treated? (Was part of the earlier U3 question; the confirmed U3 decision covers Reserve only) | Stage 7 |
-| U14 | **Narrowed in revision 6:** building and fixture-testing the whole bucket feature now proceeds before a validated sales basis (owner direction). Still open: may recorded allocations of real money (for example an owner-entered Reserve amount) be used **live** before a validated sales basis exists, or do live bucket features wait for stage 8? | Stage 7 |
-| U15 | Until PBSRx supports customer credit sales, where is a pharmacy credit sale recorded? (a) A KoboFlow receivable only (no KoboFlow sales figure), reconciled to PBSRx later by source id; (b) wait for a PBSRx-side credit-sale feature; or (c) another approach. PBSRx today saves a short-paid sale as a full sale (section 8) | Stages 6, 8 |
 
 ### Implementation assumptions to verify at stage start
 
@@ -1969,7 +2004,7 @@ Every finding in `docs/turnaround-readiness-audit.md` and where it is handled:
 | 3 | 2026-10-24 | U4a, U5a, U5b, U9 and U12 recorded | Owner decisions |
 | 4 | 2026-10-24 | Corrections 1–4 (receipts are not sales, confirmation storage, conservative Business-only cash, floor history) and H5 | Financial-safety review |
 | 5 | 2026-10-24 | G1–G5, H1–H3, S1–S4, U13; U14 recorded as open | Final consistency review |
-| 6 | 2026-10-25 | Three money figures and provenance labels (§1); Director inputs (§2C); collections in cash collected, and bucket build-versus-activation, target versus funding (§3); credit-sale, collection, pending and failed rules (§5); PBSRx `344b565` findings and smallest safe fixes (§8); Stages 6, 7 and 8 scope and tests; scenarios E35–E41; U14 narrowed; U15 added | Owner's continuation and integration direction; PBSRx inspection |
+| 6 | 2026-10-25 | Three money figures and provenance labels (§1); Director inputs (§2C); collections in cash collected, and bucket build-versus-activation, target versus funding (§3); credit-sale, collection, pending and failed rules (§5); PBSRx `344b565` findings and smallest safe fixes (§8); Stages 6, 7 and 8 scope and tests; scenarios E35–E41; U14 narrowed, then decided; U15 added, then decided; revision header corrected from 5 to 6 | Owner's continuation and integration direction; PBSRx inspection; the owner's U14 and U15 decisions (§11) |
 
 ---
 
