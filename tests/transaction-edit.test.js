@@ -88,6 +88,9 @@ async function liveSetup(page) {
     await page.click('#setup-add-acct');
     await row(i).locator('[data-f=label]').fill(label); await row(i).locator('[data-f=kind]').selectOption(kind); await row(i).locator('[data-f=opening]').fill(String(opening));
   }
+  // Stage 1 (item C): "Used For" no longer defaults to Business; none of this file's scenarios
+  // are about ownership, so every account is chosen and confirmed explicitly.
+  for (const i of [0, 1, 2]) await row(i).locator('[data-f=use]').selectOption('business');
   await page.click('#setup-add-bucket');
   const b = page.locator('#setup-buckets [data-bucket-row="0"]');
   await b.locator('[data-f=label]').fill('Fictional Rent'); await b.locator('[data-f=parentId]').selectOption('acc_opay'); await b.locator('[data-f=amount]').fill('30000');

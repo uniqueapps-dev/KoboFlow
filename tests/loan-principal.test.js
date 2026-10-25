@@ -294,6 +294,9 @@ async function liveSetup(page) {
   await row(0).locator('[data-f=opening]').fill('100000');
   await page.click('#setup-add-acct');
   await row(1).locator('[data-f=label]').fill('Fictional Bank'); await row(1).locator('[data-f=kind]').selectOption('bank'); await row(1).locator('[data-f=opening]').fill('500000');
+  // Stage 1 (item C): "Used For" no longer defaults to Business; none of this file's scenarios
+  // are about ownership, so every account is chosen and confirmed explicitly.
+  await row(0).locator('[data-f=use]').selectOption('business'); await row(1).locator('[data-f=use]').selectOption('business');
   for (const k of ALIASES) await page.selectOption(`#setup-aliases [data-alias="${k}"]`, 'acc_opay');
   await page.click('#setup-save-btn'); await page.click('#setup-confirm-btn');
   await page.waitForFunction(() => !document.getElementById('setup-modal').classList.contains('open'));
@@ -320,7 +323,10 @@ async function figures(page) {
     review: await page.$$eval('#agr-review [data-review]', els => els.map(e => e.getAttribute('data-review'))) };
   await nav(page, 'loans');
   const stat = l => page.$$eval('#loan-summary .stat-card', (c, l) => { const x = c.find(e => e.querySelector('.stat-label').textContent.trim() === l); return x.querySelector('.stat-val').textContent; }, l);
-  f.totalOwed = money(await stat('Total Owed')); f.scheduledLeft = money(await stat('Scheduled Still to Pay'));
+  // H5: "Total Owed" is now the current liability (principal + interest/fees already due, never
+  // future interest) and "Scheduled Still to Pay" stays the full remaining schedule — the two can
+  // differ whenever the next instalment is not yet due (see the figures() callers below).
+  f.totalOwed = money(await stat('Total Owed (current liability)')); f.scheduledLeft = money(await stat('Scheduled Still to Pay (full payoff)'));
   await nav(page, 'networth');
   f.netWorthLiab = await page.$$eval('#nw-liabs-list [data-open-agr] .nw-row-val', els => els.reduce((t, e) => t + Number(e.textContent.replace(/[^0-9]/g, '')), 0)); // a settled loan has no row
   await nav(page, 'calendar');
@@ -351,13 +357,17 @@ for (const b of BUILDS) {
     await liveSetup(page);
     await createLoan(page);
     let f = await figures(page);
-    assert.deepEqual([f.outstanding, f.totalOwed, f.scheduledLeft, f.netWorthLiab], [221820, 221820, 221820, 221820]);
+    // H5: the full schedule (outstanding/scheduledLeft) is 221,820, but nothing is yet due (the
+    // first instalment is 20 days out), so the current liability (totalOwed/netWorthLiab) is
+    // principal only: 150,000. The 71,820 difference is future interest, in the forecast only.
+    assert.deepEqual([f.outstanding, f.totalOwed, f.scheduledLeft, f.netWorthLiab], [221820, 150000, 221820, 150000]);
     assert.deepEqual(f.review, []);
 
     await payExtra(page, 37500);
     f = await figures(page);
-    // Liability 221,820 − 37,500 on every screen; the next instalments still as agreed.
-    assert.deepEqual([f.outstanding, f.totalOwed, f.scheduledLeft, f.netWorthLiab], [184320, 184320, 184320, 184320]);
+    // Liability 221,820 − 37,500 = 184,320 on the full-schedule figures; still nothing due, so
+    // the current liability is principal only, 150,000 − 37,500 = 112,500.
+    assert.deepEqual([f.outstanding, f.totalOwed, f.scheduledLeft, f.netWorthLiab], [184320, 112500, 184320, 112500]);
     assert.equal(f.principal, '₦112,500');
     assert.equal(f.charges, 71820);
     assert.deepEqual(f.review, ['extra_unconfirmed']);
@@ -395,7 +405,10 @@ for (const b of BUILDS) {
     const alloc = (await stored(context, b.dbName, 'allocations')).find(a => a.kind === 'extra_principal');
     live.forEach(i => assert.deepEqual(i.extraAbsorbed, [alloc.id]));
     f = await figures(page);
-    assert.deepEqual([f.outstanding, f.totalOwed, f.scheduledLeft, f.netWorthLiab], [166365, 166365, 166365, 166365], 'not 128,865: the extra is not subtracted again');
+    // The amendment reshapes the schedule (shortening the term lowers total future interest to
+    // 53,865, so the full schedule is 166,365) but does not change remaining principal: current
+    // liability stays 112,500 (still nothing due) — not 128,865: the extra is not subtracted again.
+    assert.deepEqual([f.outstanding, f.totalOwed, f.scheduledLeft, f.netWorthLiab], [166365, 112500, 166365, 112500]);
     assert.equal(f.principal, '₦112,500');
     assert.deepEqual(f.review, []);
     assert.equal(f.cal60, 110910);
@@ -420,7 +433,9 @@ for (const b of BUILDS) {
     let f = await figures(page);
     assert.equal(f.principal, 'Fully repaid');
     assert.equal(f.outstanding, 71820, 'scheduled interest is still shown as owed');
-    assert.equal(f.netWorthLiab, 71820);
+    // H5: principal is fully repaid and nothing is yet due, so the current liability (what Net
+    // Worth counts) is 0 — the 71,820 is all future interest, not yet demonstrably due.
+    assert.equal(f.netWorthLiab, 0);
     assert.deepEqual(f.review, ['extra_unconfirmed', 'charges_after_principal']);
     await openLoan(page);
     assert.match(await text(page, '#agr-detail .screen-sub'), /Active/);

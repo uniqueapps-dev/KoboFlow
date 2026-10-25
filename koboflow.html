@@ -667,6 +667,7 @@ function agreementBalances(agr,instalments,allocations,txns,todayStr){
   var ls=loanStates(instalments,allocations,todayStr,txns),st=ls.states,info=ls.info,al=liveAllocs(allocations);
   var debt=isDebt(agr&&agr.terms?agr.terms:agr);
   var sch={p:0,i:0,f:0,u:0},paid={p:0,i:0,f:0,u:0},out={p:0,i:0,f:0},waivedK=0,exApplied=0;
+  var dueIK=0,dueFK=0; // H5: interest/fees already demonstrably due (daysToDue<=0), never future
   st.forEach(function(s){
     var I=s.inst,pp=toK(s.paidParts.principal),pi=toK(s.paidParts.interest),pf=toK(s.paidParts.fees),pu=toK(s.paidParts.unsplit),ex=toK(s.extraApplied);
     exApplied+=ex;paid.p+=pp;paid.i+=pi;paid.f+=pf;paid.u+=pu;
@@ -676,6 +677,7 @@ function agreementBalances(agr,instalments,allocations,txns,todayStr){
     }else{
       sch.p+=toK(I.principal);sch.i+=toK(I.interest);sch.f+=toK(I.fees);
       out.p+=toK(s.remParts.principal);out.i+=toK(s.remParts.interest);out.f+=toK(s.remParts.fees);
+      if(s.daysToDue<=0){dueIK+=toK(s.remParts.interest);dueFK+=toK(s.remParts.fees);}
     }
   });
   var extraK=sum(info.open.concat(info.absorbedLive),function(a){return toK(a.principal);});
@@ -696,10 +698,23 @@ function agreementBalances(agr,instalments,allocations,txns,todayStr){
   if(debt&&ls.unappliedK>0)review.push({code:'extra_unapplied',text:m(ls.unappliedK)+' of extra principal is more than the principal left in the schedule. Check the payments and ask the lender for a statement.'});
   if(debt&&info.absorbedReversed.length)review.push({code:'absorbed_reversed',text:'An extra principal payment that the amended schedule reflects was reversed. The amended instalments may now be too low: check them with the lender.'});
   if(debt&&principalSettled&&!settled)review.push({code:'charges_after_principal',text:'Principal is fully repaid. '+m(out.i+out.f)+' of scheduled interest and fees is still shown as owed. Ask the lender for the payoff figure; if they confirm less, record it with Early Settlement.'});
+  // H5 (owner-confirmed, master plan section 6): Net Worth and every other screen must be able to
+  // show TWO figures, never just one conflated total:
+  //   - currentLiability: outstanding principal (all of it; a debt does not become "less owed"
+  //     because its due date is later) plus interest/fees that are already demonstrably due
+  //     (daysToDue<=0 on an unwaived instalment) — never future interest or fees;
+  //   - remainingScheduledPayments: everything else still on the schedule (future interest and
+  //     fees only — future PRINCIPAL is already inside currentLiability above). This belongs in
+  //     the Cash-Obligations Forecast, not among current liabilities.
+  // componentsApprox is reused (not duplicated): any unsplit payment anywhere on this agreement
+  // means a due instalment's own split could be approximate too, so the same flag covers both
+  // (H1: "flagged as uncertain, never invented").
+  var currentLiabilityK=debt?out.p+dueIK+dueFK:0,remainingScheduledK=debt?Math.max(0,outTotal-currentLiabilityK):0;
   return{states:st,
     scheduled:{principal:fromK(sch.p+absorbedK),interest:fromK(sch.i),fees:fromK(sch.f),total:fromK(sch.p+sch.i+sch.f+sch.u+absorbedK)},
     paid:{principal:fromK(paid.p+extraK),interest:fromK(paid.i),fees:fromK(paid.f),unsplit:fromK(paid.u),lateCharges:fromK(late)},
     outstanding:{principal:debt?fromK(out.p):0,interest:debt?fromK(out.i):0,fees:debt?fromK(out.f):0,total:fromK(outTotal),componentsApprox:paid.u>0},
+    currentLiability:fromK(currentLiabilityK),remainingScheduledPayments:fromK(remainingScheduledK),liabilityComponentsApprox:paid.u>0,
     extraPrincipal:fromK(extraK),extraUnconfirmed:fromK(openK),extraAbsorbed:fromK(absorbedK),extraApplied:fromK(exApplied),extraUnapplied:fromK(ls.unappliedK),
     extraIds:{open:info.openIds,absorbed:info.absorbedIds},
     waived:fromK(waivedK),repaidToDate:fromK(repaid),overdue:fromK(overdueK),
@@ -888,6 +903,76 @@ function reservationPlan(accounts,buckets,obligations){
     out.push({id:b.id,label:b.label,parentId:b.parentId,reservedFor:rf,status:status,amount:fromK(amtK),effective:fromK(effK),funded:fromK(fundedK),covers:fromK(covK)});
   });
   return{buckets:out,effective:out.map(function(x){return{id:x.id,label:x.label,parentId:x.parentId,amount:x.effective};}),coverage:coverage};
+}
+
+/* ── Business vs. household ownership (master plan section 4, U5/U5a/U5b, G1-G5) ──────────
+   Two separate questions: WHERE money is held (the real account) and WHOSE it is / what it is
+   for (an account's "Used For": business, personal or shared). The second is a classification
+   only; it never itself moves money.
+   "use" on an account is '' (not chosen yet — never guessed, never silently Business),
+   'business', 'personal' or 'shared'. Confirmation (G4): useConfirmedAt/useConfirmedValue record
+   when the owner explicitly chose the current value; a value whose confirmation does not match
+   the current value is treated exactly like no confirmation at all — never Business by default. */
+var OWNERSHIP={business:'Business',personal:'Personal',shared:'Shared'};
+function accountOwnership(a){return a&&OWNERSHIP[a.use]?a.use:'';}
+function ownershipConfirmed(a){return !!a&&accountOwnership(a)!==''&&a.useConfirmedValue===a.use&&!!a.useConfirmedAt;}
+/* Shared accounts (U5a): never the whole balance. The owner declares one opening pharmacy
+   portion (amount, declaredAt). This conservative (Stage 2) version treats that portion as a
+   static ceiling: KoboFlow counts min(declaredPortion, currentBalance), and flags anything that
+   makes the declared portion uncertain, rather than silently absorbing the difference. The full
+   per-entry, running-portion tracking described in section 4 is a later-stage enhancement; this
+   is the safe subset that never overstates pharmacy cash while that is pending (disclosed in the
+   Stage 1 report). */
+function sharedPortion(a){
+  var p=a&&a.sharedPortion;if(!p)return{declared:false,amount:0,declaredAt:null,ok:false,reason:'not_declared'};
+  var amt=num(p.amount);if(amt===null||amt<0)return{declared:true,amount:0,declaredAt:p.declaredAt||null,ok:false,reason:'invalid'};
+  var balK=toK(a.balance!==undefined?a.balance:a.opening),amtK=toK(amt);
+  if(amtK>balK)return{declared:true,amount:fromK(amtK),declaredAt:p.declaredAt||null,ok:false,reason:'exceeds_balance',counted:fromK(balK)};
+  return{declared:true,amount:fromK(amtK),declaredAt:p.declaredAt||null,ok:true,reason:null,counted:fromK(amtK)};
+}
+/* The ONE pharmacy-eligible-cash filter used by every screen (G2): Director, Calendar, Pressure,
+   Autopilot and Opportunity Analyzer must all call this (via pharmacyCashPosition below) rather
+   than compute their own. Returns a virtual account list safe to pass straight into
+   cashPosition()/reservationPlan() unchanged (same balances for business accounts; personal
+   accounts zeroed; shared accounts clamped to their confirmed portion; unclassified or
+   unconfirmed accounts zeroed and flagged) plus the warnings that explain every exclusion. */
+function pharmacyEligibleAccounts(accounts,opts){
+  opts=opts||{};var warnings=[],virtual=[];
+  (accounts||[]).forEach(function(a){
+    var own=accountOwnership(a),confirmed=ownershipConfirmed(a),bal=a.balance!==undefined?a.balance:a.opening;
+    if(own===''){
+      warnings.push({key:'unclassified_account',accountId:a.id,label:a.label,text:'"'+a.label+'" has no "Used For" (Business, Personal or Shared), so it is excluded from confirmed pharmacy cash until you choose one.'});
+      virtual.push({id:a.id,label:a.label,kind:a.kind,access:a.access,opening:0,balance:0});
+    }else if(own==='personal'){
+      virtual.push({id:a.id,label:a.label,kind:a.kind,access:a.access,opening:0,balance:0});
+    }else if(own==='business'){
+      if(!confirmed)warnings.push({key:'unconfirmed_business',accountId:a.id,label:a.label,text:'"'+a.label+'" is set to Business but you have not confirmed it (or it changed since you did), so it is excluded from confirmed pharmacy cash until confirmed.'});
+      virtual.push({id:a.id,label:a.label,kind:a.kind,access:a.access,opening:confirmed?bal:0,balance:confirmed?bal:0});
+    }else{ // shared
+      var sp=sharedPortion(a);
+      if(!confirmed){
+        warnings.push({key:'unconfirmed_shared',accountId:a.id,label:a.label,text:'"'+a.label+'" is set to Shared but you have not confirmed it (or it changed since you did), so it is excluded from confirmed pharmacy cash until confirmed.'});
+        virtual.push({id:a.id,label:a.label,kind:a.kind,access:a.access,opening:0,balance:0});
+      }else if(!sp.declared){
+        warnings.push({key:'shared_no_portion',accountId:a.id,label:a.label,text:'"'+a.label+'" is Shared but has no declared pharmacy portion, so none of its balance counts as confirmed pharmacy cash yet.'});
+        virtual.push({id:a.id,label:a.label,kind:a.kind,access:a.access,opening:0,balance:0});
+      }else if(!sp.ok){
+        warnings.push({key:'shared_discrepancy',accountId:a.id,label:a.label,text:'"'+a.label+'" declared a pharmacy portion of ₦'+sp.amount.toLocaleString('en-NG')+' but the account balance is only ₦'+fromK(toK(bal)).toLocaleString('en-NG')+'. The portion is uncertain until this is resolved, so none of it counts as confirmed pharmacy cash meanwhile.'});
+        virtual.push({id:a.id,label:a.label,kind:a.kind,access:a.access,opening:0,balance:0});
+      }else{
+        virtual.push({id:a.id,label:a.label,kind:a.kind,access:a.access,opening:sp.counted,balance:sp.counted});
+      }
+    }
+  });
+  return{accounts:virtual,warnings:warnings};
+}
+/* The shared calculation itself (item D): same shape as cashPosition(), built only from
+   confirmed pharmacy-owned money, plus the warnings that explain what was excluded and why. */
+function pharmacyCashPosition(accounts,buckets,opts){
+  var el=pharmacyEligibleAccounts(accounts,opts);
+  var pos=cashPosition(el.accounts,buckets);
+  pos.warnings=el.warnings;
+  return pos;
 }
 /* ── Bills (database v4) ──
    A bill record is the definition: {id, name, cat, amount, firstDue, repeat, until?, status,
@@ -1178,6 +1263,9 @@ function validateSetup(s,txns,todayStr){
   });
   var prim=accts.filter(function(a){return a.primary;});
   if(prim.length!==1)errors.push('Mark exactly one account as your primary operating account.');
+  // Item C: never a reason to refuse saving (an owner can save an account before deciding its
+  // Used For), but always disclosed, so nothing is silently guessed into pharmacy cash.
+  pharmacyEligibleAccounts(accts,{}).warnings.forEach(function(w){warnings.push(w.text);});
   (s.buckets||[]).forEach(function(b){
     if(!String(b.label||'').trim())errors.push('Every earmark needs a name.');
     if(!ids[b.parentId])errors.push('Earmark "'+(b.label||'')+'" must sit inside one of your accounts.');
@@ -1451,7 +1539,8 @@ var API={toK:toK,fromK:fromK,num:num,fmtDate:fmtDate,parseDate:parseDate,today:t
   isDebt:isDebt,cashReceived:function(t){return fromK(cashReceivedK(t));},buildSchedule:buildSchedule,termsSummary:termsSummary,
   instalmentStates:instalmentStates,extraPrincipalInfo:extraPrincipalInfo,agreementBalances:agreementBalances,allocatePayment:allocatePayment,settlementPlan:settlementPlan,
   classifyTxn:classifyTxn,accountDeltas:accountDeltas,accountBalances:accountBalances,upcomingObligations:upcomingObligations,cashForecast:cashForecast,
-  buildReminders:buildReminders,xirr:xirr,ACCOUNT_KINDS:ACCOUNT_KINDS,LEGACY_ACCOUNTS:LEGACY_ACCOUNTS,bucketSummary:bucketSummary,accountAccess:accountAccess,cashPosition:cashPosition,cashCover:cashCover,reservationPlan:reservationPlan,coveredAmount:coveredAmount,BILL_REPEAT:BILL_REPEAT,BILL_UNITS:BILL_UNITS,billRepeatLabel:billRepeatLabel,billCustomOk:billCustomOk,billDueDates:billDueDates,billAmountOn:billAmountOn,billOccurrences:billOccurrences,billObligations:billObligations,billUnmatchedPayments:billUnmatchedPayments,validateBill:validateBill,dataQuality:dataQuality,incomeFromFindings:incomeFromFindings,dupName:dupName,PARTY_MAX:PARTY_MAX,dateKey:dateKey,inDateRange:inDateRange,partyField:partyField,cleanParty:cleanParty,partyKey:partyKey,clipParty:clipParty,budgetProgress:budgetProgress,directorPlan:directorPlan,spendingRunway:spendingRunway,validateSetup:validateSetup,cashFlowSummary:cashFlowSummary,oppRepayments:oppRepayments,analyzeOpportunity:analyzeOpportunity,oppToTerms:oppToTerms,parseManualRows:parseManualRows};
+  buildReminders:buildReminders,xirr:xirr,ACCOUNT_KINDS:ACCOUNT_KINDS,LEGACY_ACCOUNTS:LEGACY_ACCOUNTS,bucketSummary:bucketSummary,accountAccess:accountAccess,cashPosition:cashPosition,cashCover:cashCover,reservationPlan:reservationPlan,coveredAmount:coveredAmount,
+  OWNERSHIP:OWNERSHIP,accountOwnership:accountOwnership,ownershipConfirmed:ownershipConfirmed,sharedPortion:sharedPortion,pharmacyEligibleAccounts:pharmacyEligibleAccounts,pharmacyCashPosition:pharmacyCashPosition,BILL_REPEAT:BILL_REPEAT,BILL_UNITS:BILL_UNITS,billRepeatLabel:billRepeatLabel,billCustomOk:billCustomOk,billDueDates:billDueDates,billAmountOn:billAmountOn,billOccurrences:billOccurrences,billObligations:billObligations,billUnmatchedPayments:billUnmatchedPayments,validateBill:validateBill,dataQuality:dataQuality,incomeFromFindings:incomeFromFindings,dupName:dupName,PARTY_MAX:PARTY_MAX,dateKey:dateKey,inDateRange:inDateRange,partyField:partyField,cleanParty:cleanParty,partyKey:partyKey,clipParty:clipParty,budgetProgress:budgetProgress,directorPlan:directorPlan,spendingRunway:spendingRunway,validateSetup:validateSetup,cashFlowSummary:cashFlowSummary,oppRepayments:oppRepayments,analyzeOpportunity:analyzeOpportunity,oppToTerms:oppToTerms,parseManualRows:parseManualRows};
 root.KoboFin=API;
 if(typeof module!=='undefined'&&module.exports)module.exports=API;
 })(typeof window!=='undefined'?window:this);
@@ -2711,16 +2800,17 @@ function raf2(fn){requestAnimationFrame(function(){requestAnimationFrame(fn);});
 function showToast(msg){var t=qs('toast');if(!t)return;t.textContent=msg;t.className='show';setTimeout(function(){t.className='';},2200);}
 
 var ACCOUNTS=[
-  {id:'pharma_cash', label:'Pharmacy Cash',  balance:185000, type:'Business', icon:'&#127978;'},
-  {id:'pharma_bank', label:'Pharmacy Bank',  balance:312500, type:'Business', icon:'&#127974;'},
-  {id:'pers_cash',   label:'Personal Cash',  balance:45000,  type:'Personal', icon:'&#128181;'},
-  {id:'pers_bank',   label:'Personal Bank',  balance:120000, type:'Personal', icon:'&#128179;'},
-  {id:'coop',        label:'Coop Savings',   balance:180000, type:'Savings',  icon:'&#129309;'},
-  {id:'emergency',   label:'Emergency Fund', balance:50000,  type:'Savings',  icon:'&#128737;'},
-  {id:'fixed_dep',   label:'Fixed Deposit',  balance:0,      type:'Investment',icon:'&#128200;'},
+  {id:'pharma_cash', label:'Pharmacy Cash',  balance:185000, type:'Business', icon:'&#127978;', use:'business'},
+  {id:'pharma_bank', label:'Pharmacy Bank',  balance:312500, type:'Business', icon:'&#127974;', use:'business'},
+  {id:'pers_cash',   label:'Personal Cash',  balance:45000,  type:'Personal', icon:'&#128181;', use:'personal'},
+  {id:'pers_bank',   label:'Personal Bank',  balance:120000, type:'Personal', icon:'&#128179;', use:'personal'},
+  {id:'coop',        label:'Coop Savings',   balance:180000, type:'Savings',  icon:'&#129309;', use:'business'},
+  {id:'emergency',   label:'Emergency Fund', balance:50000,  type:'Savings',  icon:'&#128737;', use:'business'},
+  {id:'fixed_dep',   label:'Fixed Deposit',  balance:0,      type:'Investment',icon:'&#128200;', use:'business'},
 ];
-/* Balances above are opening balances; current balance = opening + recorded transactions. */
-ACCOUNTS.forEach(function(a){a.opening=a.balance;});
+/* Demo accounts are a fixed illustration, already confirmed: Used For warnings are a live-mode
+   concern (item C), and sample figures must keep matching what they always showed. */
+ACCOUNTS.forEach(function(a){a.opening=a.balance;a.useConfirmedAt='2026-01-01';a.useConfirmedValue=a.use;});
 
 var T=getToday(),Y=getYest();
 var VEHICLES=[
@@ -3129,12 +3219,20 @@ function recalcBalances(){var b=F.accountBalances(ACCOUNTS,items,isLive()?{basel
 /* Every screen uses the same cash rule (engine cashPosition): available = cash, bank and wallet
    accounts unless marked restricted; coop and investment accounts are restricted unless marked
    available. Earmarks are reported separately and never reduce a balance. */
-function cashNow(){return F.cashPosition(ACCOUNTS,reservations().effective);}
+/* Item D / G2: the ONE pharmacy-eligible account list every screen below builds on — business
+   accounts you have confirmed, plus the confirmed portion of shared accounts; personal,
+   unclassified and unconfirmed accounts are excluded here (never guessed), with the reasons in
+   .warnings. Director, Calendar, Pressure, Autopilot and Opportunity Analyzer all read through
+   this, never through raw ACCOUNTS, so a change to the ownership rules changes every screen at
+   once (see F.pharmacyEligibleAccounts / F.pharmacyCashPosition). */
+function pharmacyAccounts(){return F.pharmacyEligibleAccounts(ACCOUNTS,{});}
+function cashNow(){return F.pharmacyCashPosition(ACCOUNTS,reservations().effective);}
 /* Earmarks with their link to an obligation resolved against current instalment states (engine
    reservationPlan). Recomputed on every call, never stored: paying an instalment releases its
-   reservation automatically, exactly once. */
+   reservation automatically, exactly once. Built on the pharmacy-eligible accounts above, so an
+   earmark inside a personal or unconfirmed account never funds or covers a pharmacy obligation. */
 function allObligations(){return billEntries().concat(loanEntries());}
-function reservations(){return F.reservationPlan(ACCOUNTS,isLive()&&SETUP&&SETUP.buckets?SETUP.buckets:[],allObligations());}
+function reservations(){return F.reservationPlan(pharmacyAccounts().accounts,isLive()&&SETUP&&SETUP.buckets?SETUP.buckets:[],allObligations());}
 function staleReservations(){return reservations().buckets.filter(function(b){return b.reservedFor&&b.status==='no_outstanding';});}
 function liquidCash(){return cashNow().available;}
 function spendableCash(){return cashNow().available;}
@@ -3230,7 +3328,7 @@ function loanEntries(){
 }
 function obligationsWithin(days){return F.upcomingObligations(billEntries().concat(loanEntries()),getToday(),days);}
 function sumRem(list){return list.reduce(function(s,e){return s+e.remaining;},0);}
-function cashCoverFor(obs){var r=reservations();return F.cashCover(F.cashPosition(ACCOUNTS,r.effective),sumRem(obs),F.coveredAmount(obs,r.coverage));}
+function cashCoverFor(obs){var r=reservations();return F.cashCover(F.pharmacyCashPosition(ACCOUNTS,r.effective),sumRem(obs),F.coveredAmount(obs,r.coverage));}
 function freeCash(){return cashCoverFor(obligationsWithin(30)).leftAfter;}
 function unlinkedLoanReceipts(){return items.filter(function(t){return !t.demo&&!t.agreementId&&F.classifyTxn(t).loanProceeds>0;});}
 function dueText(iso){var d=F.daysBetween(getToday(),iso);return d<0?'Overdue '+(-d)+'d':d===0?'Today':d===1?'Tomorrow':'In '+d+' days';}
@@ -3285,17 +3383,21 @@ function renderLoans(){
   var el=qs('loan-alerts');if(!el)return;
   el.innerHTML=reminderHTML();
   var views=AGR.map(agrView),act=views.filter(function(v){return v.agr.status==='active'&&v.debt;});
-  var d7=0,d14=0,od=0,up=0,next=null,owed=0;
-  act.forEach(function(v){owed+=v.bal.outstanding.total;v.bal.states.forEach(function(s){
+  var d7=0,d14=0,od=0,up=0,next=null,owed=0,remSched=0;
+  // H5/H2: "Total Owed" is the current liability (principal + interest/fees already due), never
+  // future interest; "Scheduled Still to Pay" is the full remaining schedule (the payoff figure,
+  // unchanged); the difference between them is future interest/fees not yet due.
+  act.forEach(function(v){owed+=v.bal.currentLiability;remSched+=v.bal.remainingScheduledPayments;v.bal.states.forEach(function(s){
     if(s.remaining<=0)return;up+=s.remaining;
     if(s.daysToDue<0)od+=s.remaining;else{if(s.daysToDue<=7)d7+=s.remaining;if(s.daysToDue<=14)d14+=s.remaining;}
     if(!next||s.dueDate<next.dueDate)next=s;});});
   qs('loan-summary').innerHTML=[
-    {l:'Total Owed',v:fmt(owed),c:'#EF4444'},
+    {l:'Total Owed (current liability)',v:fmt(owed),c:'#EF4444'},
     {l:'Overdue',v:fmt(od),c:od>0?'#EF4444':'#7A7880'},
     {l:'Due in 7 Days',v:fmt(d7),c:'#F5A623'},
     {l:'Due in 14 Days',v:fmt(d14),c:'#F5A623'},
-    {l:'Scheduled Still to Pay',v:fmt(up),c:'#F0EDE8'},
+    {l:'Scheduled Still to Pay (full payoff)',v:fmt(up),c:'#F0EDE8'},
+    {l:'&nbsp;&nbsp;of which not yet due',v:fmt(remSched),c:'#7A7880'},
     {l:'Next Repayment',v:next?fmt(next.remaining)+'<div style="font-family:var(--dm);font-size:10px;color:var(--muted);">'+fmtD(next.dueDate)+'</div>':'None',c:'#3B82F6'}
   ].map(function(s){return'<div class="stat-card"><div class="stat-label">'+s.l+'</div><div class="stat-val" style="color:'+s.c+';">'+s.v+'</div></div>';}).join('');
   var un=unlinkedLoanReceipts();
@@ -3918,12 +4020,36 @@ var DEMO_ITEMS=null,SETUP=null;
 var KIND_ICON={wallet:'&#128241;',bank:'&#127974;',cash:'&#128181;',coop:'&#129309;',investment:'&#128200;'};
 function isLive(){return !!(SETUP&&SETUP.mode==='live');}
 function resolveAcct(id){return(isLive()&&id&&SETUP.aliases&&SETUP.aliases[id]!==undefined)?(SETUP.aliases[id]||''):id;}
+/* Migration safety (item C, G4): a record saved before this feature existed has no "use" key at
+   all (every save since always writes one, even '' for "not chosen yet" — see confirmSetup()).
+   That genuine absence is the one safe signal for "pre-existing data the owner already relied
+   on" (for example, upgraded from the old index.html): it is grandfathered in as confirmed
+   Business, exactly matching the behaviour it already had, never silently excluded or reset to
+   "not chosen". A brand-new account always has an explicit (even if blank) "use", so it is never
+   mistaken for this case. Applied once, in place, wherever a raw SETUP.accounts record is about
+   to be read as current (runtime ACCOUNTS and the Setup form draft) so every reader — including
+   the "Used For" dropdown and validateSetup's warnings — agrees.
+   A restored backup's account is never read raw here with a genuinely missing "use": importJSON's
+   resetRestoredOwnership() gives it an explicit '' first, so this grandfathering — meant for
+   same-device continuity only — cannot be reached by a cross-install restore. */
+function normalizeAcctOwnership(a){
+  if(a.use!==undefined)return a;
+  a.use='business';a.useConfirmedAt=SETUP&&(SETUP.updatedAt||SETUP.createdAt)||getToday();a.useConfirmedValue='business';
+  return a;
+}
 function applySetup(){
   ACCOUNTS.length=0;
   if(isLive()){
     SETUP.accounts.filter(function(a){return !a.removed;}).forEach(function(a){
+      normalizeAcctOwnership(a);
       var acc=F.accountAccess(a);
+      // Carries "Used For" and its confirmation, and a shared account's declared pharmacy
+      // portion, onto the live account — these were previously dropped here (DIR-4), so a
+      // personal or unconfirmed account's whole balance silently counted as pharmacy-available
+      // cash. See F.pharmacyEligibleAccounts(), the one place that now reads these fields.
       ACCOUNTS.push({id:a.id,label:a.label,opening:F.num(a.opening)||0,balance:F.num(a.opening)||0,kind:a.kind,access:a.access||'',primary:!!a.primary,
+        use:a.use||'',useConfirmedAt:a.useConfirmedAt||null,useConfirmedValue:a.useConfirmedValue!==undefined?a.useConfirmedValue:null,
+        sharedPortion:a.sharedPortion?{amount:a.sharedPortion.amount,declaredAt:a.sharedPortion.declaredAt}:null,
         type:(a.primary?'Primary · ':'')+F.ACCOUNT_KINDS[a.kind]+(a.institution?' · '+a.institution:'')+(acc==='restricted'?' · Restricted':''),icon:KIND_ICON[a.kind]||'&#128179;'});
     });
     if(DEMO_ITEMS===null)DEMO_ITEMS=items.filter(function(i){return i.demo;});
@@ -4047,7 +4173,8 @@ function openSetup(fresh){
   setupPending=null;
   var restore=fresh!==true&&setupDraft&&setupDirty&&setupDraftBase===setupBaseKey();
   if(!restore){
-    setupDraft=SETUP?clone(SETUP):{mode:'live',baselineDate:getToday(),accounts:[{id:'acc_opay',label:'Opay',institution:'Opay',kind:'wallet',use:'business',primary:true,opening:''}],buckets:[],aliases:{},history:[]};
+    setupDraft=SETUP?clone(SETUP):{mode:'live',baselineDate:getToday(),accounts:[{id:'acc_opay',label:'Opay',institution:'Opay',kind:'wallet',use:'',primary:true,opening:''}],buckets:[],aliases:{},history:[]};
+    setupDraft.accounts.forEach(normalizeAcctOwnership); // same migration-safety grandfathering as applySetup()
     setupDraft.budgets=setupDraft.budgets||[];setupDraft.planning=setupDraft.planning||{workingCapitalFloor:null,netWorthGoal:null};
     setupDirty=false;setupDraftBase=setupBaseKey();
   }
@@ -4055,14 +4182,27 @@ function openSetup(fresh){
   renderSetupRows();setupBack();openModal('setup-modal');
   if(restore)setupResult('<div class="form-warn" id="setup-unsaved-note"><b>Unsaved changes.</b> These edits from earlier have NOT been saved. Review &amp; Save to keep them, or <button class="act-btn act-dismiss" id="setup-discard-btn">DISCARD</button> to show the saved setup.</div>');
 }
+/* Item C: "Used For" never defaults to Business. '' is "not chosen yet" — excluded from
+   confirmed pharmacy cash (F.pharmacyEligibleAccounts) until the owner explicitly picks one, and
+   saving the form with a value that was not the last CONFIRMED value for this account is what
+   records the confirmation (see confirmSetup()) — never a guess, never silent. */
+function acctUseStatusNote(a){
+  if(!a.use)return'<div class="muted-note" data-use-status style="margin:3px 0 0;color:var(--amber);">Not chosen yet: excluded from confirmed pharmacy cash until you choose one.</div>';
+  var confirmed=a.useConfirmedValue===a.use&&!!a.useConfirmedAt;
+  return'<div class="muted-note" data-use-status style="margin:3px 0 0;'+(confirmed?'':'color:var(--amber);')+'">'+(confirmed?'Confirmed '+fmtD(a.useConfirmedAt)+'.':'Not yet confirmed: saving this form will confirm it.')+'</div>';
+}
 function acctRowHTML(a,i){
   var kinds=Object.keys(F.ACCOUNT_KINDS).map(function(k){return'<option value="'+k+'"'+(a.kind===k?' selected':'')+'>'+F.ACCOUNT_KINDS[k]+'</option>';}).join('');
   var used=items.some(function(t){return !t.demo&&(t.fromAcct===a.id||t.toAcct===a.id);});
+  var sp=a.sharedPortion;
   return'<div class="setup-row" data-acct-row="'+i+'">'
     +'<div class="grid2" style="margin-bottom:0;"><div class="form-group"><label>Account Name</label><input class="form-input" data-f="label" value="'+esc(a.label)+'" placeholder="e.g. GTBank Business"/></div>'
     +'<div class="form-group"><label>Bank / Provider</label><input class="form-input" data-f="institution" value="'+esc(a.institution||'')+'"/></div></div>'
     +'<div class="grid2" style="margin-bottom:0;"><div class="form-group"><label>Type</label><select class="form-input" data-f="kind"><option value="">Choose&hellip;</option>'+kinds+'</select></div>'
-    +'<div class="form-group"><label>Used For</label><select class="form-input" data-f="use"><option value="business"'+(a.use==='business'?' selected':'')+'>Business</option><option value="personal"'+(a.use==='personal'?' selected':'')+'>Personal</option><option value="shared"'+(a.use==='shared'?' selected':'')+'>Shared</option></select></div></div>'
+    +'<div class="form-group"><label>Used For</label><select class="form-input" data-f="use"><option value=""'+(!a.use?' selected':'')+'>Not chosen yet</option><option value="business"'+(a.use==='business'?' selected':'')+'>Business</option><option value="personal"'+(a.use==='personal'?' selected':'')+'>Personal</option><option value="shared"'+(a.use==='shared'?' selected':'')+'>Shared</option></select>'
+      +acctUseStatusNote(a)+'</div></div>'
+    +'<div class="form-group" data-shared-portion style="display:'+(a.use==='shared'?'':'none')+';"><label>Pharmacy\'s portion of this shared account (&#8358;)</label><input class="form-input" data-f="sharedAmt" type="number" inputmode="decimal" value="'+esc(sp?sp.amount:'')+'"/>'
+      +'<div class="muted-note" style="margin:3px 0 0;">The amount of THIS account\'s balance that is pharmacy money'+(sp&&sp.declaredAt?' (declared '+fmtD(sp.declaredAt)+')':'')+'. Nothing beyond this, and never more than the account actually holds, counts as confirmed pharmacy cash. Changing it records a new declaration.</div></div>'
     +'<div class="form-group"><label>Opening Balance (&#8358;) at start of baseline date</label><input class="form-input" data-f="opening" type="number" inputmode="decimal" value="'+esc(a.opening)+'"/></div>'
     +'<div class="form-group"><label>Availability</label><select class="form-input" data-f="access">'
       +'<option value=""'+(!a.access?' selected':'')+'>Default for this type ('+(F.accountAccess({kind:a.kind})==='immediate'?'available to spend':'restricted')+')</option>'
@@ -4121,7 +4261,12 @@ function renderSetupRows(){
    opening balance) went nowhere and the old value was reviewed and saved. Only the
    dropdowns that list account names are refreshed, in place, keeping their selection. */
 function refreshAcctOptions(){
-  document.querySelectorAll('#setup-accounts [data-acct-row]').forEach(function(row){var k=row.querySelector('[data-f="kind"]'),o=row.querySelector('[data-f="access"] option[value=""]');if(k&&o)o.textContent='Default for this type ('+(F.accountAccess({kind:k.value})==='immediate'?'available to spend':'restricted')+')';});
+  document.querySelectorAll('#setup-accounts [data-acct-row]').forEach(function(row){
+    var k=row.querySelector('[data-f="kind"]'),o=row.querySelector('[data-f="access"] option[value=""]');if(k&&o)o.textContent='Default for this type ('+(F.accountAccess({kind:k.value})==='immediate'?'available to spend':'restricted')+')';
+    var i=+row.getAttribute('data-acct-row'),a=setupDraft.accounts[i],useSel=row.querySelector('[data-f="use"]'),sp=row.querySelector('[data-shared-portion]'),note=row.querySelector('[data-use-status]');
+    if(useSel&&sp)sp.style.display=useSel.value==='shared'?'':'none';
+    if(useSel&&note&&a){var preview={use:useSel.value,useConfirmedValue:a.useConfirmedValue,useConfirmedAt:a.useConfirmedAt};note.outerHTML=acctUseStatusNote(preview);}
+  });
   var accts=setupDraft.accounts.filter(function(a){return !a.removed;});
   var opts=accts.map(function(a){return'<option value="'+esc(a.id)+'">'+esc(a.label||'(unnamed)')+'</option>';}).join('');
   document.querySelectorAll('#setup-buckets [data-f="parentId"]').forEach(function(sel){var v=sel.value;sel.innerHTML='<option value="">Choose&hellip;</option>'+opts;sel.value=v;});
@@ -4135,6 +4280,9 @@ function readSetupForm(){
     a.kind=row.querySelector('[data-f="kind"]').value;a.use=row.querySelector('[data-f="use"]').value;
     var ac=row.querySelector('[data-f="access"]');a.access=ac?ac.value:(a.access||'');
     a.opening=row.querySelector('[data-f="opening"]').value;a.primary=row.querySelector('[data-f="primary"]').checked;
+    // Staged only: resolved into a.sharedPortion (with its declaredAt) at save time (saveSetup),
+    // since typing in this field should not itself record a declaration.
+    var sa=row.querySelector('[data-f="sharedAmt"]');a._sharedAmtDraft=sa?sa.value:'';
   });
   document.querySelectorAll('#setup-buckets [data-bucket-row]').forEach(function(row){
     var b=s.buckets[+row.getAttribute('data-bucket-row')];
@@ -4166,11 +4314,37 @@ function setupPreview(){
 var setupPending=null;
 function setupResult(html){var el=qs('setup-result');if(el)el.innerHTML=html;}
 var SETUP_BUSY_MSG='<div class="form-err">Another save is still in progress, so nothing was saved yet. Wait a moment and try again.</div>';
+/* Item C/E (G4): resolves "Used For" confirmation and a shared account's declared pharmacy
+   portion, mutating the draft account in place, and records what changed (never silent). Saving
+   the form with a "Used For" value that is not the one already confirmed for this account IS
+   the explicit confirmation (G4): there is no separate confirm step to forget. An account whose
+   value is unchanged keeps its existing confirmation timestamp untouched. */
+function resolveUseAndSharedPortion(a,o,changes){
+  var prevConfirmedValue=o&&o.useConfirmedValue!==undefined?o.useConfirmedValue:null,prevConfirmedAt=o&&o.useConfirmedAt||null;
+  if(o&&o.use!==a.use)changes.push({account:a.label,field:'use',from:o.use||'',to:a.use||''});
+  if(a.use&&a.use!==prevConfirmedValue){a.useConfirmedAt=nowISO();a.useConfirmedValue=a.use;}
+  else{a.useConfirmedAt=a.use?prevConfirmedAt:null;a.useConfirmedValue=a.use?prevConfirmedValue:null;}
+  if(a.use==='shared'){
+    var amt=F.num(a._sharedAmtDraft),prevSp=o&&o.sharedPortion;
+    if(amt!==null&&amt>=0){
+      if(!prevSp||(F.num(prevSp.amount)||0)!==amt){changes.push({account:a.label,field:'shared_portion',from:prevSp?prevSp.amount:null,to:amt});a.sharedPortion={amount:amt,declaredAt:getToday()};}
+      else a.sharedPortion=prevSp;
+    }else{if(prevSp)changes.push({account:a.label,field:'shared_portion_removed',from:prevSp.amount});a.sharedPortion=null;}
+  }else{
+    if(o&&o.sharedPortion)changes.push({account:a.label,field:'shared_portion_removed',from:o.sharedPortion.amount});
+    a.sharedPortion=null;
+  }
+  delete a._sharedAmtDraft;
+}
 function saveSetup(){
   if(saving){setupResult(SETUP_BUSY_MSG);return;}
   var s=readSetupForm(),v=setupPreview();setupResult('');
   if(!v.ok){setupResult('<div class="form-err">Not saved yet: fix the items in red above.</div>');qs('setup-preview').scrollIntoView({block:'nearest'});return;}
   var prev=SETUP,changes=[];
+  // Always resolved, first save or not: a first-ever "Used For" choice is still an explicit
+  // confirmation (G4), and a first-ever shared-portion entry is still a declaration (U5a). The
+  // change log itself (shown only when prev exists) is a secondary, display-only concern.
+  s.accounts.forEach(function(a){resolveUseAndSharedPortion(a,prev&&prev.accounts.find(function(x){return x.id===a.id;}),changes);});
   if(prev){
     if(prev.baselineDate!==s.baselineDate)changes.push({field:'baselineDate',from:prev.baselineDate,to:s.baselineDate});
     s.accounts.forEach(function(a){var o=prev.accounts.find(function(x){return x.id===a.id;});
@@ -4207,6 +4381,9 @@ function saveSetup(){
     if(c.field==='label')return'Renamed: '+esc(c.from)+' &rarr; <b>'+esc(c.to)+'</b>';
     if(c.field==='access'){var al=function(v){return v==='immediate'?'available to spend':v==='restricted'?'restricted':'default for its type';};return esc(c.account)+' availability: '+al(c.from)+' &rarr; <b>'+al(c.to)+'</b>';}
     if(c.field==='opening')return esc(c.account)+' opening balance: '+fmt(F.num(c.from)||0)+' &rarr; <b>'+fmt(F.num(c.to)||0)+'</b>';
+    if(c.field==='use'){var ul=function(v){return v?(F.OWNERSHIP[v]||v):'not chosen';};return esc(c.account)+' Used For: '+ul(c.from)+' &rarr; <b>'+ul(c.to)+'</b> (confirmed now)';}
+    if(c.field==='shared_portion')return esc(c.account)+' pharmacy portion: '+(c.from===null?'not declared':fmt(c.from))+' &rarr; <b>'+fmt(c.to)+'</b>';
+    if(c.field==='shared_portion_removed')return esc(c.account)+' pharmacy portion ('+fmt(c.from)+') cleared';
     if(c.field==='added')return'New account: <b>'+esc(c.account)+'</b> (opening '+fmt(F.num(c.to)||0)+')';
     if(c.field==='removed')return'Removed: <b>'+esc(c.account)+'</b> (its history is kept)';
     if(c.field==='earmark_added')return'New earmark: <b>'+bucketText(c.to)+'</b>';
@@ -4246,7 +4423,10 @@ function confirmSetup(){if(saving){setupResult(SETUP_BUSY_MSG);return;}guard(fun
   var s=setupPending.draft,changes=setupPending.changes,prev=SETUP,now=nowISO(),hist=(prev&&prev.history)||[];
   s.id='ledgerSetup';s.mode='live';s.updatedAt=now;s.createdAt=(prev&&prev.createdAt)||now;
   s.history=hist.concat(changes.length||!prev?[{at:now,changes:prev?changes:[{field:'created',to:s.baselineDate}]}]:[]);
-  s.accounts=s.accounts.map(function(a){return{id:a.id,label:a.label,institution:a.institution,kind:a.kind,use:a.use,primary:!!a.primary,opening:F.num(a.opening)||0,removed:!!a.removed,access:a.access==='immediate'||a.access==='restricted'?a.access:''};});
+  s.accounts=s.accounts.map(function(a){return{id:a.id,label:a.label,institution:a.institution,kind:a.kind,use:a.use,
+    useConfirmedAt:a.useConfirmedAt||null,useConfirmedValue:a.useConfirmedValue!==undefined?a.useConfirmedValue:null,
+    sharedPortion:a.sharedPortion?{amount:F.num(a.sharedPortion.amount)||0,declaredAt:a.sharedPortion.declaredAt}:null,
+    primary:!!a.primary,opening:F.num(a.opening)||0,removed:!!a.removed,access:a.access==='immediate'||a.access==='restricted'?a.access:''};});
   s.buckets=s.buckets.map(function(b){return{id:b.id,label:b.label,parentId:b.parentId,amount:F.num(b.amount)||0,reservedFor:b.reservedFor||''};});
   s.planning={workingCapitalFloor:planNum((s.planning||{}).workingCapitalFloor),netWorthGoal:planNum((s.planning||{}).netWorthGoal)};
   s.budgets=(s.budgets||[]).map(function(b){return{id:b.id,cat:b.cat,amount:F.num(b.amount)||0};});
@@ -4391,15 +4571,23 @@ function renderNetWorth(){
   var loans=activeDebtViews(),un=unlinkedLoanReceipts();
   // Overdue bills are owed now, so they are liabilities; bills not yet due are future payments, not debts.
   var ob=isLive()?billEntries().filter(function(o){return o.dueDate<getToday();}):[],obT=ob.reduce(function(s,o){return s+o.remaining;},0);
-  var tl2=loans.reduce(function(s,v){return s+v.bal.outstanding.total;},0)+un.reduce(function(s,t){return s+t.amount;},0)+obT+(isLive()?0:OBLIGATIONS_DATA.reduce(function(s,o){return s+o.amount;},0));
+  // H5/H2: Net Worth's liability total is the CURRENT liability (principal + interest/fees
+  // already due), never future interest — "remaining scheduled payments" (future interest/fees)
+  // is shown per loan below, informationally, and never subtracted here.
+  var tl2=loans.reduce(function(s,v){return s+v.bal.currentLiability;},0)+un.reduce(function(s,t){return s+t.amount;},0)+obT+(isLive()?0:OBLIGATIONS_DATA.reduce(function(s,o){return s+o.amount;},0));
   var nw=ta-tl2,nwc=nw>=0?'#22C55E':'#EF4444',goal=10000000,fi=Math.max(0,Math.min(100,Math.round(nw/goal*100)));
   var el;
   el=qs('nw-total');if(el){el.textContent=(nw<0?'-':'')+fmt(nw);el.style.color=nwc;}
   el=qs('nw-change');if(el){if(isLive()){el.textContent='Not enough recorded history to compare with last month';el.style.color='#7A7880';}else{el.textContent='Up +32,500 vs last month (sample trend)';el.style.color='#22C55E';}}
   el=qs('nw-assets');if(el)el.textContent=fmt(ta);
   el=qs('nw-liabs');if(el)el.textContent=fmt(tl2);
-  el=qs('nw-assets-list');if(el)el.innerHTML=ACCOUNTS.map(function(a){return'<div class="nw-row"><div class="nw-row-label"><span>'+a.icon+'</span><span>'+esc(a.label)+'</span></div><div class="nw-row-val" style="color:#22C55E;">'+fmt(a.balance)+'</div></div>';}).join('');
-  el=qs('nw-liabs-list');if(el)el.innerHTML=loans.map(function(v){return'<div class="nw-row" data-open-agr="'+esc(v.agr.id)+'"><div class="nw-row-label"><span>&#127974;</span><span>'+esc(v.agr.name)+'<div style="font-size:10px;color:var(--muted);">principal '+fmt(v.bal.outstanding.principal)+' &middot; scheduled interest &amp; fees '+fmt(v.bal.outstanding.interest+v.bal.outstanding.fees)+'</div></span></div><div class="nw-row-val" style="color:#EF4444;">'+fmt(v.bal.outstanding.total)+'</div></div>';}).join('')
+  // Item D/G3: a pharmacy-eligible figure alongside the all-accounts total — never presented AS
+  // the all-account figure, and never the reverse.
+  var pp=isLive()?F.pharmacyCashPosition(ACCOUNTS,reservations().effective):null;
+  el=qs('nw-assets-list');if(el)el.innerHTML=(pp?'<div class="nw-row" style="border-bottom:1px solid var(--border);padding-bottom:8px;margin-bottom:6px;"><div class="nw-row-label"><span>&#127978;</span><span>Pharmacy-eligible cash (confirmed)</span></div><div class="nw-row-val" style="color:#22C55E;">'+fmt(pp.available)+'</div></div>'
+    +(pp.warnings.length?'<div class="muted-note" style="margin:0 0 6px;">'+pp.warnings.length+' account(s) below are not yet counted as confirmed pharmacy cash &mdash; see Settings &rarr; Accounts.</div>':''):'')
+    +ACCOUNTS.map(function(a){return'<div class="nw-row"><div class="nw-row-label"><span>'+a.icon+'</span><span>'+esc(a.label)+'</span></div><div class="nw-row-val" style="color:#22C55E;">'+fmt(a.balance)+'</div></div>';}).join('');
+  el=qs('nw-liabs-list');if(el)el.innerHTML=loans.map(function(v){return'<div class="nw-row" data-open-agr="'+esc(v.agr.id)+'"><div class="nw-row-label"><span>&#127974;</span><span>'+esc(v.agr.name)+'<div style="font-size:10px;color:var(--muted);">principal '+fmt(v.bal.outstanding.principal)+' &middot; interest &amp; fees already due '+fmt(v.bal.currentLiability-v.bal.outstanding.principal)+(v.bal.remainingScheduledPayments>0?' &middot; not yet due '+fmt(v.bal.remainingScheduledPayments):'')+'</div></span></div><div class="nw-row-val" style="color:#EF4444;">'+fmt(v.bal.currentLiability)+'</div></div>';}).join('')
     +un.map(function(t){return'<div class="nw-row"><div class="nw-row-label"><span>&#9888;</span><span>'+esc(t.desc)+' (terms not recorded, at least)</span></div><div class="nw-row-val" style="color:#EF4444;">'+fmt(t.amount)+'</div></div>';}).join('')
     +ob.map(function(o){return'<div class="nw-row" data-nav="bills"><div class="nw-row-label"><span>&#128196;</span><span>'+esc(o.label)+' (overdue bill, due '+fmtD(o.dueDate)+')</span></div><div class="nw-row-val" style="color:#EF4444;">'+fmt(o.remaining)+'</div></div>';}).join('')
     +(isLive()?[]:OBLIGATIONS_DATA).map(function(o){return'<div class="nw-row"><div class="nw-row-label"><span>'+o.icon+'</span><span>'+o.desc+' (bill)</span></div><div class="nw-row-val" style="color:#EF4444;">'+fmt(o.amount)+'</div></div>';}).join('');
@@ -4760,9 +4948,19 @@ function incomeFromList(){
       +' <button class="act-btn act-edit" data-edit-txn="'+esc(t.id)+'" aria-label="Review this entry">REVIEW</button></div>';
   }).join('')+(fs.length>max?'<div class="muted-note">and '+(fs.length-max)+' more.</div>':'')+'</div>';
 }
+/* Ownership warnings (item C/D: unclassified, unconfirmed, shared-without-portion or
+   shared-discrepancy accounts) in the same {key,severity,count,ids,text} shape as every other
+   data-quality finding, so they flow through the one existing "Missing or uncertain" card and the
+   one existing qualified/high-severity gate — no second confidence mechanism. High severity: each
+   one means real money is currently excluded from confirmed pharmacy cash until the owner acts. */
+function ownershipQuality(){
+  if(!isLive())return[];
+  return pharmacyAccounts().warnings.map(function(w){return{key:w.key,severity:'high',count:1,ids:[w.accountId],text:w.text};});
+}
 function liveQuality(){
   if(!isLive())return[];
   var q=F.dataQuality({txns:items,accountIds:ACCOUNTS.map(function(a){return a.id;}),aliases:SETUP.aliases,baselineDate:SETUP.baselineDate,today:getToday()});
+  q=q.concat(ownershipQuality());
   ACCOUNTS.filter(function(a){return a.balance<0;}).forEach(function(a){q.push({key:'negative_balance',severity:'high',count:1,ids:[a.id],text:a.label+' shows a negative balance (-'+fmt(a.balance)+'). An inflow may be missing, or it is an overdraft that should be recorded as a loan.'});});
   var um=F.billUnmatchedPayments(BILLS,items,{today:getToday()});
   if(um.length)q.push({key:'bill_unmatched',severity:'medium',count:um.length,ids:um.map(function(t){return t.id;}),text:um.length+' bill payment'+(um.length>1?'s point':' points')+' to a bill date that no longer exists. '+(um.length>1?'They still count':'It still counts')+' as money spent.'});
@@ -4773,8 +4971,8 @@ function liveQuality(){
   return q;
 }
 function directorData(){
-  var r=reservations(),cp=F.cashPosition(ACCOUNTS,r.effective),obs=obligationsWithin(30);
-  var avail={};ACCOUNTS.forEach(function(a){avail[a.id]=F.accountAccess(a)==='immediate';});
+  var r=reservations(),cp=F.pharmacyCashPosition(ACCOUNTS,r.effective),obs=obligationsWithin(30);
+  var pa=pharmacyAccounts().accounts,avail={};pa.forEach(function(a){avail[a.id]=F.accountAccess(a)==='immediate';});
   var linked=r.buckets.filter(function(b){return b.reservedFor&&avail[b.parentId];}).reduce(function(t,b){return t+b.effective;},0);
   var plan=F.directorPlan({today:getToday(),cashNow:cp.available,restricted:cp.restricted,earmarkedGeneral:cp.earmarked-linked,reservedLinked:linked,freeToUse:cp.unearmarked,
     obligations:obs.map(function(o){return{id:o.id,label:o.label,dueDate:o.dueDate,remaining:o.remaining,covered:r.coverage[o.id]||0,agreementId:o.agreementId||null};}),
@@ -4932,6 +5130,25 @@ function importParties(rec){
   });
   return n;
 }
+/* Restored accounts never bring a confirmation with them (G4, item 9: "markers are local and not
+   in backups... after a backup restore, every restored account needs a fresh confirmation"). The
+   owner's chosen "Used For" and a Shared account's declared pharmacy portion are data, not
+   attestations, so they are kept; only useConfirmedAt/useConfirmedValue — this device's record
+   that THIS owner looked at the account just now — are cleared. Until re-confirmed, the account
+   is excluded from pharmacy-eligible cash exactly like any other unconfirmed account
+   (F.pharmacyEligibleAccounts), never silently treated as still-confirmed.
+   A genuinely legacy account (no "use" key at all — see normalizeAcctOwnership) is given an
+   explicit '' here, the same "not chosen yet" a brand-new account gets: that one-time same-device
+   grandfathering is for continuity on the device that already relied on the balance, and must not
+   extend across a restore onto a different install, where no such continuity exists. */
+function resetRestoredOwnership(ls){
+  var out=clone(ls);
+  (out.accounts||[]).forEach(function(a){
+    if(a.use===undefined)a.use='';
+    a.useConfirmedAt=null;a.useConfirmedValue=null;
+  });
+  return out;
+}
 /* Import is additive and idempotent: records already present (same id, or same
    transaction signature) are skipped; records whose links cannot be resolved are rejected. */
 function planImport(data){
@@ -4978,7 +5195,11 @@ function planImport(data){
   }
   if(data.ledgerSetup&&data.ledgerSetup.id==='ledgerSetup'){
     var ls=data.ledgerSetup;
-    if(!SETUP){var lv=F.validateSetup(ls,[],'9999-12-31');if(lv.ok){add('meta',ls);rep.notes.push('Account setup (live mode since '+ls.baselineDate+') will be restored.');}else rep.rejected++;}
+    if(!SETUP){
+      var lv=F.validateSetup(ls,[],'9999-12-31');
+      if(lv.ok){add('meta',resetRestoredOwnership(ls));rep.notes.push('Account setup (live mode since '+ls.baselineDate+') will be restored. Each account\'s "Used For" will need confirming again before it counts as pharmacy cash.');}
+      else rep.rejected++;
+    }
     else if(JSON.stringify(SETUP)!==JSON.stringify(ls)){rep.conflicts++;rep.notes.push('The backup has a different account setup; your current setup is kept.');}
     else rep.skipped++;
   }
@@ -5511,7 +5732,7 @@ qs('clear-data-btn').addEventListener('click',function(){
 
 window.__kfOnBlocked=function(err){showToast(err.message);};
 qs('setup-open-btn').addEventListener('click',openSetup);
-qs('setup-add-acct').addEventListener('click',function(){setupDirty=true;readSetupForm();setupDraft.accounts.push({id:uid('acc'),label:'',institution:'',kind:'',use:'business',primary:false,opening:''});renderSetupRows();});
+qs('setup-add-acct').addEventListener('click',function(){setupDirty=true;readSetupForm();setupDraft.accounts.push({id:uid('acc'),label:'',institution:'',kind:'',use:'',primary:false,opening:''});renderSetupRows();});
 qs('setup-add-bucket').addEventListener('click',function(){setupDirty=true;readSetupForm();setupDraft.buckets.push({id:uid('bkt'),label:'',parentId:'',amount:'',reservedFor:''});renderSetupRows();});
 qs('setup-add-budget').addEventListener('click',function(){setupDirty=true;readSetupForm();setupDraft.budgets.push({id:uid('bdg'),cat:'',amount:''});renderSetupRows();});
 qs('setup-modal').addEventListener('click',function(e){

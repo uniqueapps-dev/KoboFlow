@@ -77,6 +77,9 @@ async function liveSetup(page, { floor = '' } = {}) {
     await page.click('#setup-add-acct');
     await row(i).locator('[data-f=label]').fill(label); await row(i).locator('[data-f=kind]').selectOption(kind); await row(i).locator('[data-f=opening]').fill(String(opening));
   }
+  // Stage 1 (item C): "Used For" no longer defaults to Business; none of this file's scenarios
+  // are about ownership, so every account is chosen and confirmed explicitly.
+  for (const i of [0, 1, 2]) await row(i).locator('[data-f=use]').selectOption('business');
   await page.click('#setup-add-bucket');
   const b = page.locator('#setup-buckets [data-bucket-row="0"]');
   await b.locator('[data-f=label]').fill('Fictional Rent'); await b.locator('[data-f=parentId]').selectOption('acc_opay'); await b.locator('[data-f=amount]').fill('30000');
@@ -425,10 +428,13 @@ for (const b of BUILDS) {
     const ob = await text(page, '#ob-list');
     assert.match(ob, /Fictional shop rent/); assert.match(ob, /Fictional salary/);
     await nav(page, 'networth');
-    // Assets 750,000 + 80,000 = 830,000. Liabilities: loan 221,820 + overdue salary 40,000 = 261,820. Earmarks are not assets.
+    // Assets 750,000 + 80,000 = 830,000. Liabilities (H5): the loan's first instalment is not yet
+    // due, so its current liability is principal only (150,000), not the full 221,820 schedule
+    // (the other 71,820 is future interest, in "remaining scheduled payments", not here) + the
+    // overdue salary bill 40,000 = 190,000. Earmarks are not assets.
     assert.equal(await text(page, '#nw-assets'), '₦830,000');
-    assert.equal(await text(page, '#nw-liabs'), '₦261,820');
-    assert.equal(await text(page, '#nw-total'), '₦568,180');
+    assert.equal(await text(page, '#nw-liabs'), '₦190,000');
+    assert.equal(await text(page, '#nw-total'), '₦640,000');
     await nav(page, 'loans');
     assert.match(await text(page, '#loan-summary'), /221,820/);
     // Opportunity Analysis starts from the same free cash.
@@ -438,14 +444,16 @@ for (const b of BUILDS) {
     await page.fill('#opp-first-due', await plusDays(page, 30)); await page.fill('#opp-profit', '90000');
     await page.click('#opp-calc-btn');
     assert.match(await text(page, '#opp-result'), /Free cash after known payments due in 30 days \(before this commitment\)₦574,545/);
-    // Paying the overdue bill: cash and the liability fall by the same 40,000; net worth unchanged; nothing double-counted.
+    // Paying the overdue bill: cash falls by 40,000, and so does the liability (H5: the loan's
+    // first instalment is still not due, so it contributes only its principal, 150,000, to the
+    // liability throughout — the overdue salary bill, now paid, no longer adds its 40,000).
     await nav(page, 'bills');
     const sal = await page.$eval('#bills-due', el => Array.from(el.querySelectorAll('[data-bill-occ]')).find(r => /Fictional salary/.test(r.textContent)).dataset.billOcc);
     await pay(page, sal, {});
     await nav(page, 'networth');
     assert.equal(await text(page, '#nw-assets'), '₦790,000');
-    assert.equal(await text(page, '#nw-liabs'), '₦221,820');
-    assert.equal(await text(page, '#nw-total'), '₦568,180');
+    assert.equal(await text(page, '#nw-liabs'), '₦150,000');
+    assert.equal(await text(page, '#nw-total'), '₦640,000');
     await nav(page, 'director');
     assert.equal(await dirRow(page, 'cash'), '₦710,000');
     assert.equal(await dirRow(page, 'uncovered'), '₦55,455');

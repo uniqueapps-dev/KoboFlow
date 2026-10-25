@@ -368,6 +368,134 @@ test('export then import is lossless and repeat imports add nothing', { skip }, 
   await context.close();
 });
 
+// Backup/import ownership-confirmation safety (Stage 1 audit finding H-1): "Used For" markers are
+// local attestations (G4, item 9), never valid once restored onto a different install. These tests
+// seed ledgerSetup directly rather than through the Setup form (which is covered elsewhere) so they
+// can focus purely on what crosses the export/import boundary.
+const NO_LEGACY_ALIAS = { pharma_cash: '', pharma_bank: '', pers_cash: '', pers_bank: '', coop: '', emergency: '', fixed_dep: '' };
+const seedLedgerSetup = (page, setup) => page.evaluate(s => new Promise((res, rej) => {
+  const r = indexedDB.open('KoboFlowDB');
+  r.onsuccess = () => { const tx = r.result.transaction('meta', 'readwrite'); tx.objectStore('meta').put(s); tx.oncomplete = () => { r.result.close(); res(); }; tx.onerror = () => rej(tx.error); };
+  r.onerror = () => rej(r.error);
+}), setup);
+
+test('backup restore (H-1 fix): a restored Business account loses its confirmation and contributes nothing to pharmacy cash until reconfirmed; unrelated data survives', { skip }, async () => {
+  const { context, page } = await newPage();
+  await open(page);
+  await seedLedgerSetup(page, { id: 'ledgerSetup', mode: 'live', baselineDate: '2026-10-01',
+    accounts: [{ id: 'acc_a', label: 'Pharmacy Opay', institution: 'Opay', kind: 'wallet', use: 'business', useConfirmedAt: '2026-10-20T09:00:00.000Z', useConfirmedValue: 'business', primary: true, opening: 500000 }],
+    aliases: NO_LEGACY_ALIAS, buckets: [] });
+  // Seeded directly (rather than through quick capture) so this is a deterministic fixture for
+  // "unrelated data survives the round trip" — not a test of quick-capture's own account defaults.
+  await page.evaluate(() => new Promise((res, rej) => { const r = indexedDB.open('KoboFlowDB'); r.onsuccess = () => { const tx = r.result.transaction('transactions', 'readwrite'); tx.objectStore('transactions').put({ id: 9001, amount: 15000, desc: 'Fictional fuel', cat: 'Fuel', type: 'expense', fromAcct: 'acc_a', toAcct: '', state: 'AI Categorized', date: '2026-10-20', time: '09:00' }); tx.oncomplete = () => { r.result.close(); res(); }; tx.onerror = () => rej(tx.error); }; r.onerror = () => rej(r.error); }));
+  await page.reload(); await page.waitForSelector('body[data-kf-ready="1"]');
+  assert.match(await page.textContent('#autopilot-body'), /Cash Now \(actual\)₦485,000/, 'confirmed Business account counts in full before export');
+
+  await page.click('#settings-nav-btn');
+  const [dl] = await Promise.all([page.waitForEvent('download'), page.click('#export-json-btn')]);
+  const file = await dl.path();
+  const backup = JSON.parse(fs.readFileSync(file, 'utf8'));
+  assert.equal(backup.ledgerSetup.accounts[0].useConfirmedValue, 'business', 'the exported file itself still carries the confirmation: the fix is at import, not export');
+
+  const fresh = await newPage();
+  await open(fresh.page);
+  await fresh.page.click('#settings-nav-btn');
+  await fresh.page.setInputFiles('#import-file-input', file);
+  await fresh.page.waitForFunction(() => document.body.classList.contains('kf-live'));
+
+  const restored = (await dbAll(fresh.page, 'meta')).find(m => m.id === 'ledgerSetup');
+  assert.equal(restored.accounts[0].use, 'business', 'the classification itself is preserved');
+  assert.equal(restored.accounts[0].useConfirmedAt, null, 'confirmation timestamp is reset on restore');
+  assert.equal(restored.accounts[0].useConfirmedValue, null, 'confirmation value is reset on restore');
+  assert.equal((await dbAll(fresh.page, 'transactions')).length, 1, 'the unrelated transaction still imported intact');
+
+  await nav(fresh.page, 'home');
+  assert.match(await fresh.page.textContent('#autopilot-body'), /Cash Now \(actual\)₦0/, 'restored-but-unconfirmed Business money does not count as pharmacy cash');
+
+  await fresh.page.click('#settings-nav-btn');
+  await fresh.page.click('#setup-open-btn');
+  await fresh.page.waitForSelector('#setup-modal.open');
+  const row0 = fresh.page.locator('#setup-accounts [data-acct-row="0"]');
+  assert.equal(await row0.locator('[data-f=use]').inputValue(), 'business', 'the restored classification is shown, not blanked');
+  assert.match(await row0.locator('[data-use-status]').textContent(), /Not yet confirmed/);
+  await fresh.page.click('#setup-save-btn');
+  await fresh.page.waitForSelector('#setup-confirm-btn');
+  await fresh.page.click('#setup-confirm-btn');
+  await fresh.page.waitForFunction(() => !document.getElementById('setup-modal').classList.contains('open'));
+  const reconfirmed = (await dbAll(fresh.page, 'meta')).find(m => m.id === 'ledgerSetup');
+  assert.equal(reconfirmed.accounts[0].useConfirmedValue, 'business', 'saving the form re-confirms it, with no dropdown change needed');
+  await nav(fresh.page, 'home');
+  assert.match(await fresh.page.textContent('#autopilot-body'), /Cash Now \(actual\)₦485,000/, 'eligibility restored to the full confirmed balance after reconfirming');
+  assert.deepEqual(fresh.page.errors, []);
+  await fresh.context.close();
+  await context.close();
+});
+
+test('backup restore (H-1 fix): a restored Shared account\'s declared portion is preserved but excluded from pharmacy cash until reconfirmed', { skip }, async () => {
+  const { context, page } = await newPage();
+  await open(page);
+  await seedLedgerSetup(page, { id: 'ledgerSetup', mode: 'live', baselineDate: '2026-10-01',
+    accounts: [
+      { id: 'acc_a', label: 'Pharmacy Opay', institution: 'Opay', kind: 'wallet', use: 'business', useConfirmedAt: '2026-10-20T09:00:00.000Z', useConfirmedValue: 'business', primary: true, opening: 200000 },
+      { id: 'acc_b', label: 'Family Account', institution: 'GTBank', kind: 'bank', use: 'shared', useConfirmedAt: '2026-10-20T09:00:00.000Z', useConfirmedValue: 'shared', sharedPortion: { amount: 40000, declaredAt: '2026-10-20' }, primary: false, opening: 100000 },
+    ],
+    aliases: NO_LEGACY_ALIAS, buckets: [] });
+  await page.reload(); await page.waitForSelector('body[data-kf-ready="1"]');
+  assert.match(await page.textContent('#autopilot-body'), /Cash Now \(actual\)₦240,000/, '200,000 business + the 40,000 declared shared portion, before export');
+
+  await page.click('#settings-nav-btn');
+  const [dl] = await Promise.all([page.waitForEvent('download'), page.click('#export-json-btn')]);
+  const file = await dl.path();
+
+  const fresh = await newPage();
+  await open(fresh.page);
+  await fresh.page.click('#settings-nav-btn');
+  await fresh.page.setInputFiles('#import-file-input', file);
+  await fresh.page.waitForFunction(() => document.body.classList.contains('kf-live'));
+
+  const restored = (await dbAll(fresh.page, 'meta')).find(m => m.id === 'ledgerSetup');
+  const shared = restored.accounts.find(a => a.id === 'acc_b');
+  assert.equal(shared.use, 'shared', 'classification preserved');
+  assert.equal(shared.sharedPortion.amount, 40000, 'the declared portion amount is preserved, not discarded');
+  assert.equal(shared.useConfirmedAt, null);
+  assert.equal(shared.useConfirmedValue, null);
+
+  await nav(fresh.page, 'home');
+  assert.match(await fresh.page.textContent('#autopilot-body'), /Cash Now \(actual\)₦0/, 'neither restored account counts until reconfirmed');
+
+  await fresh.page.click('#settings-nav-btn');
+  await fresh.page.click('#setup-open-btn');
+  await fresh.page.waitForSelector('#setup-modal.open');
+  const row1 = fresh.page.locator('#setup-accounts [data-acct-row="1"]');
+  assert.equal(await row1.locator('[data-f=use]').inputValue(), 'shared');
+  assert.equal(await row1.locator('[data-f=sharedAmt]').inputValue(), '40000', 'the declared amount is shown, pre-filled, not lost');
+  await fresh.page.click('#setup-save-btn');
+  await fresh.page.waitForSelector('#setup-confirm-btn');
+  await fresh.page.click('#setup-confirm-btn');
+  await fresh.page.waitForFunction(() => !document.getElementById('setup-modal').classList.contains('open'));
+  await nav(fresh.page, 'home');
+  assert.match(await fresh.page.textContent('#autopilot-body'), /Cash Now \(actual\)₦240,000/, 'reconfirming restores exactly the declared portion, not the whole 100,000 balance');
+  assert.deepEqual(fresh.page.errors, []);
+  await fresh.context.close();
+  await context.close();
+});
+
+test('backup restore: an invalid account setup in the file is rejected, and unrelated valid records still import, with nothing partially written', { skip }, async () => {
+  const { context, page } = await newPage();
+  await open(page);
+  const backup = { app: 'KoboFlow', version: '4.0',
+    ledgerSetup: { id: 'ledgerSetup', mode: 'live', baselineDate: '2026-10-01', accounts: [{ id: 'acc_a', label: 'No Primary', kind: 'wallet', use: 'business', primary: false, opening: 100000 }], aliases: {}, buckets: [] },
+    transactions: [{ id: 9001, amount: 5000, desc: 'Fictional valid entry', cat: 'Food', type: 'expense', fromAcct: 'pharma_cash', toAcct: '', state: 'AI Categorized', date: '2026-10-20', time: '09:00' }] };
+  await page.click('#settings-nav-btn');
+  await page.setInputFiles('#import-file-input', { name: 'backup.json', mimeType: 'application/json', buffer: Buffer.from(JSON.stringify(backup)) });
+  await page.waitForFunction(() => /Import complete/.test(document.getElementById('toast').textContent || ''));
+  const setup = (await dbAll(page, 'meta')).find(m => m.id === 'ledgerSetup');
+  assert.equal(setup, undefined, 'the rejected account setup (no primary account) was not written at all — nothing partial');
+  assert.equal((await dbAll(page, 'transactions')).length, 1, 'the unrelated valid transaction still imported');
+  assert.deepEqual(page.errors, []);
+  await context.close();
+});
+
 test('existing features still work: capture persists, every screen renders, no network needed', { skip }, async () => {
   const { context, page } = await newPage();
   await open(page);
@@ -403,6 +531,9 @@ async function fillSetup(page, { baseline, opay = '500000', gtb = '80000', rent 
   assert.equal(await row0.locator('[data-f="label"]').inputValue(), 'Opay', 'Opay is offered explicitly');
   assert.equal(await row0.locator('[data-f="primary"]').isChecked(), true);
   await row0.locator('[data-f="opening"]').fill(opay);
+  // Stage 1 (item C): "Used For" no longer defaults to Business — Opay is the pharmacy's own
+  // account in every scenario this helper builds, so it is chosen and confirmed explicitly.
+  await row0.locator('[data-f="use"]').selectOption('business');
   await page.click('#setup-add-acct');
   const row1 = page.locator('#setup-accounts [data-acct-row="1"]');
   await row1.locator('[data-f="label"]').fill('GTBank Personal');
@@ -463,7 +594,9 @@ test('live setup: Opay as primary, real opening balances, earmarks not double-co
   assert.equal(await acctBal(page, 'GTBank Personal'), 80000);
   assert.equal(await acctBal(page, 'Pharmacy Bank'), null, 'no sample accounts in live mode');
   assert.match(await page.textContent('#bucket-list'), /Rent ₦150,000.*Free to use ₦350,000/);
-  assert.match(await page.textContent('#autopilot-body'), /Cash Now \(actual\)₦580,000/, 'earmark not added on top');
+  // Stage 1 (item C/D): Cash Now is now pharmacy-eligible only — GTBank Personal's ₦80,000 is
+  // correctly excluded (it used to be added in here before the ownership fix, DIR-4).
+  assert.match(await page.textContent('#autopilot-body'), /Cash Now \(actual\)₦500,000/, 'earmark not added on top, and personal money is excluded');
   assert.equal(await page.textContent('#mode-note'), '');
   await nav(page, 'timeline');
   assert.doesNotMatch(await page.textContent('#timeline-list'), /Restock Emzor/, 'sample entries hidden');
@@ -589,6 +722,10 @@ test('account setup saves with native dialogs blocked, and every field survives 
   await r1.locator('[data-f="kind"]').selectOption('bank');
   await r1.locator('[data-f="opening"]').fill('100000');
   await r1.locator('[data-f="opening"]').blur();
+  // Stage 1 (item C): "Used For" no longer defaults to Business; this test is not about
+  // ownership, so both accounts are chosen and confirmed explicitly.
+  await page.locator('#setup-accounts [data-acct-row="0"] [data-f="use"]').selectOption('business');
+  await r1.locator('[data-f="use"]').selectOption('business');
   await page.click('#setup-add-bucket');
   const b0 = page.locator('#setup-buckets [data-bucket-row="0"]');
   await b0.locator('[data-f="label"]').fill('Test Rent');

@@ -120,6 +120,9 @@ async function liveSetup(page, { earmark = 30000, coopAccess = '', baselineDays 
   await add(1, 'Fictional Bank', 'bank', 500000);
   await add(2, 'Fictional Coop', 'coop', 80000, coopAccess);
   await add(3, 'Fictional Fixed Deposit', 'bank', 200000, 'restricted');
+  // Stage 1 (item C): "Used For" no longer defaults to Business; none of this file's scenarios
+  // are about ownership, so every account is chosen and confirmed explicitly.
+  for (const i of [0, 1, 2, 3]) await row(i).locator('[data-f=use]').selectOption('business');
   if (earmark) {
     await page.click('#setup-add-bucket');
     const b = page.locator('#setup-buckets [data-bucket-row="0"]');

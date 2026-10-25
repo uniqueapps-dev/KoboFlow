@@ -1,10 +1,12 @@
 # KoboFlow: financial turnaround master plan
 
-- **Status:** draft for the owner's review, revision 6. Records the confirmed U2–U5 decisions,
+- **Status:** draft for the owner's review, revision 7. Records the confirmed U2–U5 decisions,
   then U4a, U5a, U5b, U9 and U12, then the approved financial-safety corrections and the owner's H5
   decision, then the final-review corrections (G1–G5, H1–H3, S1–S4) and the owner's U13 decision,
   then the owner's integrated sales, collections, receivables and bucket direction, then the
-  owner's U14 and U15 decisions (revision 6; change log in section 13).
+  owner's U14 and U15 decisions (revision 6), then an implementation-scope clarification recording
+  what an integrated implementation pass actually delivered against stages 1, 2, 3 and 5 below
+  (revision 7; change log in section 13).
   Planning only: no code was changed for this document.
 - **Branch:** `claude/koboflow-loan-management-qn2vql`.
 - **Checkpoint:** `cb5f209bc50224044435bf857b892c0ec62f0325`, which contains the loan principal and
@@ -751,15 +753,38 @@ Changes:
 | # | Stage | Main audit items | Depends on | Status |
 |---|---|---|---|---|
 | 1 | Loan principal and settlement integrity | P0-1 (D2, D3) | — | **Awaiting verification** |
-| 2 | Director truthfulness and data-quality coverage, including the conservative pharmacy-eligible cash view on five screens and separation warnings | P0-2 (DIR-1, 3, 5, 6), P0-4, E3–E5, DIR-4 (interim), U9, G1–G5 | 1 | Not started (**next**) |
-| 3 | Business and household separation (critical priority) | P1-1 (DIR-4), H1, U5 | 2 | Partially complete (field saved, not applied) |
+| 2 | Director truthfulness and data-quality coverage, including the conservative pharmacy-eligible cash view on five screens and separation warnings | P0-2 (DIR-1, 3, 5, 6), P0-4, E3–E5, DIR-4 (interim), U9, G1–G5 | 1 | Partially complete — interim parts only, delivered together with stages 1, 3 and 5's H5 item; see the implementation-scope note below |
+| 3 | Business and household separation (critical priority) | P1-1 (DIR-4), H1, U5 | 2 | Partially complete — core separation (U5, U5a, G1, G4) applied, delivered together with stages 1, 2 and 5's H5 item; see the implementation-scope note below |
 | 4 | Quick-entry classification safety | P0-3 (D4) | 3 (purpose available in review) | Not started |
-| 5 | Cash-flow statement reconciliation; bill and obligation action links; Net Worth loan liability (H5) | P1-4 (D1), P1-5 (DIR-2), H5 (with H1–H3) | 2 | Not started |
+| 5 | Cash-flow statement reconciliation; bill and obligation action links; Net Worth loan liability (H5) | P1-4 (D1), P1-5 (DIR-2), H5 (with H1–H3) | 2 | Partially complete — the H5 Net Worth change only, delivered together with stages 1–3; see the implementation-scope note below |
 | 6 | Receivables, partial receipts, overdue follow-up; expected inflows in the forecast | P1-2, H2 | 3, 5; U1 | Not started |
 | 7 | Five buckets (targets held until validated sales, U13), Reserve protection, floor breach warnings, approved overrides, plan history | P1-3 (part), sections 3 and 4, U2–U4, U12, U13 | 2, 3, 4, 6; U1; live allocation recommendations also need 8 (validated sales basis) | Partially complete (manual floor and earmarks exist) |
 | 8 | PBSRx validation, supplier-obligation feed, reconciliation | P2-1, P2-2, P2-3 | 5, 6; PBSRx-side fixes | Partially complete (contract documented only) |
 | 9 | Financial Break-Even Calculator; evidence-based floor proposal; inventory as an asset | section 2A, section 3 (U4), section 7, H4 | 3, 8 | Not started |
 | 10 | End-to-end acceptance, offline and reopen reconciliation, release readiness | P2-7, audit G | all | Not started |
+
+**Implementation-scope note (revision 7).** An integrated implementation pass on
+`claude/koboflow-loan-management-qn2vql` (uncommitted; independently audited) delivered, together
+and as one unit, work this plan's sequence above assigns separately to stages 1, 2, 3 and 5:
+- **Stage 1** (loan principal and settlement integrity), in full, as already recorded above.
+- **Stage 2**, only its interim, conservative parts (item 10 of the Stage 2 detail below): the one
+  shared pharmacy-eligible cash calculation on five screens (G2), the "Used For" confirmation
+  marker and its lifecycle (G4), and ownership warnings surfaced through the existing
+  data-quality/confidence gate. Not delivered: U9 (balance confirmation), the three-state
+  confident/qualified/withheld model, and the DIR-1/3/5/6 wording fixes — the rest of Stage 2's
+  scope remains open.
+- **Stage 3**'s core separation (U5, U5a, G1, G4): "Used For" no longer defaults to Business, a
+  Shared account counts only its declared, confirmed portion, and household money is kept out of
+  pharmacy-available cash in the one shared calculation above. Not delivered: a per-entry purpose
+  field, full per-entry/running shared-account tracking, and Stage 3's other items (P3-2, P3-3).
+- **Stage 5**'s Net Worth change only (H5): the current-liability/remaining-scheduled-payments
+  split. The rest of Stage 5 (D1 cash-flow reconciliation, DIR-2 action links, P2-4–P2-6) is not
+  started.
+
+This note records what the current diff contains. It does not substitute for each stage's own
+independent review, test-site publication and Android acceptance above, which remain outstanding
+before any stage is marked complete, and it marks no later-stage requirement (receivables,
+buckets, PBSRx, break-even) as done.
 
 Remaining P1, P2 and P3 items are placed where they fit (full mapping in section 12):
 - **Stage 2:** the beyond-30-day note on commitments (P1-3).
@@ -2005,6 +2030,7 @@ Every finding in `docs/turnaround-readiness-audit.md` and where it is handled:
 | 4 | 2026-10-24 | Corrections 1–4 (receipts are not sales, confirmation storage, conservative Business-only cash, floor history) and H5 | Financial-safety review |
 | 5 | 2026-10-24 | G1–G5, H1–H3, S1–S4, U13; U14 recorded as open | Final consistency review |
 | 6 | 2026-10-25 | Three money figures and provenance labels (§1); Director inputs (§2C); collections in cash collected, and bucket build-versus-activation, target versus funding (§3); credit-sale, collection, pending and failed rules (§5); PBSRx `344b565` findings and smallest safe fixes (§8); Stages 6, 7 and 8 scope and tests; scenarios E35–E41; U14 narrowed, then decided; U15 added, then decided; revision header corrected from 5 to 6 | Owner's continuation and integration direction; PBSRx inspection; the owner's U14 and U15 decisions (§11) |
+| 7 | 2026-10-25 | Implementation-scope note added to the Stage summary (§9): records that an integrated, independently-audited implementation pass delivered Stage 1 in full plus the interim parts of Stage 2, Stage 3's core separation, and Stage 5's H5 Net Worth change, together as one unit; Stage 2/3/5 status cells updated to point to the note; no stage marked complete, no later-stage requirement touched | An independent Stage 1 financial-safety audit found the delivered work spans more of this plan's own stage sequence than its "Stage 1" status cell alone showed, which would mislead anyone using this document to track what is done |
 
 ---
 

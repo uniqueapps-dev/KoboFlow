@@ -184,6 +184,9 @@ async function liveSetup(page) {
   await row(0).locator('[data-f=opening]').fill('100000');
   await page.click('#setup-add-acct');
   await row(1).locator('[data-f=label]').fill('Fictional Bank'); await row(1).locator('[data-f=kind]').selectOption('bank'); await row(1).locator('[data-f=opening]').fill('500000');
+  // Stage 1 (item C): "Used For" no longer defaults to Business; none of this file's scenarios
+  // are about ownership, so every account is chosen and confirmed explicitly.
+  await row(0).locator('[data-f=use]').selectOption('business'); await row(1).locator('[data-f=use]').selectOption('business');
   for (const k of LEGACY) await page.selectOption(`#setup-aliases [data-alias="${k}"]`, 'acc_opay');
   await page.click('#setup-save-btn'); await page.click('#setup-confirm-btn');
   await page.waitForFunction(() => !document.getElementById('setup-modal').classList.contains('open'));
