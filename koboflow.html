@@ -823,6 +823,39 @@ function accountBalances(accounts,txns,opts){
   });
   var out={};for(var k2 in bal)out[k2]=fromK(bal[k2]);return out;
 }
+/* What a quick-capture mapping change does to balances, entry by entry. Read-only: stored
+   entries are never changed; the mapping is applied when balances are calculated, so a change
+   moves every past entry (on/after the baseline) that carries a legacy account id. For each such
+   entry the effect is accountDeltas under the new mapping minus under the old one, counting only
+   real accounts, exactly as accountBalances counts them. Summed, the changes equal the difference
+   between accountBalances with the two mappings. halfMapped marks a movement between two accounts
+   (transfer, owner withdrawal, investment…) that the new mapping counts on one side only, so it
+   changes total money. */
+function mappingImpact(accounts,txns,opts){
+  opts=opts||{};var ids={},oldA=opts.fromAliases||{},newA=opts.toAliases||{},per={},total=0,entries=[];
+  (accounts||[]).forEach(function(a){ids[a.id]=true;});
+  function real(x,al){var r=(al&&al[x])||x;return ids[r]?r:null;}
+  function side(t,al){var o={};var d=accountDeltas(t,al);for(var k in d)if(ids[k])o[k]=toK(d[k]);return o;}
+  (txns||[]).forEach(function(t){
+    if(!t||t.voided||t.demo)return;
+    if(opts.baselineDate&&(t.date||'')<opts.baselineDate)return;
+    var legacy=[];
+    [['from',t.fromAcct],['to',t.toAcct]].forEach(function(p){
+      if(p[1]&&LEGACY_ACCOUNTS[p[1]])legacy.push({side:p[0],key:p[1],from:real(p[1],oldA),to:real(p[1],newA)});
+    });
+    if(!legacy.length)return;
+    var a=side(t,oldA),b=side(t,newA),d={},any=false,tk=0;
+    Object.keys(a).concat(Object.keys(b)).forEach(function(k){var v=(b[k]||0)-(a[k]||0);if(v&&d[k]===undefined){d[k]=v;tk+=v;any=true;}});
+    if(!any)return;
+    var counted=[t.fromAcct,t.toAcct].filter(function(x){return x&&real(x,newA);}).length;
+    var e={id:t.id,date:t.date||'',desc:t.desc||'',type:t.type||'',amount:Number(t.amount)||0,legacy:legacy,change:{},totalChange:fromK(tk),
+      halfMapped:!!(t.fromAcct&&t.toAcct&&counted===1)};
+    for(var k in d){e.change[k]=fromK(d[k]);per[k]=(per[k]||0)+d[k];}
+    total+=tk;entries.push(e);
+  });
+  var perAccount={};for(var k3 in per)if(per[k3])perAccount[k3]=fromK(per[k3]);
+  return{entries:entries,perAccount:perAccount,total:fromK(total)};
+}
 
 /* ── Real accounts & earmark buckets ─────────────────────────── */
 var ACCOUNT_KINDS={wallet:'Mobile money wallet',bank:'Bank account',cash:'Cash',coop:'Cooperative / thrift',investment:'Investment / fixed deposit'};
@@ -1538,7 +1571,7 @@ var API={toK:toK,fromK:fromK,num:num,fmtDate:fmtDate,parseDate:parseDate,today:t
   CATEGORIES:CATEGORIES,NATURES:NATURES,STRUCTURES:STRUCTURES,STATUSES:STATUSES,STATUS_LABEL:STATUS_LABEL,OPP_STRUCTURES:OPP_STRUCTURES,REMINDER_TEXT:REMINDER_TEXT,
   isDebt:isDebt,cashReceived:function(t){return fromK(cashReceivedK(t));},buildSchedule:buildSchedule,termsSummary:termsSummary,
   instalmentStates:instalmentStates,extraPrincipalInfo:extraPrincipalInfo,agreementBalances:agreementBalances,allocatePayment:allocatePayment,settlementPlan:settlementPlan,
-  classifyTxn:classifyTxn,accountDeltas:accountDeltas,accountBalances:accountBalances,upcomingObligations:upcomingObligations,cashForecast:cashForecast,
+  classifyTxn:classifyTxn,accountDeltas:accountDeltas,accountBalances:accountBalances,mappingImpact:mappingImpact,upcomingObligations:upcomingObligations,cashForecast:cashForecast,
   buildReminders:buildReminders,xirr:xirr,ACCOUNT_KINDS:ACCOUNT_KINDS,LEGACY_ACCOUNTS:LEGACY_ACCOUNTS,bucketSummary:bucketSummary,accountAccess:accountAccess,cashPosition:cashPosition,cashCover:cashCover,reservationPlan:reservationPlan,coveredAmount:coveredAmount,
   OWNERSHIP:OWNERSHIP,accountOwnership:accountOwnership,ownershipConfirmed:ownershipConfirmed,sharedPortion:sharedPortion,pharmacyEligibleAccounts:pharmacyEligibleAccounts,pharmacyCashPosition:pharmacyCashPosition,BILL_REPEAT:BILL_REPEAT,BILL_UNITS:BILL_UNITS,billRepeatLabel:billRepeatLabel,billCustomOk:billCustomOk,billDueDates:billDueDates,billAmountOn:billAmountOn,billOccurrences:billOccurrences,billObligations:billObligations,billUnmatchedPayments:billUnmatchedPayments,validateBill:validateBill,dataQuality:dataQuality,incomeFromFindings:incomeFromFindings,dupName:dupName,PARTY_MAX:PARTY_MAX,dateKey:dateKey,inDateRange:inDateRange,partyField:partyField,cleanParty:cleanParty,partyKey:partyKey,clipParty:clipParty,budgetProgress:budgetProgress,directorPlan:directorPlan,spendingRunway:spendingRunway,validateSetup:validateSetup,cashFlowSummary:cashFlowSummary,oppRepayments:oppRepayments,analyzeOpportunity:analyzeOpportunity,oppToTerms:oppToTerms,parseManualRows:parseManualRows};
 root.KoboFin=API;
@@ -4293,6 +4326,33 @@ function readSetupForm(){
   document.querySelectorAll('#setup-aliases [data-alias]').forEach(function(sel){var v=sel.value;if(v==='__unset')delete s.aliases[sel.getAttribute('data-alias')];else s.aliases[sel.getAttribute('data-alias')]=v;});
   return s;
 }
+/* Pre-save impact of a quick-capture mapping change (engine mappingImpact): the past entries it
+   moves, with their legacy account and old -> new mapping, and the change per account and in total.
+   Display only: the entries themselves are never edited, and mapping back reverses the effect. */
+function mappingImpactFor(s,prev){
+  var accts=s.accounts.filter(function(a){return !a.removed&&a.label;});
+  return{accts:accts,im:F.mappingImpact(accts.map(function(a){return{id:a.id,opening:F.num(a.opening)||0};}),items,{baselineDate:s.baselineDate,fromAliases:prev?prev.aliases||{}:{},toAliases:s.aliases||{}})};
+}
+function mappingImpactHtml(s,prev){
+  var r=mappingImpactFor(s,prev),im=r.im,max=20;if(!im.entries.length)return'';
+  function lbl(id){var a=r.accts.find(function(x){return x.id===id;})||(prev&&prev.accounts.find(function(x){return x.id===id;}));return a?a.label:id;}
+  function target(al,k){return !al?'not set up':al[k]===undefined||al[k]===null?'not chosen':al[k]===''?'Not used':lbl(al[k]);}
+  function amt(n){return'<span style="color:'+(n<0?'#EF4444':'#22C55E')+';">'+signed(n)+'</span>';}
+  var half=im.entries.filter(function(e){return e.halfMapped;}).length;
+  return'<div class="card" data-mapping-impact="1" style="background:var(--surf2);border-color:var(--amber);"><div class="card-label">Past entries this mapping change moves</div>'
+    +'<div class="muted-note">Balances are calculated from your entries using the quick-capture mapping, so this change also moves '+im.entries.length+' entr'+(im.entries.length>1?'ies':'y')+' already recorded (on or after '+esc(fmtD(s.baselineDate))+'). The entries themselves are not changed; changing the mapping back reverses this.</div>'
+    +im.entries.slice(0,max).map(function(e){
+      return'<div class="muted-note" data-impact-entry="'+esc(e.id)+'" style="color:var(--text);"><b>'+esc(fmtD(e.date))+' &middot; '+esc(e.desc)+'</b> &middot; '+esc(e.type)+' '+fmt(e.amount)+'<br>'
+        +e.legacy.map(function(l){return esc(F.LEGACY_ACCOUNTS[l.key])+' ['+esc(l.key)+'] '+(l.side==='from'?'(paid from)':'(paid into)')+': '+esc(target(prev&&prev.aliases,l.key))+' &rarr; <b>'+esc(target(s.aliases,l.key))+'</b>';}).join('<br>')
+        +'<br>Effect: '+Object.keys(e.change).map(function(k){return esc(lbl(k))+' '+amt(e.change[k]);}).join(', ')+(e.totalChange?' &middot; total '+amt(e.totalChange):'')
+        +(e.halfMapped?'<br><span style="color:var(--amber);" data-impact-half="1">Only one side of this movement is mapped to an account, so it changes total money.</span>':'')+'</div>';
+    }).join('')
+    +(im.entries.length>max?'<div class="muted-note">&hellip;and '+(im.entries.length-max)+' more (all included in the totals below).</div>':'')
+    +Object.keys(im.perAccount).map(function(k){return'<div data-impact-acct="'+esc(k)+'">'+kv(esc(lbl(k)),amt(im.perAccount[k]))+'</div>';}).join('')
+    +'<div data-impact-total="'+im.total+'">'+kv('Change in total real money',im.total?amt(im.total):fmt(0),'','total')+'</div>'
+    +(half?'<div class="form-warn">'+half+' entr'+(half>1?'ies are movements':'y is a movement')+' between two accounts with only one side mapped. Map both sides (or neither) if the money stayed with you.</div>':'')
+    +'</div>';
+}
 function setupPreview(){
   var s=readSetupForm(),v=F.validateSetup(s,items,getToday()),el=qs('setup-preview');
   var accts=s.accounts.filter(function(a){return !a.removed&&a.label;});
@@ -4300,6 +4360,7 @@ function setupPreview(){
   el.innerHTML=(v.errors.length?'<div class="form-err">'+v.errors.map(esc).join('<br>')+'</div>':'')
     +v.warnings.map(function(w){return'<div class="form-warn">'+esc(w)+'</div>';}).join('')
     +v.info.map(function(w){return'<div class="muted-note">'+esc(w)+'</div>';}).join('')
+    +(bal?mappingImpactHtml(s,SETUP):'')
     +(bal?'<div class="card" style="background:var(--surf2);"><div class="card-label">Balances after saving</div>'+accts.map(function(a){return kv(esc(a.label)+' <span style="font-size:10px;">(opening '+fmt(F.num(a.opening)||0)+')</span>',fmt(bal[a.id]));}).join('')
       +kv('Total real money',fmt(accts.reduce(function(t,a){return t+bal[a.id];},0)),'#22C55E','total')+'<div class="muted-note">Sample entries and sample bills will be hidden from live figures (not deleted).</div></div>':'');
   return v;
@@ -4404,6 +4465,7 @@ function saveSetup(){
     +(s.budgets||[]).map(function(b){return kv('Budget '+esc(b.cat)+' (a month)',fmt(F.num(b.amount)||0),'var(--muted)');}).join('')
     +'<div class="muted-note">'+Object.keys(F.LEGACY_ACCOUNTS).map(function(k){var t=s.aliases[k];return esc(F.LEGACY_ACCOUNTS[k])+' &rarr; '+(t?esc((acc.find(function(x){return x.id===t;})||{}).label||t):'Not used');}).join(' &middot; ')+'</div>'
     +changeBox
+    +mappingImpactHtml(s,prev)
     +(changes.some(function(c){return c.field==='opening'||c.field==='baselineDate';})?'<div class="muted-note">Opening balance or baseline changes are recorded in the setup history.</div>':'')
     +(!prev?'<div class="muted-note">Sample entries, bills and balances will be hidden from your figures. Nothing is deleted.</div>':'')
     +'<div class="btn-row"><button id="setup-back-btn">Back to Edit</button><button class="primary" id="setup-confirm-btn">CONFIRM &amp; SAVE</button></div></div>';

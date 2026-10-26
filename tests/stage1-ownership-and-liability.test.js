@@ -190,11 +190,17 @@ async function ctx() {
 }
 const openApp = async (page, url) => { await page.goto(base + url); await page.waitForSelector('body[data-kf-ready="1"]'); };
 const row = (page, i) => page.locator(`#setup-accounts [data-acct-row="${i}"]`);
+// Taps the field (the touch focus path a phone uses), then enters the text the way an Android soft
+// keyboard delivers it (insertText), and checks both steps by what the page shows. Synthetic
+// keystrokes (keyboard.type) after an emulated tap are sometimes dispatched as key events that
+// Chromium never turns into text, leaving the field empty; that was the intermittent
+// "sharedPortion: null" failure, not anything the app did with the value.
 async function tapType(page, locator, text) {
   await locator.tap();
-  await page.keyboard.press('Control+A');
-  await page.keyboard.press('Backspace');
-  await page.keyboard.type(text);
+  assert.equal(await locator.evaluate(el => el === document.activeElement), true, 'the tapped field has focus');
+  await locator.evaluate(el => el.select());
+  await page.keyboard.insertText(text);
+  assert.equal(await locator.inputValue(), text, 'the field shows what was entered');
 }
 async function openEdit(page) {
   if (!(await page.isVisible('#setup-open-btn'))) await page.click('#settings-nav-btn');
@@ -268,8 +274,7 @@ for (const b of BUILDS) {
     await page.fill('#setup-baseline', '2026-10-01');
     await tapType(page, row(page, 0).locator('[data-f=opening]'), '40000');
     await row(page, 0).locator('[data-f=use]').selectOption('shared');
-    await page.waitForTimeout(50);
-    assert.equal(await row(page, 0).locator('[data-shared-portion]').isVisible(), true, 'the portion field appears for a Shared account');
+    await row(page, 0).locator('[data-shared-portion]').waitFor({ state: 'visible' }); // the portion field appears for a Shared account
     await tapType(page, row(page, 0).locator('[data-f=sharedAmt]'), '15000');
     for (const k of ALIASES) await page.selectOption(`#setup-aliases [data-alias="${k}"]`, 'acc_opay');
     await page.tap('#setup-save-btn');
@@ -283,6 +288,14 @@ for (const b of BUILDS) {
     const saved = await p2.evaluate(n => new Promise((res, rej) => { const q = indexedDB.open(n); q.onsuccess = () => { const g = q.result.transaction('meta').objectStore('meta').get('ledgerSetup'); g.onsuccess = () => { q.result.close(); res(g.result); }; g.onerror = () => rej(g.error); }; q.onerror = () => rej(q.error); }), b.dbName);
     await p2.close();
     assert.equal(saved.accounts[0].sharedPortion.amount, 15000);
+    assert.equal(saved.accounts[0].use, 'shared');
+    assert.equal(saved.accounts[0].opening, 40000);
+    // After a reload the form shows the saved declaration, not an empty field.
+    await openApp(page, b.url);
+    await openEdit(page);
+    assert.equal(await row(page, 0).locator('[data-f=use]').inputValue(), 'shared');
+    assert.equal(await row(page, 0).locator('[data-shared-portion]').isVisible(), true);
+    assert.equal(await row(page, 0).locator('[data-f=sharedAmt]').inputValue(), '15000');
     assert.deepEqual(page.errors, []);
   });
 }
