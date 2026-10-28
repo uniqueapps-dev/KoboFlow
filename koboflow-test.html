@@ -928,14 +928,68 @@ function accountBalances(accounts,txns,opts){
   });
   var out={};for(var k2 in bal)out[k2]=fromK(bal[k2]);return out;
 }
+/* Movement rules: what each side of an entry is, in one place for every balance, cash and warning.
+   A side is 'mapped' (a set-up account, directly or through the quick-capture mapping), 'outside'
+   (money from or to somewhere KoboFlow does not track: a legacy account mapped to OUTSIDE, an owner
+   withdrawal with no destination, or an owner contribution with no source), 'unresolved' (a legacy
+   account set to "Not used" or not yet mapped, an account that is not set up, or an empty side the
+   entry type needs) or 'none' (the type has no such side). Balances apply mapped sides only, so an
+   outside or unresolved side never invents a balance (accountDeltas); stored entries are never
+   changed. Unresolved sides are surfaced, and money received FROM an unresolved side is excluded
+   from confirmed pharmacy cash until reconciled (unreconciledInflows). */
+var OUTSIDE='__outside';
+var MOVE_SIDES={expense:['req',''],obligation:['req',''],loan_repayment:['req',''],income:['','req'],loan_receipt:['','req'],
+  transfer:['req','req'],investment:['req','req'],owner_withdrawal:['req','outside'],capital_injection:['outside','req']};
+function sideStatus(t,side,aliases,accountIds){
+  var x=side==='from'?t.fromAcct:t.toAcct,ids={};
+  if(Array.isArray(accountIds))accountIds.forEach(function(id){ids[id]=true;});else ids=accountIds||{};
+  if(!x){var e=(MOVE_SIDES[t.type]||['',''])[side==='from'?0:1];return{status:e==='outside'?'outside':e==='req'?'unresolved':'none',acct:null,key:''};}
+  var al=aliases&&aliases[x];
+  if(al===OUTSIDE)return{status:'outside',acct:null,key:x};
+  var r=al||x;
+  return ids[r]?{status:'mapped',acct:r,key:x}:{status:'unresolved',acct:null,key:x};
+}
+/* Money received into a set-up account from an unresolved side, on or after the baseline: still in the
+   recorded balance (the account did receive it), but not confirmed pharmacy cash until reconciled
+   (mapping corrected or the entry edited). Each entry counts once, against its destination only. */
+function unreconciledInflows(accounts,txns,opts){
+  opts=opts||{};var ids={},by={},list=[],tot=0;
+  (accounts||[]).forEach(function(a){ids[a.id]=true;});
+  (txns||[]).forEach(function(t){
+    if(!t||t.voided||t.demo)return;
+    if(opts.baselineDate&&(t.date||'')<opts.baselineDate)return;
+    var to=sideStatus(t,'to',opts.aliases,ids),fr=sideStatus(t,'from',opts.aliases,ids);
+    if(to.status!=='mapped'||fr.status!=='unresolved')return;
+    var k=toK(t.amount);if(!(k>0))return;
+    by[to.acct]=(by[to.acct]||0)+k;tot+=k;list.push({id:t.id,date:t.date||'',desc:t.desc||'',type:t.type||'',amount:fromK(k),acct:to.acct,fromKey:fr.key});
+  });
+  var out={};for(var a in by)out[a]=fromK(by[a]);
+  return{byAccount:out,entries:list,total:fromK(tot)};
+}
+/* Every live entry (on/after the baseline) with a side that is unresolved or outside, with what the
+   balance rule does with it: the reconciliation list shown in setup and data quality. */
+function movementReview(accounts,txns,opts){
+  opts=opts||{};var ids={},unresolved=[],outside=[];
+  (accounts||[]).forEach(function(a){ids[a.id]=true;});
+  (txns||[]).forEach(function(t){
+    if(!t||t.voided||t.demo)return;
+    if(opts.baselineDate&&(t.date||'')<opts.baselineDate)return;
+    var fr=sideStatus(t,'from',opts.aliases,ids),to=sideStatus(t,'to',opts.aliases,ids);
+    var e={id:t.id,date:t.date||'',desc:t.desc||'',type:t.type||'',amount:Number(t.amount)||0,from:fr,to:to,
+      inflowHeld:to.status==='mapped'&&fr.status==='unresolved'};
+    if(fr.status==='unresolved'||to.status==='unresolved')unresolved.push(e);
+    else if(fr.status==='outside'||to.status==='outside')outside.push(e);
+  });
+  return{unresolved:unresolved,outside:outside};
+}
 /* What a quick-capture mapping change does to balances, entry by entry. Read-only: stored
    entries are never changed; the mapping is applied when balances are calculated, so a change
    moves every past entry (on/after the baseline) that carries a legacy account id. For each such
    entry the effect is accountDeltas under the new mapping minus under the old one, counting only
    real accounts, exactly as accountBalances counts them. Summed, the changes equal the difference
-   between accountBalances with the two mappings. halfMapped marks a movement between two accounts
-   (transfer, owner withdrawal, investment…) that the new mapping counts on one side only, so it
-   changes total money. */
+   between accountBalances with the two mappings. halfMapped marks an entry that the new mapping
+   counts on one side while its other side is unresolved (sideStatus), so it changes total money
+   without that being confirmed; a side mapped to OUTSIDE is a deliberate choice and is not flagged. */
 function mappingImpact(accounts,txns,opts){
   opts=opts||{};var ids={},oldA=opts.fromAliases||{},newA=opts.toAliases||{},per={},total=0,entries=[];
   (accounts||[]).forEach(function(a){ids[a.id]=true;});
@@ -952,9 +1006,9 @@ function mappingImpact(accounts,txns,opts){
     var a=side(t,oldA),b=side(t,newA),d={},any=false,tk=0;
     Object.keys(a).concat(Object.keys(b)).forEach(function(k){var v=(b[k]||0)-(a[k]||0);if(v&&d[k]===undefined){d[k]=v;tk+=v;any=true;}});
     if(!any)return;
-    var counted=[t.fromAcct,t.toAcct].filter(function(x){return x&&real(x,newA);}).length;
+    var fs=sideStatus(t,'from',newA,ids).status,ts=sideStatus(t,'to',newA,ids).status;
     var e={id:t.id,date:t.date||'',desc:t.desc||'',type:t.type||'',amount:Number(t.amount)||0,legacy:legacy,change:{},totalChange:fromK(tk),
-      halfMapped:!!(t.fromAcct&&t.toAcct&&counted===1)};
+      halfMapped:(fs==='mapped'&&ts==='unresolved')||(fs==='unresolved'&&ts==='mapped')};
     for(var k in d){e.change[k]=fromK(d[k]);per[k]=(per[k]||0)+d[k];}
     total+=tk;entries.push(e);
   });
@@ -1075,9 +1129,17 @@ function sharedPortion(a){
    accounts zeroed; shared accounts clamped to their confirmed portion; unclassified or
    unconfirmed accounts zeroed and flagged) plus the warnings that explain every exclusion. */
 function pharmacyEligibleAccounts(accounts,opts){
-  opts=opts||{};var warnings=[],virtual=[];
+  opts=opts||{};var warnings=[],virtual=[],held=opts.unreconciled||{};
   (accounts||[]).forEach(function(a){
     var own=accountOwnership(a),confirmed=ownershipConfirmed(a),bal=a.balance!==undefined?a.balance:a.opening;
+    // Money received from an unresolved side (unreconciledInflows) stays in the recorded balance but
+    // is not confirmed pharmacy cash. At most what the account holds is held back: an inflow already
+    // spent was taken out by that spending, so it is never deducted twice.
+    var hK=Math.max(0,toK(held[a.id]||0)),bK=toK(bal);
+    if(hK>0&&(own==='business'||own==='shared')&&confirmed){
+      var cut=bK>0?Math.min(hK,bK):0;bal=fromK(bK-cut);a=Object.assign({},a,{balance:bal});
+      warnings.push({key:'unreconciled_inflow',accountId:a.id,label:a.label,amount:fromK(hK),excluded:fromK(cut),text:'₦'+fromK(hK).toLocaleString('en-NG')+' received into "'+a.label+'" came from an account that is not resolved (set to "Not used" or not set up). It is in the recorded balance but not counted as confirmed pharmacy cash'+(cut<hK?' (₦'+fromK(cut).toLocaleString('en-NG')+' of it is still in the account)':'')+' until you reconcile it: map that account or edit the entry.'});
+    }
     if(own===''){
       warnings.push({key:'unclassified_account',accountId:a.id,label:a.label,text:'"'+a.label+'" has no "Used For" (Business, Personal or Shared), so it is excluded from confirmed pharmacy cash until you choose one.'});
       virtual.push({id:a.id,label:a.label,kind:a.kind,access:a.access,opening:0,balance:0});
@@ -1275,8 +1337,16 @@ function dataQuality(o){
   function add(key,severity,list,text){if(list.length)out.push({key:key,severity:severity,count:list.length,ids:list.map(function(t){return t.id;}),text:text(list.length)});}
   add('needs_review','high',live.filter(function(t){return t.state==='Needs Review';}),function(n){return n+' entr'+(n>1?'ies need':'y needs')+' review: the category or account may be wrong.';});
   add('future_dated','medium',live.filter(function(t){return(t.date||'')>td;}),function(n){return n+' entr'+(n>1?'ies are':'y is')+' dated in the future. Future-dated entries already move balances; check the dates.';});
-  add('unmapped_account','high',live.filter(function(t){var bad=false;[t.fromAcct,t.toAcct].forEach(function(x){if(x){var r=res(x);if(!r||!ids[r])bad=true;}});return bad;}),function(n){return n+' entr'+(n>1?'ies use':'y uses')+' an account that is not set up or is set to "Not used": '+(n>1?'they move':'it moves')+' no balance.';});
+  add('unmapped_account','high',live.filter(function(t){var bad=false;[t.fromAcct,t.toAcct].forEach(function(x){if(x){var r=res(x);if(r!==OUTSIDE&&(!r||!ids[r]))bad=true;}});return bad;}),function(n){return n+' entr'+(n>1?'ies use':'y uses')+' an account that is not set up or is set to "Not used": '+(n>1?'they move':'it moves')+' no balance.';});
   add('missing_account','high',live.filter(function(t){var c=classifyTxn(t);return(c.cashIn>0&&!t.toAcct)||((c.cashOut>0||c.ownerOut>0)&&!t.fromAcct);}),function(n){return n+' entr'+(n>1?'ies have':'y has')+' no account, so '+(n>1?'they are':'it is')+' not in any balance.';});
+  // Movement rules (sideStatus): sides that need an account but have none (beyond missing_account), sides
+  // that are outside KoboFlow, and money received from an unresolved side (not confirmed pharmacy cash).
+  var mv=movementReview((o.accountIds||[]).map(function(id){return{id:id};}),live,{aliases:al,baselineDate:o.baselineDate}),miss={};
+  out.forEach(function(f){if(f.key==='missing_account'||f.key==='unmapped_account')f.ids.forEach(function(id){miss[id]=1;});});
+  add('unresolved_side','high',mv.unresolved.filter(function(e){return !miss[e.id];}).map(function(e){return{id:e.id};}),function(n){return n+' entr'+(n>1?'ies move':'y moves')+' money between two accounts but one side has no account, so that side is unresolved. Edit '+(n>1?'them':'it')+' to choose the account.';});
+  add('outside_account','medium',mv.outside.map(function(e){return{id:e.id};}),function(n){return n+' entr'+(n>1?'ies move':'y moves')+' money to or from outside KoboFlow. Only the account KoboFlow tracks changes; reconcile with the outside account yourself if needed.';});
+  var held=mv.unresolved.filter(function(e){return e.inflowHeld;}),heldK=held.reduce(function(s2,e){return s2+toK(e.amount);},0);
+  add('unreconciled_inflow','high',held.map(function(e){return{id:e.id};}),function(n){return'₦'+fromK(heldK).toLocaleString('en-NG')+' in '+n+' entr'+(n>1?'ies was':'y was')+' received from an unresolved account: it is in the recorded balance but not counted as confirmed pharmacy cash until you map that account or edit the entr'+(n>1?'ies':'y')+'.';});
   // Same date, amount, type, description and accounts as before. The paid-to / received-from name only
   // separates two entries when BOTH have one and they differ (the same amount paid on the same day to two
   // different places is two payments). A blank name never hides a repeat: a named and an unnamed copy of
@@ -1427,9 +1497,10 @@ function validateSetup(s,txns,todayStr){
   var al=s.aliases||{},live=(txns||[]).filter(function(t){return !t.demo&&!t.voided;});
   Object.keys(LEGACY_ACCOUNTS).forEach(function(k){
     if(al[k]===undefined||al[k]===null){errors.push('Choose where "'+LEGACY_ACCOUNTS[k]+'" entries belong (or "Not used").');return;}
-    if(al[k]&&!ids[al[k]])errors.push('"'+LEGACY_ACCOUNTS[k]+'" is mapped to an account that no longer exists.');
+    if(al[k]&&al[k]!==OUTSIDE&&!ids[al[k]])errors.push('"'+LEGACY_ACCOUNTS[k]+'" is mapped to an account that no longer exists.');
     var used=live.filter(function(t){return t.fromAcct===k||t.toAcct===k;}).length;
-    if(!al[k]&&used)warnings.push(used+' recorded entr'+(used>1?'ies use':'y uses')+' "'+LEGACY_ACCOUNTS[k]+'" but it is set to "Not used": they will not move any balance.');
+    if(!al[k]&&used)warnings.push(used+' recorded entr'+(used>1?'ies use':'y uses')+' "'+LEGACY_ACCOUNTS[k]+'" but it is set to "Not used": that side moves no balance and stays unresolved. Any other account on the entry still moves, and money received from it is not counted as confirmed pharmacy cash until you map it (to an account or to Outside KoboFlow) or edit the entry.');
+    if(al[k]===OUTSIDE&&used)info.push(used+' recorded entr'+(used>1?'ies use':'y uses')+' "'+LEGACY_ACCOUNTS[k]+'", set to Outside KoboFlow: that side is not tracked, the other account on the entry still moves. Reconcile with the outside account yourself if needed.');
   });
   if(parseDate(s.baselineDate)){
     var before=live.filter(function(t){return(t.date||'')<s.baselineDate;}).length;
@@ -1676,7 +1747,7 @@ var API={toK:toK,fromK:fromK,num:num,fmtDate:fmtDate,parseDate:parseDate,today:t
   CATEGORIES:CATEGORIES,NATURES:NATURES,STRUCTURES:STRUCTURES,STATUSES:STATUSES,STATUS_LABEL:STATUS_LABEL,OPP_STRUCTURES:OPP_STRUCTURES,REMINDER_TEXT:REMINDER_TEXT,
   isDebt:isDebt,cashReceived:function(t){return fromK(cashReceivedK(t));},buildSchedule:buildSchedule,termsSummary:termsSummary,
   instalmentStates:instalmentStates,extraPrincipalInfo:extraPrincipalInfo,agreementBalances:agreementBalances,allocatePayment:allocatePayment,settlementPlan:settlementPlan,
-  classifyTxn:classifyTxn,accountDeltas:accountDeltas,accountBalances:accountBalances,mappingImpact:mappingImpact,upcomingObligations:upcomingObligations,cashForecast:cashForecast,
+  classifyTxn:classifyTxn,accountDeltas:accountDeltas,accountBalances:accountBalances,mappingImpact:mappingImpact,OUTSIDE:OUTSIDE,sideStatus:sideStatus,unreconciledInflows:unreconciledInflows,movementReview:movementReview,upcomingObligations:upcomingObligations,cashForecast:cashForecast,
   buildReminders:buildReminders,xirr:xirr,ACCOUNT_KINDS:ACCOUNT_KINDS,LEGACY_ACCOUNTS:LEGACY_ACCOUNTS,bucketSummary:bucketSummary,accountAccess:accountAccess,cashPosition:cashPosition,cashCover:cashCover,reservationPlan:reservationPlan,coveredAmount:coveredAmount,
   OWNERSHIP:OWNERSHIP,accountOwnership:accountOwnership,ownershipConfirmed:ownershipConfirmed,sharedPortion:sharedPortion,pharmacyEligibleAccounts:pharmacyEligibleAccounts,pharmacyCashPosition:pharmacyCashPosition,BILL_REPEAT:BILL_REPEAT,BILL_UNITS:BILL_UNITS,billRepeatLabel:billRepeatLabel,billCustomOk:billCustomOk,billDueDates:billDueDates,billAmountOn:billAmountOn,billOccurrences:billOccurrences,billObligations:billObligations,billUnmatchedPayments:billUnmatchedPayments,validateBill:validateBill,dataQuality:dataQuality,incomeFromFindings:incomeFromFindings,dupName:dupName,PARTY_MAX:PARTY_MAX,dateKey:dateKey,inDateRange:inDateRange,partyField:partyField,cleanParty:cleanParty,partyKey:partyKey,clipParty:clipParty,budgetProgress:budgetProgress,directorPlan:directorPlan,spendingRunway:spendingRunway,validateSetup:validateSetup,cashFlowSummary:cashFlowSummary,oppRepayments:oppRepayments,analyzeOpportunity:analyzeOpportunity,oppToTerms:oppToTerms,parseManualRows:parseManualRows};
 root.KoboFin=API;
@@ -2935,7 +3006,10 @@ function getYest(){return KoboFin.addDays(KoboFin.today(),-1);}
 function dateLabel(iso){var t=getToday(),y=getYest();if(iso===t)return'Today';if(iso===y)return'Yesterday';var d=KoboFin.parseDate(iso);return d?d.toLocaleDateString('en-NG',{day:'numeric',month:'short',year:'numeric'}):String(iso||'No date');}
 function qs(id){return document.getElementById(id);}
 function raf2(fn){requestAnimationFrame(function(){requestAnimationFrame(fn);});}
-function showToast(msg){var t=qs('toast');if(!t)return;t.textContent=msg;t.className='show';setTimeout(function(){t.className='';},2200);}
+// Each message stays up its full time: a new message cancels the previous one's hide timer, which
+// would otherwise hide the new message early (a refusal could vanish almost as soon as it appeared).
+var toastTimer=null;
+function showToast(msg){var t=qs('toast');if(!t)return;t.textContent=msg;t.className='show';clearTimeout(toastTimer);toastTimer=setTimeout(function(){t.className='';toastTimer=null;},2200);}
 
 var ACCOUNTS=[
   {id:'pharma_cash', label:'Pharmacy Cash',  balance:185000, type:'Business', icon:'&#127978;', use:'business'},
@@ -3363,8 +3437,11 @@ function recalcBalances(){var b=F.accountBalances(ACCOUNTS,items,isLive()?{basel
    .warnings. Director, Calendar, Pressure, Autopilot and Opportunity Analyzer all read through
    this, never through raw ACCOUNTS, so a change to the ownership rules changes every screen at
    once (see F.pharmacyEligibleAccounts / F.pharmacyCashPosition). */
-function pharmacyAccounts(){return F.pharmacyEligibleAccounts(ACCOUNTS,{});}
-function cashNow(){return F.pharmacyCashPosition(ACCOUNTS,reservations().effective);}
+/* Recorded balances (ACCOUNTS[].balance) include every mapped side. Confirmed pharmacy cash also
+   leaves out money received from an unresolved side until it is reconciled (F.unreconciledInflows). */
+function pharmOpts(){return isLive()?{unreconciled:F.unreconciledInflows(ACCOUNTS,items,{baselineDate:SETUP.baselineDate,aliases:SETUP.aliases}).byAccount}:{};}
+function pharmacyAccounts(){return F.pharmacyEligibleAccounts(ACCOUNTS,pharmOpts());}
+function cashNow(){return F.pharmacyCashPosition(ACCOUNTS,reservations().effective,pharmOpts());}
 /* Earmarks with their link to an obligation resolved against current instalment states (engine
    reservationPlan). Recomputed on every call, never stored: paying an instalment releases its
    reservation automatically, exactly once. Built on the pharmacy-eligible accounts above, so an
@@ -3374,7 +3451,7 @@ function reservations(){return F.reservationPlan(pharmacyAccounts().accounts,isL
 function staleReservations(){return reservations().buckets.filter(function(b){return b.reservedFor&&b.status==='no_outstanding';});}
 function liquidCash(){return cashNow().available;}
 function spendableCash(){return cashNow().available;}
-function acctLabel(id){var r=resolveAcct(id),a=ACCOUNTS.find(function(x){return x.id===r;});return a?a.label:(id?(F.LEGACY_ACCOUNTS[id]||id)+(isLive()?' (not mapped)':''):'');}
+function acctLabel(id){var r=resolveAcct(id),a=ACCOUNTS.find(function(x){return x.id===r;});return a?a.label:(id?(F.LEGACY_ACCOUNTS[id]||id)+(isLive()?(SETUP.aliases&&SETUP.aliases[id]===F.OUTSIDE?' (outside KoboFlow)':' (not mapped)'):''):'');}
 function acctOptions(sel){return ACCOUNTS.map(function(a){return'<option value="'+esc(a.id)+'"'+(a.id===sel?' selected':'')+'>'+esc(a.label)+' ('+fmt(a.balance)+')</option>';}).join('');}
 function fmtD(iso){var d=F.parseDate(iso);return d?d.toLocaleDateString('en-NG',{day:'numeric',month:'short',year:'numeric'}):'--';}
 function signed(n){return(n<0?'-':'+')+fmt(n);}
@@ -3466,7 +3543,7 @@ function loanEntries(){
 }
 function obligationsWithin(days){return F.upcomingObligations(billEntries().concat(loanEntries()),getToday(),days);}
 function sumRem(list){return list.reduce(function(s,e){return s+e.remaining;},0);}
-function cashCoverFor(obs){var r=reservations();return F.cashCover(F.pharmacyCashPosition(ACCOUNTS,r.effective),sumRem(obs),F.coveredAmount(obs,r.coverage));}
+function cashCoverFor(obs){var r=reservations();return F.cashCover(F.pharmacyCashPosition(ACCOUNTS,r.effective,pharmOpts()),sumRem(obs),F.coveredAmount(obs,r.coverage));}
 function freeCash(){return cashCoverFor(obligationsWithin(30)).leftAfter;}
 function unlinkedLoanReceipts(){return items.filter(function(t){return !t.demo&&!t.agreementId&&F.classifyTxn(t).loanProceeds>0;});}
 function dueText(iso){var d=F.daysBetween(getToday(),iso);return d<0?'Overdue '+(-d)+'d':d===0?'Today':d===1?'Tomorrow':'In '+d+' days';}
@@ -4157,7 +4234,10 @@ var DEMO_ACCOUNTS=ACCOUNTS.map(function(a){var c={};for(var k in a)c[k]=a[k];c.k
 var DEMO_ITEMS=null,SETUP=null;
 var KIND_ICON={wallet:'&#128241;',bank:'&#127974;',cash:'&#128181;',coop:'&#129309;',investment:'&#128200;'};
 function isLive(){return !!(SETUP&&SETUP.mode==='live');}
-function resolveAcct(id){return(isLive()&&id&&SETUP.aliases&&SETUP.aliases[id]!==undefined)?(SETUP.aliases[id]||''):id;}
+/* A legacy (quick-capture) account id resolves to the account it is mapped to. When it is set to
+   "Not used" or Outside KoboFlow, the raw legacy id is kept (never replaced by an empty side), so the
+   entry stays visibly unresolved or outside and follows any later mapping change (F.sideStatus). */
+function resolveAcct(id){var t=isLive()&&id&&SETUP.aliases?SETUP.aliases[id]:undefined;return t&&t!==F.OUTSIDE?t:id;}
 /* Upgrade rule (owner decision, 2026-10-25): existing accounts must be explicitly reconfirmed
    after an upgrade. Nothing saved before this feature is ever treated as confirmed:
    - a record with no "use" key at all reads as '' ("not chosen yet");
@@ -4386,7 +4466,8 @@ function renderSetupRows(){
     return'<div class="form-group"><label>"'+F.LEGACY_ACCOUNTS[k]+'"'+(used?' &mdash; '+used+' recorded entr'+(used>1?'ies':'y'):'')+'</label><select class="form-input" data-alias="'+k+'">'
       +'<option value="__unset"'+(cur===undefined||cur===null?' selected':'')+'>Choose&hellip;</option>'
       +accts.map(function(a){return'<option value="'+esc(a.id)+'"'+(cur===a.id?' selected':'')+'>'+esc(a.label||'(unnamed)')+'</option>';}).join('')
-      +'<option value=""'+(cur===''?' selected':'')+'>Not used</option></select></div>';
+      +'<option value=""'+(cur===''?' selected':'')+'>Not used</option>'
+      +'<option value="'+F.OUTSIDE+'"'+(cur===F.OUTSIDE?' selected':'')+'>Outside KoboFlow / untracked</option></select></div>';
   }).join('');
   setupPreview();
 }
@@ -4404,7 +4485,7 @@ function refreshAcctOptions(){
   var accts=setupDraft.accounts.filter(function(a){return !a.removed;});
   var opts=accts.map(function(a){return'<option value="'+esc(a.id)+'">'+esc(a.label||'(unnamed)')+'</option>';}).join('');
   document.querySelectorAll('#setup-buckets [data-f="parentId"]').forEach(function(sel){var v=sel.value;sel.innerHTML='<option value="">Choose&hellip;</option>'+opts;sel.value=v;});
-  document.querySelectorAll('#setup-aliases [data-alias]').forEach(function(sel){var v=sel.value;sel.innerHTML='<option value="__unset">Choose&hellip;</option>'+opts+'<option value="">Not used</option>';sel.value=v;});
+  document.querySelectorAll('#setup-aliases [data-alias]').forEach(function(sel){var v=sel.value;sel.innerHTML='<option value="__unset">Choose&hellip;</option>'+opts+'<option value="">Not used</option><option value="'+F.OUTSIDE+'">Outside KoboFlow / untracked</option>';sel.value=v;});
 }
 function readSetupForm(){
   var s=setupDraft;s.baselineDate=val('setup-baseline');
@@ -4441,7 +4522,7 @@ function mappingImpactFor(s,prev){
 function mappingImpactHtml(s,prev){
   var r=mappingImpactFor(s,prev),im=r.im,max=20;if(!im.entries.length)return'';
   function lbl(id){var a=r.accts.find(function(x){return x.id===id;})||(prev&&prev.accounts.find(function(x){return x.id===id;}));return a?a.label:id;}
-  function target(al,k){return !al?'not set up':al[k]===undefined||al[k]===null?'not chosen':al[k]===''?'Not used':lbl(al[k]);}
+  function target(al,k){return !al?'not set up':al[k]===undefined||al[k]===null?'not chosen':al[k]===''?'Not used':al[k]===F.OUTSIDE?'Outside KoboFlow':lbl(al[k]);}
   function amt(n){return'<span style="color:'+(n<0?'#EF4444':'#22C55E')+';">'+signed(n)+'</span>';}
   var half=im.entries.filter(function(e){return e.halfMapped;}).length;
   return'<div class="card" data-mapping-impact="1" style="background:var(--surf2);border-color:var(--amber);"><div class="card-label">Past entries this mapping change moves</div>'
@@ -4450,13 +4531,31 @@ function mappingImpactHtml(s,prev){
       return'<div class="muted-note" data-impact-entry="'+esc(e.id)+'" style="color:var(--text);"><b>'+esc(fmtD(e.date))+' &middot; '+esc(e.desc)+'</b> &middot; '+esc(e.type)+' '+fmt(e.amount)+'<br>'
         +e.legacy.map(function(l){return esc(F.LEGACY_ACCOUNTS[l.key])+' ['+esc(l.key)+'] '+(l.side==='from'?'(paid from)':'(paid into)')+': '+esc(target(prev&&prev.aliases,l.key))+' &rarr; <b>'+esc(target(s.aliases,l.key))+'</b>';}).join('<br>')
         +'<br>Effect: '+Object.keys(e.change).map(function(k){return esc(lbl(k))+' '+amt(e.change[k]);}).join(', ')+(e.totalChange?' &middot; total '+amt(e.totalChange):'')
-        +(e.halfMapped?'<br><span style="color:var(--amber);" data-impact-half="1">Only one side of this movement is mapped to an account, so it changes total money.</span>':'')+'</div>';
+        +(e.halfMapped?'<br><span style="color:var(--amber);" data-impact-half="1">Only one side of this movement is mapped to an account and the other is unresolved, so it changes total money.</span>':'')+'</div>';
     }).join('')
     +(im.entries.length>max?'<div class="muted-note">&hellip;and '+(im.entries.length-max)+' more (all included in the totals below).</div>':'')
     +Object.keys(im.perAccount).map(function(k){return'<div data-impact-acct="'+esc(k)+'">'+kv(esc(lbl(k)),amt(im.perAccount[k]))+'</div>';}).join('')
     +'<div data-impact-total="'+im.total+'">'+kv('Change in total real money',im.total?amt(im.total):fmt(0),'','total')+'</div>'
-    +(half?'<div class="form-warn">'+half+' entr'+(half>1?'ies are movements':'y is a movement')+' between two accounts with only one side mapped. Map both sides (or neither) if the money stayed with you.</div>':'')
+    +(half?'<div class="form-warn">'+half+' entr'+(half>1?'ies are movements':'y is a movement')+' between two accounts with only one side mapped. Map the other side to an account, or to Outside KoboFlow if the money left your tracked accounts.</div>':'')
     +'</div>';
+}
+/* Unresolved movements under the mapping being saved (F.movementReview), and money received from an
+   unresolved side that is held out of confirmed pharmacy cash before and after the change
+   (F.unreconciledInflows). Same baseline and entries as the balances; nothing is stored or edited. */
+function movementReviewHtml(s,prev){
+  var accts=s.accounts.filter(function(a){return !a.removed&&a.label;}),A=accts.map(function(a){return{id:a.id};}),max=20;
+  var mv=F.movementReview(A,items,{baselineDate:s.baselineDate,aliases:s.aliases||{}});
+  var before=prev?F.unreconciledInflows(A,items,{baselineDate:s.baselineDate,aliases:prev.aliases||{}}).total:null;
+  var after=F.unreconciledInflows(A,items,{baselineDate:s.baselineDate,aliases:s.aliases||{}}).total;
+  if(!mv.unresolved.length&&!after&&!before)return'';
+  function lbl(id){var a=accts.find(function(x){return x.id===id;});return a?a.label:id;}
+  function side(x){return x.status==='mapped'?esc(lbl(x.acct)):x.status==='outside'?'outside KoboFlow':x.status==='none'?'&mdash;':'<b style="color:var(--amber);">unresolved'+(x.key?' ('+esc(F.LEGACY_ACCOUNTS[x.key]||x.key)+')':' (no account)')+'</b>';}
+  return'<div class="card" data-unresolved-movements="'+mv.unresolved.length+'" data-held-after="'+after+'"'+(before!==null?' data-held-before="'+before+'"':'')+' style="background:var(--surf2);border-color:var(--amber);"><div class="card-label">Unresolved movements after saving</div>'
+    +(mv.unresolved.length?'<div class="muted-note">'+mv.unresolved.length+' entr'+(mv.unresolved.length>1?'ies have':'y has')+' a side that is unresolved ("Not used", not set up, or no account). Only the mapped side moves a balance. Reconcile by mapping the account (to an account or to Outside KoboFlow) or by editing the entry.</div>':'')
+    +mv.unresolved.slice(0,max).map(function(e){return'<div class="muted-note" data-unresolved-entry="'+esc(e.id)+'" style="color:var(--text);"><b>'+esc(fmtD(e.date))+' &middot; '+esc(e.desc)+'</b> &middot; '+esc(e.type)+' '+fmt(e.amount)+'<br>From '+side(e.from)+' &rarr; To '+side(e.to)+(e.inflowHeld?'<br><span style="color:var(--amber);">Received from an unresolved account: not confirmed pharmacy cash.</span>':'')+'</div>';}).join('')
+    +(mv.unresolved.length>max?'<div class="muted-note">&hellip;and '+(mv.unresolved.length-max)+' more.</div>':'')
+    +kv('Held out of confirmed pharmacy cash',(before!==null&&before!==after?fmt(before)+' &rarr; ':'')+fmt(after),after?'var(--amber)':'','total')
+    +'<div class="muted-note">Recorded balances still include this money; confirmed pharmacy cash leaves it out (never more than the account holds) until it is reconciled.</div></div>';
 }
 function setupPreview(){
   var s=readSetupForm(),v=F.validateSetup(s,items,getToday()),el=qs('setup-preview');
@@ -4465,7 +4564,7 @@ function setupPreview(){
   el.innerHTML=(v.errors.length?'<div class="form-err">'+v.errors.map(esc).join('<br>')+'</div>':'')
     +v.warnings.map(function(w){return'<div class="form-warn">'+esc(w)+'</div>';}).join('')
     +v.info.map(function(w){return'<div class="muted-note">'+esc(w)+'</div>';}).join('')
-    +(bal?mappingImpactHtml(s,SETUP):'')
+    +(bal?mappingImpactHtml(s,SETUP)+movementReviewHtml(s,SETUP):'')
     +(bal?'<div class="card" style="background:var(--surf2);"><div class="card-label">Balances after saving</div>'+accts.map(function(a){return kv(esc(a.label)+' <span style="font-size:10px;">(opening '+fmt(F.num(a.opening)||0)+')</span>',fmt(bal[a.id]));}).join('')
       +kv('Total real money',fmt(accts.reduce(function(t,a){return t+bal[a.id];},0)),'#22C55E','total')+'<div class="muted-note">Sample entries and sample bills will be hidden from live figures (not deleted).</div></div>':'');
   return v;
@@ -4536,7 +4635,7 @@ function saveSetup(){
     Object.keys(keys).forEach(function(k){var f=pa[k]===undefined?null:pa[k],t=na[k]===undefined?null:na[k];if(f!==t)changes.push({field:'mapping',key:k,from:f,to:t});});
   }
   function acctName(id){var a=s.accounts.find(function(x){return x.id===id;})||(prev&&prev.accounts.find(function(x){return x.id===id;}));return a?(a.label||'(unnamed)'):'?';}
-  function target(v){return v===null?'not chosen':v===''?'Not used':acctName(v);}
+  function target(v){return v===null?'not chosen':v===''?'Not used':v===F.OUTSIDE?'Outside KoboFlow':acctName(v);}
   function bucketText(b){return esc(b.label||'(unnamed)')+' '+fmt(b.amount)+' inside '+esc(acctName(b.parentId))+(b.reservedFor?' for '+esc(reservedForLabel(b.reservedFor)):'');}
   function changeLine(c){
     if(c.field==='baselineDate')return'Baseline date: '+fmtD(c.from)+' &rarr; <b>'+fmtD(c.to)+'</b>';
@@ -4568,9 +4667,10 @@ function saveSetup(){
     +(planNum((s.planning||{}).workingCapitalFloor)!==null?kv('Working-capital floor',fmt(planNum(s.planning.workingCapitalFloor)),'var(--muted)'):'')
     +(planNum((s.planning||{}).netWorthGoal)!==null?kv('Net-worth goal',fmt(planNum(s.planning.netWorthGoal)),'var(--muted)'):'')
     +(s.budgets||[]).map(function(b){return kv('Budget '+esc(b.cat)+' (a month)',fmt(F.num(b.amount)||0),'var(--muted)');}).join('')
-    +'<div class="muted-note">'+Object.keys(F.LEGACY_ACCOUNTS).map(function(k){var t=s.aliases[k];return esc(F.LEGACY_ACCOUNTS[k])+' &rarr; '+(t?esc((acc.find(function(x){return x.id===t;})||{}).label||t):'Not used');}).join(' &middot; ')+'</div>'
+    +'<div class="muted-note">'+Object.keys(F.LEGACY_ACCOUNTS).map(function(k){var t=s.aliases[k];return esc(F.LEGACY_ACCOUNTS[k])+' &rarr; '+(t===F.OUTSIDE?'Outside KoboFlow':t?esc((acc.find(function(x){return x.id===t;})||{}).label||t):'Not used');}).join(' &middot; ')+'</div>'
     +changeBox
     +mappingImpactHtml(s,prev)
+    +movementReviewHtml(s,prev)
     +(changes.some(function(c){return c.field==='opening'||c.field==='baselineDate';})?'<div class="muted-note">Opening balance or baseline changes are recorded in the setup history.</div>':'')
     +(!prev?'<div class="muted-note">Sample entries, bills and balances will be hidden from your figures. Nothing is deleted.</div>':'')
     +'<div class="btn-row"><button id="setup-back-btn">Back to Edit</button><button class="primary" id="setup-confirm-btn">CONFIRM &amp; SAVE</button></div></div>';
@@ -4746,9 +4846,11 @@ function renderNetWorth(){
   el=qs('nw-liabs');if(el)el.textContent=fmt(tl2);
   // Item D/G3: a pharmacy-eligible figure alongside the all-accounts total — never presented AS
   // the all-account figure, and never the reverse.
-  var pp=isLive()?F.pharmacyCashPosition(ACCOUNTS,reservations().effective):null;
+  var pp=isLive()?F.pharmacyCashPosition(ACCOUNTS,reservations().effective,pharmOpts()):null;
   el=qs('nw-assets-list');if(el)el.innerHTML=(pp?'<div class="nw-row" style="border-bottom:1px solid var(--border);padding-bottom:8px;margin-bottom:6px;"><div class="nw-row-label"><span>&#127978;</span><span>Pharmacy-eligible cash (confirmed)</span></div><div class="nw-row-val" style="color:#22C55E;">'+fmt(pp.available)+'</div></div>'
-    +(pp.warnings.length?'<div class="muted-note" style="margin:0 0 6px;">'+pp.warnings.length+' account(s) below are not yet counted as confirmed pharmacy cash &mdash; see Settings &rarr; Accounts.</div>':''):'')
+    +(function(){var ow=pp.warnings.filter(function(w){return w.key!=='unreconciled_inflow';}),hw=pp.warnings.filter(function(w){return w.key==='unreconciled_inflow';});
+      return(ow.length?'<div class="muted-note" style="margin:0 0 6px;">'+ow.length+' account(s) below are not yet counted as confirmed pharmacy cash &mdash; see Settings &rarr; Accounts.</div>':'')
+        +hw.map(function(w){return'<div class="muted-note" data-held-note="'+esc(w.accountId)+'" style="margin:0 0 6px;color:var(--amber);">'+esc(w.text)+'</div>';}).join('');})():'')
     +ACCOUNTS.map(function(a){return'<div class="nw-row"><div class="nw-row-label"><span>'+a.icon+'</span><span>'+esc(a.label)+'</span></div><div class="nw-row-val" style="color:#22C55E;">'+fmt(a.balance)+'</div></div>';}).join('');
   el=qs('nw-liabs-list');if(el)el.innerHTML=loans.map(function(v){return'<div class="nw-row" data-open-agr="'+esc(v.agr.id)+'"><div class="nw-row-label"><span>&#127974;</span><span>'+esc(v.agr.name)+'<div style="font-size:10px;color:var(--muted);">principal '+fmt(v.bal.outstanding.principal)+' &middot; interest &amp; fees already due '+fmt(v.bal.currentLiability-v.bal.outstanding.principal)+(v.bal.remainingScheduledPayments>0?' &middot; not yet due '+fmt(v.bal.remainingScheduledPayments):'')+'</div></span></div><div class="nw-row-val" style="color:#EF4444;">'+fmt(v.bal.currentLiability)+'</div></div>';}).join('')
     +un.map(function(t){return'<div class="nw-row"><div class="nw-row-label"><span>&#9888;</span><span>'+esc(t.desc)+' (terms not recorded, at least)</span></div><div class="nw-row-val" style="color:#EF4444;">'+fmt(t.amount)+'</div></div>';}).join('')
@@ -5118,7 +5220,8 @@ function incomeFromList(){
    one means real money is currently excluded from confirmed pharmacy cash until the owner acts. */
 function ownershipQuality(){
   if(!isLive())return[];
-  return pharmacyAccounts().warnings.map(function(w){return{key:w.key,severity:'high',count:1,ids:[w.accountId],text:w.text};});
+  // Money held back for unresolved inflows is reported per entry by F.dataQuality (unreconciled_inflow).
+  return pharmacyAccounts().warnings.filter(function(w){return w.key!=='unreconciled_inflow';}).map(function(w){return{key:w.key,severity:'high',count:1,ids:[w.accountId],text:w.text};});
 }
 function liveQuality(){
   if(!isLive())return[];
@@ -5134,7 +5237,7 @@ function liveQuality(){
   return q;
 }
 function directorData(){
-  var r=reservations(),cp=F.pharmacyCashPosition(ACCOUNTS,r.effective),obs=obligationsWithin(30);
+  var r=reservations(),cp=F.pharmacyCashPosition(ACCOUNTS,r.effective,pharmOpts()),obs=obligationsWithin(30);
   var pa=pharmacyAccounts().accounts,avail={};pa.forEach(function(a){avail[a.id]=F.accountAccess(a)==='immediate';});
   var linked=r.buckets.filter(function(b){return b.reservedFor&&avail[b.parentId];}).reduce(function(t,b){return t+b.effective;},0);
   var plan=F.directorPlan({today:getToday(),cashNow:cp.available,restricted:cp.restricted,earmarkedGeneral:cp.earmarked-linked,reservedLinked:linked,freeToUse:cp.unearmarked,
@@ -5365,6 +5468,15 @@ function planImport(data){
     else if(JSON.stringify(SETUP)!==JSON.stringify(ls)){rep.conflicts++;rep.notes.push('The backup has a different account setup; your current setup is kept.');}
     else rep.skipped++;
   }
+  // Imported entries are stored as they are, legacy (quick-capture) account ids included; balances read
+  // them through the current mapping (F.sideStatus). Say so, and which of them stay unresolved.
+  if(isLive()){
+    var newTx=ops.filter(function(o){return o.store==='transactions';}).map(function(o){return o.put;});
+    var leg=newTx.filter(function(t){return F.LEGACY_ACCOUNTS[t.fromAcct]||F.LEGACY_ACCOUNTS[t.toAcct];}).length;
+    var mvI=F.movementReview(ACCOUNTS,newTx,{baselineDate:SETUP.baselineDate,aliases:SETUP.aliases}),heldI=F.unreconciledInflows(ACCOUNTS,newTx,{baselineDate:SETUP.baselineDate,aliases:SETUP.aliases});
+    if(leg)rep.notes.push(leg+' imported entr'+(leg>1?'ies use':'y uses')+' quick-capture account names (Personal Cash, Pharmacy Cash…). They are kept as recorded and follow your current quick-capture mapping.');
+    if(mvI.unresolved.length)rep.notes.push(mvI.unresolved.length+' imported entr'+(mvI.unresolved.length>1?'ies have':'y has')+' an unresolved account side (set to "Not used", not set up, or no account). Only the mapped side moves a balance'+(heldI.total?'; ₦'+heldI.total.toLocaleString('en-NG')+' received from unresolved accounts will not count as confirmed pharmacy cash':'')+' until reconciled in Settings → Accounts or by editing the entries.');
+  }
   if(rep.namesFixed)rep.notes.push(rep.namesFixed+' "paid to / received from" name'+(rep.namesFixed>1?'s were':' was')+' not valid text, did not fit the entry type or was too long, and '+(rep.namesFixed>1?'were':'was')+' removed or shortened. The entries themselves are imported.');
   rep.nextId=maxId;
   return{ops:ops,report:rep};
@@ -5436,7 +5548,9 @@ function doCapture(){
   if(!(e.amount>0)){showToast('Enter the amount without a minus sign: the type decides whether money goes out or comes in. Nothing was saved.');return;}
   var item={id:newTxnId(),amount:e.amount,desc:e.desc,cat:e.cat,type:e.type,vehicle:e.vehicle,fromAcct:resolveAcct(e.fromAcct),toAcct:resolveAcct(e.toAcct),state:e.state,date:getToday(),time:getNow()};
   if(e.partyField)item[e.partyField]=e[e.partyField];
-  if((e.fromAcct&&!item.fromAcct)||(e.toAcct&&!item.toAcct))item.state='Needs Review'; // role set to "Not used": no account assumed
+  // A side whose quick-capture account is "Not used" (or not set up) keeps its legacy id and stays
+  // unresolved: no account is assumed, and the entry is marked for review. Outside KoboFlow is a choice.
+  if(isLive()){var capIds=ACCOUNTS.map(function(a){return a.id;});['from','to'].forEach(function(sd){if(e[sd+'Acct']&&F.sideStatus(item,sd,SETUP.aliases,capIds).status==='unresolved')item.state='Needs Review';});}
   capPending[v]=true;
   saveEntry(item,'Quick entry "'+v+'"').then(function(ok){
     delete capPending[v];

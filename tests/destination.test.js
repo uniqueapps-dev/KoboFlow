@@ -550,6 +550,35 @@ test('TEST build: quick entry "@ name" is split off before parsing; unclear entr
   await context.close();
 });
 
+// A message shown while an earlier one is still up must stay for its own full time. Each message used to
+// start its own hide timer without cancelling the previous one, so the earlier timer hid the newer message
+// early: a refusal could vanish ~200 ms after appearing. That was the intermittent timeout in the test
+// above (its click went through just as an older message was hidden, and a still-pending older timer then
+// hid the refusal before it could be seen). Clock paused, clicks dispatched directly: deterministic.
+for (const b of BUILDS) {
+  test(`${b.label}: a message shown while another is up stays for its full time (an earlier timer never hides it)`, { skip }, async () => {
+    const { context, page } = await ctx();
+    await page.clock.install({ time: new Date('2026-10-28T09:00:00') });
+    await openApp(page, b.url);
+    await page.clock.pauseAt(new Date('2026-10-28T09:00:10'));
+    const refuse = v => page.evaluate(v => { document.getElementById('capture-input').value = v; document.getElementById('capture-btn').click(); }, v);
+    const shown = () => page.evaluate(() => document.getElementById('toast').classList.contains('show'));
+    await refuse('-500 lunch');
+    assert.match(await text(page, '#toast'), /without a minus sign/);
+    await page.clock.runFor(2000);
+    await refuse('200 fuel @@ x');
+    assert.match(await text(page, '#toast'), /Use a single "@" before the name/);
+    await page.clock.runFor(300); // the first message's 2,200 ms have passed; the second has been up 300 ms
+    assert.equal(await shown(), true, 'the second message is still shown');
+    await page.clock.runFor(1850); // 2,150 ms after the second message
+    assert.equal(await shown(), true);
+    await page.clock.runFor(100); // 2,250 ms: now it goes
+    assert.equal(await shown(), false, 'and it still hides on its own timer');
+    assert.deepEqual(page.errors, []);
+    await context.close();
+  });
+}
+
 test('TEST build: History date range includes both days (late evening too), skips undated entries, combines with search, and clears', { skip }, async () => {
   const { context, page } = await ctx();
   await openApp(page, TEST.url);
