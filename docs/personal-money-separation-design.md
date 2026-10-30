@@ -4,8 +4,8 @@
   implementation authorisation. Incorporates the owner's decisions D1–D14, Q1–Q5 and R1–R4, resolves
   design problems P1–P8, and includes the final consistency and readiness review (section 24). **Documentation only:
   nothing described here as design is implemented.** No application code, test, database schema or
-  version, master plan, PBSRx, deployment or Git history was changed to write it. The document is
-  uncommitted.
+  version, master plan, PBSRx, deployment or Git history was changed to write it. Revision 6 has been
+  committed locally.
 - **Code basis:** branch `claude/koboflow-loan-management-qn2vql` at
   `03d8dee190b000457b25e298f323af8976668389` (also what the isolated TEST site serves).
 - **Relationship to the master plan:** details and extends section 3 (Owner bucket) and section 4
