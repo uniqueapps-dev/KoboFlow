@@ -895,6 +895,17 @@ remaining ₦0, over plan ₦30,000 (flagged).
 
 - Bills and agreements gain optional `purpose` (`pharmacy` / `personal` / `shared` + `split` /
   `unclassified`). Existing ones are unclassified until reviewed; new ones require a purpose (D8).
+- **Field-name dependency for stage 6 (recorded at stage 0, not resolved here).** Agreements
+  **already** have a `purpose` field with a different meaning: the funding purpose chosen on the loan
+  form (`business` / `personal` / `shared`, default `business`). Stage 0 leaves that meaning unchanged:
+  `agreements.purpose` is not a gated new field, and only `agreements.split` is. A field-presence
+  check cannot tell an obligation purpose stored in that same field from the existing one, and
+  `personal` and `shared` would silently change meaning in existing agreements and backups (an older
+  build would read a stage-6 value with the loan-form meaning). Before stage 6 is implemented the owner
+  must choose either a **separate field** for the obligation purpose on agreements (for example
+  `obligationPurpose`), gated and validated like the other new fields, or an explicit, reviewed
+  mapping from the existing values with value-based gating and validation. Bills have no `purpose`
+  today, so `bills.purpose` is unaffected.
 - A single routing function partitions each obligation occurrence's **remaining** amount, exactly
   like `scopeOf`: `{pharmacy, personal, unclassified}` summing to the remaining amount.
 
@@ -1112,7 +1123,15 @@ Either map Personal Cash (the legacy quick-capture id) to Outside and state purp
      "transactions": [ ... ], "ledgerSetup": { ... }, "ownerPlans": [ ... ], "bills": [ ... ] }
    ```
 
-   A file without `format` is format **1** (all existing backups).
+   A file without `format` is format **1** (all existing backups). A format block that says
+   `version: 1` is also format 1 and is treated identically.
+   **Format 1 never carries new-format financial data.** A format-1 file — with no format block, or
+   with one saying version 1 — that contains any gated new financial field (section 15.3), an
+   `ownerPlans` collection (even empty), or an owner-plan record in a `meta` list is refused by the
+   reader guard as damaged ("…but no format information / but is marked as format 1, so its meaning
+   cannot be trusted. Nothing was changed."), before planning, before any prompt and before any
+   write. The storage write gate (15.3) is a second line of defence, never the check that refuses such
+   a file (Stage 0 independent review, finding B1).
 2. **Reader guard, first step of `planImport`:** `SUPPORTED_FORMAT` constant in the build. If
    `format.minReader > SUPPORTED_FORMAT` → throw "This backup was made by a newer KoboFlow and needs a
    newer version to restore. Nothing was changed." Because `planImport` writes nothing and the commit
@@ -1157,12 +1176,18 @@ creation and restoration use the same format rules.
 |---|---|---|
 | 1 | Implement and test the reader guard (stage 0) with `NEW_FINANCIAL_FORMAT` off in every build | Stage 0 matrix (15.5) passes on both builds; full suite; build check |
 | 2 | Deploy the guard to **TEST** (separately authorised), still with the switch off | Pages run succeeded; `SOURCE.json` source commit recorded |
-| 3 | Verify on the **deployed TEST build** that it refuses unsupported backups and accepts supported ones | Matrix rows 1–3, 5–10 and 14 run against the deployed TEST site on a disposable profile, with recorded results |
+| 3 | Verify on the **deployed TEST build** (switch **off**) that it accepts format-1 backups and refuses everything else | On a disposable profile, with recorded results: rows 1, 2, 6, 9c and 13 **accepted**; rows 5, 7, 7b, 8, 9a, 10 and 14 **refused** with zero writes; and a format-2 file (rows 3 and 5b) **refused** with "…not enabled on this site yet. Nothing was changed." — the switch-off refusal is the expected result on a deployed site, not a failure |
 | 4 | Keep new-format writing disabled on TEST until step 3 is complete and accepted | Owner review of the step-3 evidence |
 | 5 | **Separately authorise** and deploy the guard to **production**, switch off | Production deployment evidence |
-| 6 | Verify production compatibility **independently** (same checks as step 3, on production) | Production verification record; TEST results are not accepted as evidence |
+| 6 | Verify production compatibility **independently** (same checks as step 3, on production, switch **off**; format 2 refused) | Production verification record; TEST results are not accepted as evidence |
 | 7 | Only then enable `NEW_FINANCIAL_FORMAT` on a site, by its own authorised build | Per-site enablement record |
 
+- **Format-2 acceptance is never tested on a deployed site during Stage 0.** Rows 3, 5b and 9b, and the
+  switch-on side of row 16, run only in the automated suite, on isolated in-memory builds with the
+  switch on (`build(src, {newFinancialFormat: true})`, or the production candidate with its constant
+  replaced in memory); those builds are never written to disk, committed or deployed. Neither the
+  TEST nor the production switch is enabled during Stage 0, and the switch-off refusal of format 2 is
+  never weakened to make a deployed-site check pass.
 - **Every future site or build** (another TEST origin, a new device build, a fork) must satisfy steps 3
   and 6 for itself before creating new-format backups or writing new financial fields.
 - **Residual risk:** a device still running a build without the guard (up to `03d8dee`, or production
@@ -1179,22 +1204,30 @@ object store (`transactions`, `agreements`, `instalments`, `allocations`, `agree
 "before + exactly the planned records". The tests run on a disposable browser profile with fictional
 data, on both the TEST build and the production candidate, using the existing write-failure and hold
 switches pattern (`__fail.write`, `__hold`, `__holdFail` in the current tests).
+As implemented (`tests/backup-format-guard.test.js`): the snapshot covers every object store the
+database has (the eight above and the legacy ones), each record serialised as JSON; for every refusal
+the test also counts, during the import, read-write transactions on the app database, calls into the
+storage layer (`atomic`, `atomicIf`, table `put`/`add` — the only routes from the app to the
+database, so a count of 0 means `commit` was not called) and confirmation prompts, and requires all
+three to be 0. Not covered and not claimed: browser-process crashes, operating-system crashes or power
+loss, and browsers other than Chromium.
 
 | # | Input backup condition | Expected result | Accept / refuse | Data state after | Evidence of no partial write |
 |---|---|---|---|---|---|
 | 1 | **Older valid backup** (v2 `version: '2.0'`, and v3 `version: '3.x'`) | Restored as today (v2: ids reassigned; v3: ids kept); per-record rejects counted as today | Accept | Before + planned records only | Snapshot diff equals the plan's op list |
 | 2 | **Current-format valid backup** (`version: '4.0'`, no `format` block = format 1) | Restored exactly as `03d8dee` restores it | Accept | Before + planned records | Snapshot diff equals the plan; the same fixture restored on `03d8dee` gives the identical result |
-| 3 | **New-format backup, compatible reader** (`format.version 2`, `minReader 2`; reader `SUPPORTED_FORMAT 2`) | Whole-file validation passes; restored with new fields intact | Accept | Before + planned records, new fields byte-identical to the file | Snapshot diff equals the plan |
+| 3 | **New-format backup, compatible reader** (`format.version 2`, `minReader 2`; reader `SUPPORTED_FORMAT 2`) | Whole-file validation passes; restored with new fields intact. **On a site whose switch is off** (every deployed site during Stage 0): refused, "…not enabled on this site yet. Nothing was changed." — acceptance is tested only on isolated in-memory switch-on builds (15.4) | Accept (switch on); refuse (switch off) | Before + planned records, new fields byte-identical to the file | Snapshot diff equals the plan |
 | 4 | **New-format backup, older reader** — (a) a guard build with `SUPPORTED_FORMAT 1`; (b) `03d8dee` | (a) refused: "This backup was made by a newer KoboFlow…Nothing was changed."; (b) **documented limitation**: accepted by `03d8dee` (test asserts and records this, so the risk stays visible) | (a) Refuse; (b) accepted (limitation) | (a) Unchanged | (a) Byte-identical snapshot; refusal occurs in `planImport` before any `commit` call (spy shows `commit` not called) |
 | 5 | **Unsupported future version** (`format.version 9`, `minReader 9`) | Refused with the newer-version message | Refuse | Unchanged | Byte-identical snapshot; `commit` not called |
-| 5b | Future version that is **additive** (`format.version 3`, `minReader 2`) on a `SUPPORTED_FORMAT 2` reader | Accepted; unknown additive fields kept as stored | Accept | Before + planned records | Snapshot diff equals the plan |
+| 5b | Future version that is **additive** (`format.version 3`, `minReader 2`) on a `SUPPORTED_FORMAT 2` reader | Accepted; unknown additive fields kept as stored. Switch off: refused as row 3 | Accept (switch on); refuse (switch off) | Before + planned records | Snapshot diff equals the plan |
 | 6 | **Missing format metadata** (no `format` key) | Treated as format 1 (rows 1–2 rules) | Accept | As rows 1–2 | As rows 1–2 |
 | 7 | **Malformed format metadata** (`format` not an object; `version`/`minReader` not positive integers; `minReader > version`; unknown `name`) | Refused: "The backup's format information is damaged. Nothing was changed." | Refuse | Unchanged | Byte-identical snapshot; `commit` not called |
+| 7b | **Format 1 carrying new-format financial data** — no format block, or a block saying `version: 1` — with any gated new field (purpose, split, plan link, safety check, Outside side, bill purpose, agreement split, opening date, vehicle purposes), an `ownerPlans` collection (even empty) or an owner plan in a `meta` list | Refused by the reader guard (15.2 step 1), "…but no format information / but is marked as format 1, so its meaning cannot be trusted. Nothing was changed.", in both switch states; never left to the write gate | Refuse | Unchanged | Byte-identical snapshot; no prompt; storage layer not called; no read-write transaction |
 | 8 | **Missing transactions collection** (no `transactions` key) | Refused with the existing message "This is not a KoboFlow backup (no transactions list)." | Refuse | Unchanged | Byte-identical snapshot |
 | 9 | **Invalid transactions collection** — (a) not an array; (b) format 2 with any structurally invalid record (bad split, unknown purpose, broken `ownerPlanId`); (c) format 1 with some invalid records | (a) refused (existing); (b) whole file refused, listing the first problems; (c) **unchanged existing behaviour**: invalid records counted as rejected, valid ones planned, owner confirms | (a) Refuse; (b) Refuse; (c) Accept with rejects | (a)(b) Unchanged; (c) before + valid planned records | (a)(b) byte-identical snapshot; (c) diff equals the plan; existing validation not weakened |
 | 10 | **Truncated or corrupted file** (cut mid-JSON; random bytes; empty file) | "Import failed: … Nothing was changed." (JSON parse failure, existing path) | Refuse | Unchanged | Byte-identical snapshot |
 | 11 | **Failed import** (valid file; the database write fails, simulated with `__fail.write`) | Existing failure message; nothing saved | Refuse (by failure) | Unchanged | Byte-identical snapshot: the single atomic transaction aborted |
-| 12 | **Interrupted import** (valid file; the transaction is aborted mid-way with `__holdFail`, and separately the page is closed before completion) | Nothing saved; on reload the data are as before; the import can be repeated | Refuse (by interruption) | Unchanged | Byte-identical snapshot after reload; no store contains any record from the file |
+| 12 | **Interrupted import** (valid file; the transaction is aborted mid-way with `__holdFail`, and separately the page is closed before the commit — made deterministic by holding the transaction open after every record has been put) | Nothing saved; on reload the data are as before; the import can be repeated. A page closed **after** the commit completed keeps everything (checked separately). IndexedDB guarantees the transaction is all or nothing; a crash of the browser process or the OS is not tested | Refuse (by interruption) | Unchanged | Byte-identical snapshot after reload; no store contains any record from the file |
 | 13 | **Repeated import** of the same valid file | Second run adds nothing ("Nothing new to import", existing signature and id checks) | Accept (no-op) | Same as after the first import | Snapshot after run 2 = snapshot after run 1 |
 | 14 | **Refusal leaves data unchanged** — every refusal row above, plus the owner cancelling at the confirmation prompt | No change | Refuse / cancel | Unchanged | Byte-identical snapshot for each row |
 | 15 | **Successful import is all-or-nothing** — a large valid file, with a forced failure on its last record | Either all planned records are present or none | — | All or none | Count per store equals before or before + plan, never in between; checked for the forced-failure run (none) and the clean run (all) |
@@ -1524,8 +1557,9 @@ backup rules. The master plan should be updated separately if the owner approves
 7. **Regression:** all existing import/export, restore and backup tests unchanged — including the
    existing H-1 restore behaviour (ownership confirmations reset, `use` and `sharedPortion` preserved),
    which stage 0 must not alter; full suite.
-8. **Completion criteria:** matrix passes; existing tests pass unchanged; both builds export format 1;
-   the switch is off in both outputs.
+8. **Completion criteria:** matrix passes (including row 7b: format 1, with or without a format block,
+   carrying new-format data is refused by the reader); existing tests pass unchanged; both builds
+   export format 1; the switch is off in both outputs; deployed sites refuse format 2 (15.4 step 3).
 9. **Before stage 1:** owner approval. Before **any** site enables `NEW_FINANCIAL_FORMAT`: section
    15.4 steps 2–7 for that site (deployment and verification are separate authorisations).
 
@@ -1632,7 +1666,8 @@ backup rules. The master plan should be updated separately if the owner approves
 
 ### Stage 6 — Obligation purposes and the conservative safe amount
 
-1. **Scope:** `purpose`/`split` on bills and agreements; router (12.1); safe amount (12.2); required
+1. **Scope:** `purpose`/`split` on bills and agreements (on agreements, subject to the field-name
+   decision in 12.1: the existing `agreements.purpose` keeps its funding meaning); router (12.1); safe amount (12.2); required
    purpose on new obligations; review area.
 2. **Dependencies:** stages 1, 3, 5; D8, Q2.
 3. **Areas:** bill and agreement forms, `allObligations`, `directorPlan` inputs, Calendar, Pressure,

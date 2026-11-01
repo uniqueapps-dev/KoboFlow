@@ -135,6 +135,24 @@
    automatically. See docs/bills-and-database-v4.md. */
 (function(g){
   var DB_VERSION  = 4;
+  /* Per-site switch (design section 15.3, R2). Off: this site writes no new-format financial field
+     and exports format-1 backups only. It may be switched on for a site only after that site's
+     reader guard has been deployed and verified (section 15.4). The TEST build sets its own value
+     (scripts/build-test-file.js), never inheriting this one. */
+  var NEW_FINANCIAL_FORMAT = false; // TEST site setting (scripts/build-test-file.js)
+  /* Refuses, before any transaction is opened, a write of new-format financial fields while the
+     switch is off. Records are checked with the engine's newFinancialFields; if the engine is not
+     loaded the write is refused rather than allowed unchecked. */
+  function newFormatRefusal(ops) {
+    if (NEW_FINANCIAL_FORMAT) return null;
+    var check = g.KoboFin && g.KoboFin.newFinancialFields;
+    if (!check) return new Error('Storage refused the write: the finance engine is not loaded.');
+    for (var i = 0; i < ops.length; i++) {
+      var f = check(ops[i].store, ops[i].put);
+      if (f.length) { var e = new Error('This site does not store KoboFlow\u2019s new financial format yet (' + f.slice(0, 3).join(', ') + ')'); e.code = 'new_format_disabled'; return e; }
+    }
+    return null;
+  }
   var STORES = ['transactions','loans','vlogs','ownerAnalytics','cashFlowSnapshots','roiSnapshots','runwaySnapshots'];
   /* v3 stores use stable string IDs supplied by the app (no autoIncrement) */
   var V3_STORES = {
@@ -369,8 +387,8 @@
       });
     }
     return {
-      add:     function(record) { return run('readwrite', function(s){ return s.add(record); }); },
-      put:     function(record) { return run('readwrite', function(s){ return s.put(record); }); },
+      add:     function(record) { var r = newFormatRefusal([{store: storeName, put: record}]); return r ? Promise.reject(r) : run('readwrite', function(s){ return s.add(record); }); },
+      put:     function(record) { var r = newFormatRefusal([{store: storeName, put: record}]); return r ? Promise.reject(r) : run('readwrite', function(s){ return s.put(record); }); },
       get:     function(key)    { return run('readonly',  function(s){ return s.get(key); }); },
       toArray: function()       { return run('readonly',  function(s){ return s.getAll(); }); },
       clear:   function()       { return run('readwrite', function(s){ return s.clear(); }); }
@@ -405,16 +423,23 @@
   /* All-or-nothing write across several stores: ops = [{store, put:record}] */
   function atomic(ops) {
     return new Promise(function(resolve, reject) {
+      var refused = newFormatRefusal(ops);
+      if (refused) { reject(refused); return; }
       openDB(function(database) {
         if (!database) { reject(_err || new Error('Storage unavailable')); return; }
-        var names = [];
+        var names = [], tx = null;
         ops.forEach(function(o){ if (names.indexOf(o.store) < 0) names.push(o.store); });
         try {
-          var tx = database.transaction(names, 'readwrite');
-          ops.forEach(function(o){ tx.objectStore(o.store).put(o.put); });
+          tx = database.transaction(names, 'readwrite');
           tx.oncomplete = function(){ resolve(true); };
           tx.onerror = tx.onabort = function(){ reject(tx.error || new Error('Save failed')); };
-        } catch(err) { reject(err); }
+          ops.forEach(function(o){ tx.objectStore(o.store).put(o.put); });
+        } catch(err) {
+          // A put that throws part-way (an uncloneable record, say) must not let the earlier puts
+          // commit: abort the whole transaction so nothing is written.
+          if (tx) { tx.onerror = tx.onabort = null; try { tx.abort(); } catch (x) {} }
+          reject(err);
+        }
       });
     });
   }
@@ -425,12 +450,14 @@
      rejects with err.code = 'changed'. */
   function atomicIf(checks, ops) {
     return new Promise(function(resolve, reject) {
+      var refused = newFormatRefusal(ops);
+      if (refused) { reject(refused); return; }
       openDB(function(database) {
         if (!database) { reject(_err || new Error('Storage unavailable')); return; }
-        var names = [], stale = null, left = checks.length;
+        var names = [], stale = null, left = checks.length, tx = null;
         checks.concat(ops).forEach(function(o){ if (names.indexOf(o.store) < 0) names.push(o.store); });
         try {
-          var tx = database.transaction(names, 'readwrite');
+          tx = database.transaction(names, 'readwrite');
           var writeAll = function() { ops.forEach(function(o){ tx.objectStore(o.store).put(o.put); }); };
           tx.oncomplete = function(){ resolve(true); };
           tx.onerror = tx.onabort = function(){ reject(stale || tx.error || new Error('Save failed')); };
@@ -448,7 +475,11 @@
               if (--left === 0) { try { writeAll(); } catch (err) { stale = err; try { tx.abort(); } catch (x) {} } }
             };
           });
-        } catch(err) { reject(err); }
+        } catch(err) {
+          // Same rule as atomic(): a throw part-way through the writes aborts all of them.
+          if (tx) { tx.onerror = tx.onabort = null; try { tx.abort(); } catch (x) {} }
+          reject(err);
+        }
       });
     });
   }
@@ -500,6 +531,7 @@
     this.readCopy= readCopy;
     this.listCopies = listCopies;
     this.verno   = DB_VERSION;
+    this.newFinancialFormat = NEW_FINANCIAL_FORMAT;
     this.name    = DB_NAME;
     this.testName= TEST_DB;
     this.version = function() { return this; };
@@ -1743,11 +1775,124 @@ function parseManualRows(text){
   return{rows:rows,errors:errors};
 }
 
+/* ── Backup format compatibility (Stage 0; design section 15) ──
+   A backup without a `format` block is format 1 (every backup made so far). A newer backup carries
+   format: {name: 'koboflow-backup', version, minReader, features}. A reader refuses a file whose
+   minReader is above the formats it understands, refuses damaged format information, and (R2)
+   refuses any format-2 file while this site's new-financial-format switch is off: such a file may
+   hold financial fields this site must not store yet. The `transactions` collection keeps its
+   normal shape in every format. Nothing here writes anything; the caller refuses before planning. */
+var BACKUP_FORMAT_NAME='koboflow-backup',SUPPORTED_BACKUP_FORMAT=2;
+var NEW_FIN_TXN_FIELDS=['purpose','split','ownerPlanId','safetyCheck'];
+var NEW_FIN_SETUP_FIELDS=['vehiclePurposes','personalCategories','restoredAt'];
+var NEW_FIN_ACCOUNT_FIELDS=['openingDate','openingConfirmedValue','openingConfirmedAt','openingConfirmedSource','openingConfirmationState','openingConfirmationHistory','ownershipConfirmationState','ownershipConfirmationHistory'];
+function hasOwn(o,k){return !!o&&typeof o==='object'&&Object.prototype.hasOwnProperty.call(o,k);}
+/* The new-format financial fields a record would store, by store. Empty when there are none.
+   Agreements already have a `purpose` field of their own (business/personal funding purpose), so
+   only `split` is new on agreements. The '__outside' value is new only as an entry side; as a
+   quick-capture mapping value it already exists (03d8dee). */
+function newFinancialFields(store,rec){
+  var out=[];if(!rec||typeof rec!=='object')return out;
+  function f(list,o,prefix){list.forEach(function(k){if(hasOwn(o,k))out.push((prefix||'')+k);});}
+  if(store==='transactions'){
+    f(NEW_FIN_TXN_FIELDS,rec);
+    if(rec.fromAcct===OUTSIDE)out.push('fromAcct:'+OUTSIDE);
+    if(rec.toAcct===OUTSIDE)out.push('toAcct:'+OUTSIDE);
+  }else if(store==='bills'){f(['purpose','split'],rec);}
+  else if(store==='agreements'){f(['split'],rec);}
+  else if(store==='meta'){
+    if(rec.kind==='ownerPlan')out.push('ownerPlan');
+    if(rec.id==='ledgerSetup'){f(NEW_FIN_SETUP_FIELDS,rec);(rec.accounts||[]).forEach(function(a){f(NEW_FIN_ACCOUNT_FIELDS,a,'accounts.');});}
+  }
+  return out;
+}
+/* Which collection of a backup file each store's records come from. */
+var BACKUP_COLLECTIONS={transactions:'transactions',agreements:'agreements',bills:'bills'};
+function backupNewFields(data){
+  var found=[];
+  Object.keys(BACKUP_COLLECTIONS).forEach(function(store){var list=data&&data[BACKUP_COLLECTIONS[store]];
+    if(Array.isArray(list))list.forEach(function(r){newFinancialFields(store,r).forEach(function(k){if(found.indexOf(store+'.'+k)<0)found.push(store+'.'+k);});});});
+  if(data&&data.ledgerSetup)newFinancialFields('meta',data.ledgerSetup).forEach(function(k){if(found.indexOf('ledgerSetup.'+k)<0)found.push('ledgerSetup.'+k);});
+  if(data&&hasOwn(data,'ownerPlans'))found.push('ownerPlans');
+  // Owner plans are meta records; a file carrying them in a meta list would otherwise be ignored silently.
+  if(data&&Array.isArray(data.meta))data.meta.forEach(function(r){newFinancialFields('meta',r).forEach(function(k){if(found.indexOf('meta.'+k)<0)found.push('meta.'+k);});});
+  return found;
+}
+function posInt(v){return typeof v==='number'&&isFinite(v)&&v>=1&&Math.floor(v)===v;}
+/* Reads a backup's format and decides whether this reader may restore it.
+   opts: {supported: highest format this build reads, enabled: this site's new-financial-format switch}.
+   Returns {ok, format, reason, message}. reason: 'unsupported' | 'malformed' | 'not_enabled'. */
+function checkBackupFormat(data,opts){
+  opts=opts||{};var supported=opts.supported||SUPPORTED_BACKUP_FORMAT;
+  function no(reason,message,format){return{ok:false,format:format||null,reason:reason,message:message};}
+  if(!data||typeof data!=='object'||Array.isArray(data))return no('malformed','This file is not a KoboFlow backup.');
+  // Format 1, whether the format block is absent or says version 1, never carries new-format financial
+  // data (fields, owner plans): such a file is refused here, before planning, not left to the write gate.
+  function formatOne(declared){
+    var stray=backupNewFields(data);
+    if(stray.length)return no('malformed','The backup holds new-format financial data ('+stray.slice(0,3).join(', ')+') but '+(declared?'is marked as format 1':'no format information')+', so its meaning cannot be trusted.',1);
+    return{ok:true,format:1,minReader:1,reason:null,message:null};
+  }
+  if(!hasOwn(data,'format'))return formatOne(false);
+  var f=data.format;
+  if(!f||typeof f!=='object'||Array.isArray(f)||f.name!==BACKUP_FORMAT_NAME||!posInt(f.version)||!posInt(f.minReader)||f.minReader>f.version||(hasOwn(f,'features')&&!Array.isArray(f.features)))
+    return no('malformed','The backup’s format information is damaged.');
+  if(f.version===1)return formatOne(true);
+  if(f.minReader>supported)return no('unsupported','This backup was made by a newer KoboFlow (backup format '+f.version+') and needs a newer version to restore.',f.version);
+  if(f.version>=2&&!opts.enabled)return no('not_enabled','This backup uses KoboFlow’s new financial format, which is not enabled on this site yet.',f.version);
+  return{ok:true,format:f.version,minReader:f.minReader,reason:null,message:null};
+}
+/* Whole-file validation for format 2 and later (design 15.2 step 3): any structural problem refuses
+   the whole file. Format 1 keeps its existing per-record behaviour. Returns a list of problems. */
+var PURPOSES={pharmacy:1,personal:1,shared:1,unclassified:1};
+function splitProblem(sp,amount){
+  if(!sp||typeof sp!=='object')return'split is not an object';
+  if(sp.method!=='amount'&&sp.method!=='percent')return'split method must be amount or percent';
+  var p=num(sp.pharmacy),q=num(sp.personal);
+  if(p===null||q===null||p<0||q<0)return'split parts must be amounts of 0 or more';
+  if(toK(p)+toK(q)!==toK(amount))return'split parts ('+p+' + '+q+') do not add up to the amount ('+amount+')';
+  return null;
+}
+function validateBackupV2(data){
+  var errs=[];function err(t){if(errs.length<20)errs.push(t);}
+  var txs=data.transactions;
+  if(!Array.isArray(txs)){err('transactions is not a list');return errs;}
+  var plans=hasOwn(data,'ownerPlans')?data.ownerPlans:[],planIds={},periods={};
+  if(!Array.isArray(plans))err('ownerPlans is not a list');
+  else plans.forEach(function(pl,i){
+    if(!pl||typeof pl!=='object'||typeof pl.id!=='string'||pl.id.indexOf('ownerPlan:')!==0||pl.kind!=='ownerPlan'){err('owner plan '+(i+1)+' has no valid id or kind');return;}
+    if(pl.schemaVersion!==1)err('owner plan '+pl.id+' has an unsupported schema version');
+    if(!/^\d{4}-(0[1-9]|1[0-2])$/.test(String(pl.period||'')))err('owner plan '+pl.id+' has no valid period');
+    if(['draft','approved','cancelled'].indexOf(pl.status)<0)err('owner plan '+pl.id+' has an unknown status');
+    if(planIds[pl.id])err('owner plan '+pl.id+' appears twice');planIds[pl.id]=pl;
+    if(pl.status!=='cancelled'){if(periods[pl.period])err('two active owner plans for '+pl.period);periods[pl.period]=1;}
+  });
+  txs.forEach(function(t,i){
+    var n='entry '+(t&&t.id!==undefined?t.id:'#'+(i+1));
+    if(!t||typeof t!=='object'||!(Number(t.amount)>0)||!t.type||!parseDate(t.date)){err(n+' is not a valid entry');return;}
+    if(hasOwn(t,'purpose')&&!PURPOSES[t.purpose])err(n+' has an unknown purpose');
+    if(hasOwn(t,'split')){var sp=splitProblem(t.split,t.amount);if(sp)err(n+': '+sp);}
+    if(hasOwn(t,'ownerPlanId')&&!planIds[t.ownerPlanId])err(n+' links to an owner plan that is not in the backup');
+  });
+  (Array.isArray(data.bills)?data.bills:[]).forEach(function(b,i){
+    if(!b||typeof b!=='object')return;
+    if(hasOwn(b,'purpose')&&!PURPOSES[b.purpose])err('bill '+(b.id||i+1)+' has an unknown purpose');
+    if(hasOwn(b,'split')){var sp=splitProblem(b.split,b.amount);if(sp)err('bill '+(b.id||i+1)+': '+sp);}
+  });
+  var ls=data.ledgerSetup;
+  if(ls&&Array.isArray(ls.accounts))ls.accounts.forEach(function(a){
+    if(!a||!hasOwn(a,'openingDate'))return;
+    if(!parseDate(a.openingDate))err('account '+(a.label||a.id)+' has an invalid opening date');
+    else if(parseDate(ls.baselineDate)&&a.openingDate<ls.baselineDate)err('account '+(a.label||a.id)+' opens before the baseline date');
+  });
+  return errs;
+}
+
 var API={toK:toK,fromK:fromK,num:num,fmtDate:fmtDate,parseDate:parseDate,today:today,addDays:addDays,addMonths:addMonths,addPeriods:addPeriods,daysBetween:daysBetween,periodicRate:periodicRate,
   CATEGORIES:CATEGORIES,NATURES:NATURES,STRUCTURES:STRUCTURES,STATUSES:STATUSES,STATUS_LABEL:STATUS_LABEL,OPP_STRUCTURES:OPP_STRUCTURES,REMINDER_TEXT:REMINDER_TEXT,
   isDebt:isDebt,cashReceived:function(t){return fromK(cashReceivedK(t));},buildSchedule:buildSchedule,termsSummary:termsSummary,
   instalmentStates:instalmentStates,extraPrincipalInfo:extraPrincipalInfo,agreementBalances:agreementBalances,allocatePayment:allocatePayment,settlementPlan:settlementPlan,
-  classifyTxn:classifyTxn,accountDeltas:accountDeltas,accountBalances:accountBalances,mappingImpact:mappingImpact,OUTSIDE:OUTSIDE,sideStatus:sideStatus,unreconciledInflows:unreconciledInflows,movementReview:movementReview,upcomingObligations:upcomingObligations,cashForecast:cashForecast,
+  classifyTxn:classifyTxn,accountDeltas:accountDeltas,BACKUP_FORMAT_NAME:BACKUP_FORMAT_NAME,SUPPORTED_BACKUP_FORMAT:SUPPORTED_BACKUP_FORMAT,newFinancialFields:newFinancialFields,backupNewFields:backupNewFields,checkBackupFormat:checkBackupFormat,validateBackupV2:validateBackupV2,accountBalances:accountBalances,mappingImpact:mappingImpact,OUTSIDE:OUTSIDE,sideStatus:sideStatus,unreconciledInflows:unreconciledInflows,movementReview:movementReview,upcomingObligations:upcomingObligations,cashForecast:cashForecast,
   buildReminders:buildReminders,xirr:xirr,ACCOUNT_KINDS:ACCOUNT_KINDS,LEGACY_ACCOUNTS:LEGACY_ACCOUNTS,bucketSummary:bucketSummary,accountAccess:accountAccess,cashPosition:cashPosition,cashCover:cashCover,reservationPlan:reservationPlan,coveredAmount:coveredAmount,
   OWNERSHIP:OWNERSHIP,accountOwnership:accountOwnership,ownershipConfirmed:ownershipConfirmed,sharedPortion:sharedPortion,pharmacyEligibleAccounts:pharmacyEligibleAccounts,pharmacyCashPosition:pharmacyCashPosition,BILL_REPEAT:BILL_REPEAT,BILL_UNITS:BILL_UNITS,billRepeatLabel:billRepeatLabel,billCustomOk:billCustomOk,billDueDates:billDueDates,billAmountOn:billAmountOn,billOccurrences:billOccurrences,billObligations:billObligations,billUnmatchedPayments:billUnmatchedPayments,validateBill:validateBill,dataQuality:dataQuality,incomeFromFindings:incomeFromFindings,dupName:dupName,PARTY_MAX:PARTY_MAX,dateKey:dateKey,inDateRange:inDateRange,partyField:partyField,cleanParty:cleanParty,partyKey:partyKey,clipParty:clipParty,budgetProgress:budgetProgress,directorPlan:directorPlan,spendingRunway:spendingRunway,validateSetup:validateSetup,cashFlowSummary:cashFlowSummary,oppRepayments:oppRepayments,analyzeOpportunity:analyzeOpportunity,oppToTerms:oppToTerms,parseManualRows:parseManualRows};
 root.KoboFin=API;
@@ -3494,7 +3639,7 @@ function savedButNotShown(err,what){
 function errText(err){return err&&err.message?err.message:String(err);}
 /* Toast, persistent red bar and an alert: a failure must not be missed. */
 function reportFailure(m){showToast(m);showDialogWarning(m);try{alert(m);}catch(e){}}
-function failSave(err){console.error(err);reportFailure('Could not save: '+errText(err)+'. Nothing was changed.');}
+function failSave(err){console.error(err);reportFailure('Could not save: '+errText(err).replace(/[.\s]+$/,'')+'. Nothing was changed.');} // no doubled full stop when the error text ends with one
 /* Some Android viewers block kfConfirm()/kfPrompt() and return cancel instantly.
    Detect that and say so on screen instead of silently doing nothing. */
 function showDialogWarning(msg){var el=qs('dialog-warning');if(!el)return;el.removeAttribute('data-entry');el.style.display='block';el.innerHTML='&#9888; '+esc(msg)+' <button class="act-btn act-dismiss" onclick="this.parentNode.style.display=\'none\'">OK</button>';}
@@ -5344,7 +5489,13 @@ function exportJSON(){
     var ls=r.meta.find(function(m){return m.id==='ledgerSetup';}),setup=ls&&ls.mode==='live'?ls:null;
     var data={app:'KoboFlow',testDatabase:"KoboFlowDB-test",version:'4.0',exported:new Date().toISOString(),ledgerSetup:setup,transactions:txs,agreements:r.agreements,instalments:r.instalments,allocations:r.allocations,agreementEvents:r.agreementEvents,opportunities:r.opportunities,bills:r.bills,
       accounts:ACCOUNTS.map(function(a){return{id:a.id,label:a.label,opening:a.opening};})};
-    dlFile('koboflow_TEST_backup_'+getToday()+'.json',JSON.stringify(data,null,2),'application/json');
+    // Backup format (design 15.2, R2): format 1 (no format block, exactly as before) unless this site's
+    // new-financial-format switch is on. A build never writes a format it cannot read.
+    if(db.newFinancialFormat){
+      data.format={name:F.BACKUP_FORMAT_NAME,version:2,minReader:2,features:[]};
+      if(data.format.version>F.SUPPORTED_BACKUP_FORMAT)throw new Error('this build cannot write backup format '+data.format.version);
+    }
+    dlFile('koboflow_TEST_backup_'+getToday()+(data.format?'_format'+data.format.version:'')+'.json',JSON.stringify(data,null,2),'application/json');
     showToast('JSON backup exported');
     return data;
   }).catch(function(err){
@@ -5417,6 +5568,18 @@ function resetRestoredOwnership(ls){
 /* Import is additive and idempotent: records already present (same id, or same
    transaction signature) are skipped; records whose links cannot be resolved are rejected. */
 function planImport(data){
+  // Reader guard (Stage 0, design 15.2): decided before anything else is read or planned, so an
+  // unsupported, damaged or not-yet-enabled backup, or a format-1 file (with or without a format block)
+  // carrying new-format financial data, is refused before any prompt or write. The storage write gate
+  // is a second line of defence, not a substitute for this check.
+  var fc=F.checkBackupFormat(data,{supported:F.SUPPORTED_BACKUP_FORMAT,enabled:db.newFinancialFormat});
+  if(!fc.ok)throw new Error(fc.message);
+  if(fc.format>=2){
+    var bad=F.validateBackupV2(data);
+    if(bad.length)throw new Error('The backup failed validation, so none of it was restored: '+bad.slice(0,5).join('; ')+(bad.length>5?'; and more.':'.'));
+    // Owner plans are restored only by a build that stores them (stage 7); never dropped silently.
+    if(Array.isArray(data.ownerPlans)&&data.ownerPlans.length)throw new Error('This backup contains owner plans, which this version of KoboFlow cannot restore yet.');
+  }
   var rep={added:{},skipped:0,conflicts:0,rejected:0,notes:[]},ops=[];
   function add(store,rec){ops.push({store:store,put:rec});rep.added[store]=(rep.added[store]||0)+1;}
   // An edited entry also claims its earlier signatures, so an older backup cannot bring the pre-edit version back.

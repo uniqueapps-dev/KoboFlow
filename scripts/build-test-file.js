@@ -38,8 +38,16 @@ function replaceOnce(s, from, to, what) {
 const sha256 = buf => crypto.createHash('sha256').update(buf).digest('hex');
 const read = rel => fs.readFileSync(path.join(ROOT, rel));
 
-function build(src) {
+// opts.newFinancialFormat: the TEST site's own new-financial-format switch (design 15.3, R2).
+// Always set explicitly here, so the TEST site never inherits production's value. Off unless a
+// caller passes true; enabling it on the deployed TEST site needs separate authorisation after that
+// site's reader guard has been verified (design 15.4). There is deliberately no CLI flag for it.
+function build(src, opts) {
   let s = src;
+  const nff = !!(opts && opts.newFinancialFormat === true);
+  const sw = s.match(/\n  var NEW_FINANCIAL_FORMAT = (true|false);\n/g) || [];
+  if (sw.length !== 1) throw new Error(`build-test-file: expected exactly one NEW_FINANCIAL_FORMAT switch, found ${sw.length}`);
+  s = s.replace(/\n  var NEW_FINANCIAL_FORMAT = (true|false);\n/, () => `\n  var NEW_FINANCIAL_FORMAT = ${nff}; // TEST site setting (scripts/build-test-file.js)\n`);
 
   // 1. Guard first: before any app script runs, make the live database unreachable.
   //    Security boundary: this protects code running in the test page itself. IndexedDB
@@ -180,7 +188,7 @@ function build(src) {
 
   // 4. Files exported from the test build are clearly labelled.
   s = replaceOnce(s, "dlFile('koboflow_'+getToday()+'.csv'", "dlFile('koboflow_TEST_'+getToday()+'.csv'", 'CSV filename');
-  s = replaceOnce(s, "dlFile('koboflow_backup_'+getToday()+'.json'", "dlFile('koboflow_TEST_backup_'+getToday()+'.json'", 'JSON filename');
+  s = replaceOnce(s, "dlFile('koboflow_backup_'+getToday()+", "dlFile('koboflow_TEST_backup_'+getToday()+", 'JSON filename');
   s = replaceOnce(s, "var data={app:'KoboFlow',version:'4.0',", "var data={app:'KoboFlow',testDatabase:" + JSON.stringify(TEST_DB) + ",version:'4.0',", 'backup header');
 
   // 5. Separate PWA identity: test manifest, test icons, test service worker.
@@ -242,12 +250,12 @@ function git(args) {
 }
 
 // Returns the complete test site as an ordered list of [relativePath, Buffer].
-function buildTestSite() {
+function buildTestSite(opts) {
   const prodSw = read('sw.js').toString('utf8');
   const version = JSON.parse(read('package.json')).version;
   if (swVersion(prodSw) !== version) throw new Error(`build-test-file: sw.js VERSION ${swVersion(prodSw)} does not match package.json ${version}`);
   const files = [
-    ['index.html', Buffer.from(build(read('koboflow.html').toString('utf8')))],
+    ['index.html', Buffer.from(build(read('koboflow.html').toString('utf8'), opts))],
     ['test-manifest.json', Buffer.from(buildManifest(read('manifest.json').toString('utf8')))],
     ['test-sw.js', Buffer.from(buildServiceWorker(prodSw))],
     ['icons/test-icon-192.png', read('icons/test-icon-192.png')],
@@ -263,6 +271,7 @@ function buildTestSite() {
     version,
     database: TEST_DB,
     cacheNamespace: TEST_PREFIX,
+    newFinancialFormat: !!(opts && opts.newFinancialFormat === true),
     inputs: Object.fromEntries(INPUTS.map(p => [p, sha256(read(p))])),
     files: Object.fromEntries(files.map(([p, b]) => [p, sha256(b)])),
   };
