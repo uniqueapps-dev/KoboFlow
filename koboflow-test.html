@@ -1775,6 +1775,348 @@ function parseManualRows(text){
   return{rows:rows,errors:errors};
 }
 
+/* ── Classification layer: scopeOf, the obligation router and the measures table (Stage 1;
+   design sections 5, 6 and 12.1) ──
+   Read-only and pure: nothing here writes, stores or changes an entry, an agreement, a balance or a
+   report. The cash layer (accountDeltas, accountBalances, pharmacyCashPosition) is unchanged and is the
+   only thing that moves money; classifyTxn is unchanged and still decides the nature of an entry.
+   scopeOf decides only which position an entry belongs to, as an exact partition of its amount in kobo:
+   parts.pharmacy + parts.personal + parts.unclassified === toK(amount); for a loan repayment the exact
+   partition is over its components (5.1), which are the only classification inputs to the measures.
+   Stage 1 limits (each a later stage's work, not decided here): no stored vehicle purposes, so no
+   vehicle default exists unless a caller supplies vehiclePurposes (the app does not); no per-account
+   opening dates (the global baseline applies, including for the R-open pre-opening parts); the Shared
+   pharmacy portion stays the static ceiling of pharmacyCashPosition; agreements' existing `purpose`
+   field (loan funding purpose) is never read as an obligation purpose (stage 6 field-name decision,
+   design 12.1); interest and fees have no position before stage 6 (all unresolved finance cost).
+   Agreements are read only to check a capital injection's agreement nature (N3b). Where the design
+   gives no rule for a case, the entry is unclassified ("otherwise unclassified", 5.2 rule 5): nothing is
+   inferred from category, description, cash-ness or a parser default (5.5). */
+var SCOPE_SINGLE={income:'to',expense:'from',obligation:'from'};
+var SCOPE_MOVE={transfer:1,owner_withdrawal:1,investment:1};
+var SCOPE_KINDS=['pharmacy','personal','shared','owner_withdrawal','owner_contribution','pharmacy_internal','personal_internal','cross_pharmacy_paid_personal','cross_personal_paid_pharmacy','financing','loan_repayment','external_funding','unclassified'];
+var SCOPE_EXTERNAL_FUNDING={equity:1,gift:1,profit_share:1,other_non_loan:1}; // third-party non-loan funding (5.1, N3a)
+/* Index of the set-up accounts, the mapping and (read-only) the stored agreements, built once and passed
+   to scopeOf for every entry. An agreement id that appears more than once is not trusted (no record). */
+function scopeContext(accounts,opts){
+  opts=opts||{};var byId={},ids={},agr=Object.create(null),dup=Object.create(null);
+  (accounts||[]).forEach(function(a){if(a&&a.id){byId[a.id]=a;ids[a.id]=true;}});
+  (Array.isArray(opts.agreements)?opts.agreements:[]).forEach(function(a){
+    if(!a||typeof a!=='object'||typeof a.id!=='string'||!a.id)return;
+    if(a.id in agr)dup[a.id]=true;else agr[a.id]=a;
+  });
+  Object.keys(dup).forEach(function(id){delete agr[id];});
+  return{scopeContext:true,byId:byId,ids:ids,agreementsById:agr,aliases:opts.aliases||{},vehiclePurposes:opts.vehiclePurposes||{},vehicleOf:typeof opts.vehicleOf==='function'?opts.vehicleOf:null};
+}
+/* One side of an entry, with the CONFIRMED ownership of its account (ownershipConfirmed): an account
+   whose Used For is not chosen or not confirmed is 'unconfirmed', never a default. An empty side that
+   the type needs is 'none' + missing (historical empty source, 5.5), not an account. */
+function scopeSide(t,side,ctx){
+  var key=side==='from'?t.fromAcct:t.toAcct,s=sideStatus(t,side,ctx.aliases,ctx.ids);
+  var out={side:side,status:s.status,ownership:'none',acct:s.acct||null};
+  if(!key&&s.status==='unresolved'){out.status='none';out.missing=true;}
+  if(key===OUTSIDE){out.status='outside';out.acct=null;} // an Outside side stored on the entry itself (design 8.2; written only from stage 3)
+  if(out.status==='mapped'){var a=ctx.byId[s.acct],own=accountOwnership(a);out.ownership=own&&ownershipConfirmed(a)?own:'unconfirmed';}
+  return out;
+}
+function scopeBucket(own){return own==='business'?'pharmacy':own==='personal'?'personal':null;}
+function scopeAll(bucket,k){var o={pharmacy:0,personal:0,unclassified:0};o[bucket]=k;return o;}
+function scopeStatusFlag(p){
+  if(p.missing)return'missing_source';
+  if(p.status==='outside')return'outside_needs_purpose';
+  if(p.status==='unresolved')return'unresolved_source';
+  if(p.status==='mapped'&&p.ownership==='unconfirmed')return'unconfirmed_account';
+  return null;
+}
+/* Informational parts (5.1): the position of the account the money left or, for money arriving from
+   outside, the account it arrived in. Never read by a measure. */
+function scopeInfoParts(p,k){var b=p&&p.status==='mapped'?scopeBucket(p.ownership):null;return scopeAll(b||'unclassified',k);}
+/* Income, expense and obligation entries (5.2). The payer is the paying side (From) of an expense or
+   obligation and the receiving side (To) of income. */
+function scopeSingle(t,ctx,k){
+  var income=t.type==='income',p=scopeSide(t,SCOPE_SINGLE[t.type],ctx),flags=[];
+  function res(kind,parts,basis){return{kind:kind,parts:parts,basis:basis,payer:p,flags:flags};}
+  function unc(flag){if(flag&&flags.indexOf(flag)<0)flags.push(flag);return res('unclassified',scopeAll('unclassified',k),'none');}
+  var payerPos=p.status==='mapped'?scopeBucket(p.ownership):null,shared=p.status==='mapped'&&p.ownership==='shared',sideFlag=scopeStatusFlag(p);
+  var vid=ctx.vehicleOf?ctx.vehicleOf(t):(t.vehicle||null),vp=vid?ctx.vehiclePurposes[vid]:null;
+  var vehPos=vp==='pharmacy'||vp==='personal'?vp:null; // a Shared or Unclassified vehicle purpose gives no default
+  var disagree=!!(payerPos&&vehPos&&payerPos!==vehPos);
+  // Income with no receiving account is ALWAYS unresolved income (5.2 rule 5; P-D13b; section 6
+  // "Unresolved income": "no receiving account (always, even with an explicit purpose)").
+  if(income&&p.missing)return unc('missing_source');
+  // 1. Explicit split: exact kobo partition, or unclassified (never applied "nearly").
+  if(hasOwn(t,'split')){
+    if(splitProblem(t.split,t.amount))return unc('split_does_not_reconcile');
+    var ph=toK(num(t.split.pharmacy)),pe=k-ph;
+    return res(ph&&pe?'shared':ph?'pharmacy':'personal',{pharmacy:ph,personal:pe,unclassified:0},'explicit_split');
+  }
+  // Income into a Shared account needs a valid split (rule 3, Q-13): rule 2 does not apply, whatever
+  // purpose is carried.
+  if(income&&shared)return unc('shared_needs_purpose');
+  // 2. Explicit purpose (set only by the owner). Purpose and confirmed ownership are both kept (P-D6).
+  if(hasOwn(t,'purpose')){
+    if(t.purpose==='pharmacy'||t.purpose==='personal'){
+      if(disagree)flags.push('default_conflict_resolved'); // Q4: the resolved conflict stays visible
+      if(payerPos&&payerPos!==t.purpose){
+        flags.push('purpose_differs_from_payer');
+        // Income: unresolved until a cross-boundary rule for receipts is decided (Q-N2 / N2; stage 3).
+        // Receiving money is never an owner withdrawal or an owner contribution.
+        if(income)return res('unclassified',scopeAll('unclassified',k),'none');
+        // Spending: a deliberate cross-boundary statement (5.4).
+        return res(t.purpose==='personal'?'cross_pharmacy_paid_personal':'cross_personal_paid_pharmacy',scopeAll(t.purpose,k),'explicit_purpose');
+      }
+      if(shared)flags.push('shared_payer');      // spending paid from a Shared account: information only
+      else if(sideFlag)flags.push(sideFlag);     // no confirmed ownership: the side's warning is kept
+      return res(t.purpose,scopeAll(t.purpose,k),'explicit_purpose');
+    }
+    // 'shared' without a valid split, 'unclassified' ("I don't know") or anything else: no default applies.
+    return unc(t.purpose==='shared'?'shared_needs_purpose':sideFlag);
+  }
+  // 3. A Shared payer needs an explicit purpose or split; its declared portion is never applied per entry.
+  if(shared)return unc('shared_needs_purpose');
+  // 4. Defaults: confirmed ownership, vehicle purpose; two that disagree give no default (Q4).
+  if(disagree)return unc('defaults_disagree');
+  if(payerPos)return res(payerPos,scopeAll(payerPos,k),'account_ownership');
+  if(vehPos){if(sideFlag)flags.push(sideFlag);return res(vehPos,scopeAll(vehPos,k),'vehicle_default');}
+  // 5. No usable default.
+  return unc(sideFlag);
+}
+/* Transfers, owner withdrawals, investments (5.3) and capital injections reliably identified as the
+   owner's own money: by the confirmed ownership of BOTH sides; purpose does not apply. Outside → Business
+   is an owner contribution ONLY for such a capital injection (ownMoney); any other movement from outside
+   into a Business account is unclassified. Parts are informational (5.1). */
+function scopeMove(t,ctx,k,ownMoney){
+  var fr=scopeSide(t,'from',ctx),to=scopeSide(t,'to',ctx),flags=[];
+  function res(kind,bucket){return{kind:kind,parts:scopeAll(bucket,k),basis:'movement_rule',payer:bucket&&fr.status==='mapped'?fr:to,from:fr,to:to,flags:flags};}
+  function unc(){[fr,to].forEach(function(p){var f=p.ownership==='shared'?'shared_needs_purpose':scopeStatusFlag(p);if(f&&flags.indexOf(f)<0)flags.push(f);});
+    return{kind:'unclassified',parts:scopeAll('unclassified',k),basis:'none',payer:fr.status==='mapped'?fr:to,from:fr,to:to,flags:flags};}
+  var a=fr.status==='mapped'?fr.ownership:fr.status==='outside'?'outside':'x',b=to.status==='mapped'?to.ownership:to.status==='outside'?'outside':'x';
+  // Shared movements need the movement's explicit split (design 9.2): stage 5. Until then unclassified.
+  if(a==='shared'||b==='shared')return unc();
+  if(a==='business'&&b==='business')return res('pharmacy_internal','pharmacy');
+  if(a==='personal'&&b==='personal')return res('personal_internal','personal');
+  if(a==='business'&&(b==='personal'||b==='outside'))return res('owner_withdrawal','pharmacy');
+  if(a==='personal'&&b==='business')return res('owner_contribution','personal');
+  if(a==='outside'&&b==='business'&&ownMoney)return res('owner_contribution','pharmacy');
+  return unc(); // unresolved, unconfirmed, not chosen, or a pairing the design does not define
+}
+/* The stored agreement an entry refers to, or null (missing, malformed, deleted or ambiguous id). */
+function scopeAgreement(id,ctx){return typeof id==='string'&&id&&ctx.agreementsById&&(id in ctx.agreementsById)?ctx.agreementsById[id]:null;}
+/* Loan receipts and capital injections (5.1, 5.3 "Capital injections and loan receipts"): the stored
+   type and fields decide; nothing is inferred from category text, description or amount, except the
+   legacy loan form that classifyTxn already recognises. */
+function scopeFunding(t,ctx,k){
+  var to=scopeSide(t,'to',ctx);
+  function fin(kind){return{kind:kind,parts:scopeInfoParts(to,k),basis:'financing_rule',payer:to,flags:[]};}
+  if(t.type==='loan_receipt')return fin('financing');                       // P-D2: whatever the receiving account
+  if(t.cat==='Loan'&&!t.fundingKind)return fin('financing');                // N1: legacy "loan received" capture
+  var fk=t.fundingKind;
+  if(typeof fk==='string'&&Object.prototype.hasOwnProperty.call(SCOPE_EXTERNAL_FUNDING,fk))return fin('external_funding'); // N3a
+  if(fk==='capital_injection'){
+    // N3b: the owner's own money only when the agreement is found and its actual nature is checked each time.
+    var agr=scopeAgreement(t.agreementId,ctx),terms=agr&&agr.terms;
+    if(terms&&typeof terms==='object'&&terms.nature==='capital_injection')return scopeMove(t,ctx,k,true);
+  }
+  // Fail-safe (N3b): no fundingKind, an unknown one, or no confirmed own-money agreement. Never an owner
+  // contribution; pending owner review (stage 3).
+  var fr=scopeSide(t,'from',ctx);
+  return{kind:'unclassified',parts:scopeAll('unclassified',k),basis:'none',payer:to,from:fr,to:to,flags:['funding_source_unconfirmed']};
+}
+/* One raw allocation component in kobo: absent (undefined or null) is 0; anything else must be a finite,
+   non-negative number with no fraction of a kobo. -1 = invalid. */
+function scopeRawK(v){
+  if(v===undefined||v===null)return 0;
+  if(typeof v!=='number'||!isFinite(v)||v<0)return -1;
+  var x=v*K;return Math.abs(x-Math.round(x))>1e-6?-1:Math.round(x);
+}
+/* Repayment components from the entry's stored allocation (alloc), read only (5.1; owner decisions Q1,
+   Q2). Exact partition: principal + financeCost.(pharmacy + personal + unclassified) +
+   repaymentSplitPending === k. Before stage 6 interest and fees have no position (all unclassified).
+   A missing allocation, an invalid one (a raw component that is not a valid amount, components above the
+   payment, a provisional allocation that claims a split, or a stored unsplit amount inconsistent with the
+   others) makes the WHOLE amount provisional: nothing is lost and nothing is counted twice.
+   A repayment amount that is not positive (k <= 0, after the legacy Number(amount) || 0 reading) has
+   all components zero (approved plan 3.2): it never creates a negative provisional amount and can never
+   reduce the conservative burn. Its stored amount still moves in the cash layer (unchanged). */
+function scopeComponents(t,k){
+  var al=t.alloc,c={principal:0,financeCost:{pharmacy:0,personal:0,unclassified:0},repaymentSplitPending:0};
+  function whole(check){c.repaymentSplitPending=k;return{components:c,allocCheck:check};}
+  if(k<=0)return{components:c,allocCheck:k===0?'none':'non_positive_amount'}; // all components zero (plan 3.2)
+  if(!al||typeof al!=='object'||Array.isArray(al))return whole('missing');
+  var p=scopeRawK(al.principal),i=scopeRawK(al.interest),f=scopeRawK(al.fees),hasU=al.unsplit!==undefined&&al.unsplit!==null,u=hasU?scopeRawK(al.unsplit):0;
+  if(p<0||i<0||f<0||u<0||p+i+f>k)return whole('invalid');
+  if(hasU&&p+i+f+u!==k)return whole('invalid');                  // stored unsplit inconsistent with the payment
+  if(t.allocMode==='provisional'&&p+i+f>0)return whole('invalid'); // a provisional allocation claiming a split
+  c.principal=p;c.financeCost.unclassified=i+f;c.repaymentSplitPending=k-p-i-f;
+  return{components:c,allocCheck:c.repaymentSplitPending===0?'confirmed':c.repaymentSplitPending===k?'provisional':'partial'};
+}
+/* A loan repayment entry (5.1, 5.2 heading): classified by its components, never by the entry's purpose
+   or split before stage 6. Its cash moves once, in full, in the cash layer (unchanged). */
+function scopeRepayment(t,ctx,k){
+  var p=scopeSide(t,'from',ctx),r=scopeComponents(t,k),flags=[],st=scopeStatusFlag(p);
+  if(r.components.repaymentSplitPending!==0)flags.push('repayment_split_pending');
+  if(st)flags.push(st);
+  return{kind:'loan_repayment',parts:scopeInfoParts(p,k),basis:'financing_rule',payer:p,components:r.components,allocCheck:r.allocCheck,flags:flags};
+}
+/* The single classification of one live entry (design 5.1). Voided and sample entries are not
+   classified (null). */
+function scopeOf(t,ctx){
+  if(!t||t.voided||t.demo)return null;
+  if(!ctx||!ctx.scopeContext)ctx=scopeContext(ctx&&ctx.accounts,ctx);
+  var k=toK(Number(t.amount)||0);
+  if(t.type==='loan_receipt'||t.type==='capital_injection')return scopeFunding(t,ctx,k);
+  if(t.type==='loan_repayment')return scopeRepayment(t,ctx,k);
+  if(SCOPE_SINGLE[t.type])return scopeSingle(t,ctx,k);
+  if(SCOPE_MOVE[t.type])return scopeMove(t,ctx,k,false);
+  var p=scopeSide(t,'from',ctx);
+  return{kind:'unclassified',parts:scopeAll('unclassified',k),basis:'none',payer:p,flags:[]};
+}
+/* Obligation router (12.1), read-only: partitions an obligation occurrence's REMAINING amount like
+   scopeOf. purpose: the obligation's own purpose record ({purpose, split}) or null. Bills have no
+   purpose today, and an agreement's existing `purpose` (loan funding purpose) is not an obligation
+   purpose (stage 6 decision), so every obligation is unclassified now (D8), counted conservatively. */
+function routeObligation(ob,purpose){
+  // A loan instalment (agreementId) is never routed by a purpose record until stage 6 decides the field.
+  var k=Math.max(0,toK(ob&&ob.remaining||0)),p=ob&&ob.agreementId?{}:purpose||{},flags=[];
+  function out(parts,basis){return{id:ob&&ob.id||null,remaining:fromK(k),parts:{pharmacy:fromK(parts.pharmacy),personal:fromK(parts.personal),unclassified:fromK(parts.unclassified)},basis:basis,flags:flags};}
+  if(hasOwn(p,'split')){
+    if(!splitProblem(p.split,fromK(k))){var ph=toK(num(p.split.pharmacy));return out({pharmacy:ph,personal:k-ph,unclassified:0},'explicit_split');}
+    flags.push('split_does_not_reconcile');return out(scopeAll('unclassified',k),'none');
+  }
+  if(p.purpose==='pharmacy'||p.purpose==='personal')return out(scopeAll(p.purpose,k),'explicit_purpose');
+  if(p.purpose==='shared')flags.push('shared_needs_purpose');
+  return out(scopeAll('unclassified',k),'none');
+}
+/* The paying-side classification of the account-tested figures (section 6; owner decision R-open,
+   treatment 2): a confirmed Business account, a confirmed Shared account, or other. The entry's date is
+   never an input. */
+function scopePaySide(s){
+  var p=s&&s.payer;if(!p||p.side!=='from'||p.status!=='mapped')return'other';
+  return p.ownership==='business'?'business':p.ownership==='shared'?'shared':'other';
+}
+/* Sums of the classification of live entries dated from..to (inclusive), by the measures table. Every
+   kobo of every entry goes to exactly one exclusive bucket (`excl`); the owner-withdrawal and
+   owner-contribution totals also carry the approved cross-boundary double statements (5.4). The
+   pre-opening parts are "of which" parts of their Business or Shared figure, never added again. */
+function scopeTotals(txns,ctx,from,to,baselineDate){
+  function acct(){return{business:0,businessPreOpening:0,shared:0,sharedPreOpening:0,other:0};}
+  var z={opex:0,personal:0,unresSpend:acct(),finPh:0,finPe:0,finUnres:acct(),prov:acct(),withdrawals:0,contributions:0,
+    receiptsPh:0,incomePe:0,incomeUnres:0,allIncome:0,financingReceipts:0,principal:0,external:0,unresMoves:0,capUnconfirmed:0,unknownType:0,
+    kindWithdrawal:0,kindContribution:0,internal:0,card:{pharmacy:0,personal:0,unclassified:0},total:0,kinds:{},entries:[]};
+  function add(b,side,pre,v){b[side]+=v;if(pre&&side!=='other')b[side+'PreOpening']+=v;}
+  (txns||[]).forEach(function(t){
+    var d=String(t&&t.date||'').slice(0,10);if(!d||(from&&d<from)||(to&&d>to))return;
+    var s=scopeOf(t,ctx);if(!s)return;
+    var P=s.parts,c=s.components,k=c?c.principal+c.financeCost.pharmacy+c.financeCost.personal+c.financeCost.unclassified+c.repaymentSplitPending:P.pharmacy+P.personal+P.unclassified;
+    var side=scopePaySide(s),pre=side!=='other'&&!!(baselineDate&&d<baselineDate);
+    z.total+=k;z.kinds[s.kind]=(z.kinds[s.kind]||0)+k;
+    z.allIncome+=toK(classifyTxn(t).income); // "all recorded income": a labelled transition comparison only
+    if(t.type==='expense'||t.type==='obligation'){
+      z.opex+=P.pharmacy;z.personal+=P.personal;add(z.unresSpend,side,pre,P.unclassified);
+      z.card.pharmacy+=P.pharmacy;z.card.personal+=P.personal;z.card.unclassified+=P.unclassified;
+    }else if(t.type==='income'){
+      z.receiptsPh+=P.pharmacy;z.incomePe+=P.personal;z.incomeUnres+=P.unclassified;
+      z.card.pharmacy+=P.pharmacy;z.card.personal+=P.personal;z.card.unclassified+=P.unclassified;
+    }else if(s.kind==='loan_repayment'){
+      // Components only (P-D11e): principal is financing; interest and fees are an expense; the
+      // provisional amount is neither. The informational parts are never read.
+      z.principal+=c.principal;z.finPh+=c.financeCost.pharmacy;z.finPe+=c.financeCost.personal;
+      add(z.finUnres,side,pre,c.financeCost.unclassified);add(z.prov,side,pre,c.repaymentSplitPending);
+      z.card.pharmacy+=c.financeCost.pharmacy;z.card.personal+=c.financeCost.personal;z.card.unclassified+=c.financeCost.unclassified;
+    }else if(s.kind==='financing')z.financingReceipts+=k;
+    else if(s.kind==='external_funding')z.external+=k;
+    else if(s.kind==='owner_withdrawal')z.kindWithdrawal+=k;
+    else if(s.kind==='owner_contribution')z.kindContribution+=k;
+    else if(s.kind==='pharmacy_internal'||s.kind==='personal_internal')z.internal+=k;
+    else if(s.flags.indexOf('funding_source_unconfirmed')>=0)z.capUnconfirmed+=k;     // P-D15 (Q7: only here)
+    else if(SCOPE_MOVE[t.type]||t.type==='capital_injection')z.unresMoves+=k;          // P-D15
+    else z.unknownType+=k; // a type the design does not define: unclassified, in no section 6 figure
+    if(s.kind==='owner_withdrawal'||s.kind==='cross_pharmacy_paid_personal')z.withdrawals+=k;
+    if(s.kind==='owner_contribution'||s.kind==='cross_personal_paid_pharmacy')z.contributions+=k;
+    // The entry's stored amount (legacy Number(amount) || 0). It equals k for every entry except a repayment
+    // with a non-positive amount, whose components (and so its classified total) are zero.
+    var e={id:t.id,date:d,desc:t.desc||'',type:t.type||'',amount:fromK(toK(Number(t.amount)||0)),kind:s.kind,basis:s.basis,flags:s.flags.slice(),
+      parts:{pharmacy:fromK(P.pharmacy),personal:fromK(P.personal),unclassified:fromK(P.unclassified)}};
+    if(c)e.components={principal:fromK(c.principal),financeCost:{pharmacy:fromK(c.financeCost.pharmacy),personal:fromK(c.financeCost.personal),unclassified:fromK(c.financeCost.unclassified)},repaymentSplitPending:fromK(c.repaymentSplitPending)};
+    z.entries.push(e);
+  });
+  // The exclusive buckets: their sum equals the sum of the entries' amounts (no kobo lost or counted twice).
+  z.excl={opex:z.opex,personal:z.personal,unresSpendBusiness:z.unresSpend.business,unresSpendShared:z.unresSpend.shared,unresSpendOther:z.unresSpend.other,
+    principal:z.principal,finPh:z.finPh,finPe:z.finPe,finUnresBusiness:z.finUnres.business,finUnresShared:z.finUnres.shared,finUnresOther:z.finUnres.other,
+    provBusiness:z.prov.business,provShared:z.prov.shared,provOther:z.prov.other,receiptsPh:z.receiptsPh,incomePe:z.incomePe,incomeUnres:z.incomeUnres,
+    financingReceipts:z.financingReceipts,external:z.external,kindWithdrawal:z.kindWithdrawal,kindContribution:z.kindContribution,internal:z.internal,
+    unresMoves:z.unresMoves,capUnconfirmed:z.capUnconfirmed,unknownType:z.unknownType};
+  return z;
+}
+/* The pharmacy cash burn (section 6): pharmacy operating expenses (incl. pharmacy finance cost) +
+   unresolved spending, unresolved finance cost and provisional repayments of confirmed Business and
+   confirmed Shared accounts. The pre-opening parts are inside these parents and never added again. */
+function scopeBurnK(z){return z.opex+z.finPh+z.unresSpend.business+z.unresSpend.shared+z.finUnres.business+z.finUnres.shared+z.prov.business+z.prov.shared;}
+/* The measures table (design section 6) as ONE function returning every figure, from the cash layer
+   (unchanged) and scopeOf. opts: {aliases, agreements, baselineDate, buckets, from, to, today,
+   historyStart, vehiclePurposes, vehicleOf}. Period figures cover from..to; the runway uses the existing
+   window rules (spendingRunway: from historyStart, at least 30 and at most 90 days, up to today).
+   Read-only. */
+function financialMeasures(accounts,txns,opts){
+  opts=opts||{};var td=opts.today||today(),ctx=scopeContext(accounts,opts),bl=opts.baselineDate||null;
+  var bal=accountBalances(accounts||[],txns,{baselineDate:bl,aliases:opts.aliases});
+  var withBal=(accounts||[]).map(function(a){return Object.assign({},a,{balance:bal[a.id]});});
+  var held=unreconciledInflows(accounts||[],txns,{baselineDate:bl,aliases:opts.aliases});
+  var cash=pharmacyCashPosition(withBal,opts.buckets||[],{unreconciled:held.byAccount});
+  var p=scopeTotals(txns,ctx,opts.from||null,opts.to||null,bl);
+  // Runway: confirmed pharmacy cash (available) / average daily pharmacy cash burn over the window.
+  var start=parseDate(opts.historyStart)?String(opts.historyStart).slice(0,10):td;if(start>td)start=td;
+  var days=Math.min(RUNWAY_MAX_DAYS,daysBetween(start,td)+1),wFrom=addDays(td,1-days),w=scopeTotals(txns,ctx,wFrom,td,bl);
+  var burnK=scopeBurnK(w),reason=days<RUNWAY_MIN_DAYS?'short_history':burnK<=0?'no_spending':null,daily=fromK(burnK)/days;
+  var opexK=p.opex+p.finPh,F2=fromK;
+  return{
+    period:{from:opts.from||null,to:opts.to||null},
+    balances:bal,
+    confirmedPharmacyCash:{available:cash.available,restricted:cash.restricted,total:cash.total,heldUnresolvedInflows:held.total,warnings:cash.warnings},
+    pharmacyOperatingExpenses:F2(opexK),
+    pharmacyFinanceCost:F2(p.finPh),                                   // from stage 6; none before
+    unresolvedSpendingPharmacyAccounts:F2(p.unresSpend.business),      // confirmed Business accounts (P-D10t)
+    unresolvedSpendingPharmacyAccountsPreOpening:F2(p.unresSpend.businessPreOpening), // of which: before the effective opening date
+    unresolvedSpendingSharedAccounts:F2(p.unresSpend.shared),          // P-D10: never pharmacy opex; in the burn
+    unresolvedSpendingSharedAccountsPreOpening:F2(p.unresSpend.sharedPreOpening),
+    unresolvedSpendingOther:F2(p.unresSpend.other),
+    unresolvedFinanceCostBusinessAccounts:F2(p.finUnres.business),     // P-D11: all interest and fees before stage 6
+    unresolvedFinanceCostBusinessAccountsPreOpening:F2(p.finUnres.businessPreOpening),
+    unresolvedFinanceCostSharedAccounts:F2(p.finUnres.shared),
+    unresolvedFinanceCostSharedAccountsPreOpening:F2(p.finUnres.sharedPreOpening),
+    unresolvedFinanceCostOther:F2(p.finUnres.other),
+    provisionalRepaymentsBusinessAccounts:F2(p.prov.business),         // P-D11b: neither financing nor expense
+    provisionalRepaymentsBusinessAccountsPreOpening:F2(p.prov.businessPreOpening),
+    provisionalRepaymentsSharedAccounts:F2(p.prov.shared),
+    provisionalRepaymentsSharedAccountsPreOpening:F2(p.prov.sharedPreOpening),
+    provisionalRepaymentsOther:F2(p.prov.other),
+    pharmacyCashBurn:F2(scopeBurnK(p)),
+    personalExpenses:F2(p.personal+p.finPe),
+    personalFinanceCost:F2(p.finPe),                                   // from stage 6; none before
+    ownerWithdrawals:F2(p.withdrawals),
+    ownerContributions:F2(p.contributions),
+    pharmacyReceipts:F2(p.receiptsPh),                                 // P-D13
+    personalIncome:F2(p.incomePe),
+    unresolvedIncome:F2(p.incomeUnres),
+    allRecordedIncome:F2(p.allIncome),                                 // transition comparison only; not a pharmacy figure
+    financing:F2(p.financingReceipts+p.principal),                     // P-D2: loan receipts + principal repaid
+    externalFunding:F2(p.external),                                    // N3a
+    unresolvedAccountMovements:F2(p.unresMoves),                       // P-D15
+    capitalInjectionsSourceUnconfirmed:F2(p.capUnconfirmed),           // P-D15, N3b
+    runway:{known:!reason,reason:reason,historyDays:days,minDays:RUNWAY_MIN_DAYS,windowStart:wFrom,burn:F2(burnK),
+      dailyBurn:reason?null:daily,days:reason?null:Math.round((Number(cash.available)||0)/daily)},
+    // The read-only summary (P-D3): income, expense and obligation parts and loan interest and fees only;
+    // everything else is shown separately and never added to these totals.
+    scope:{pharmacy:F2(p.card.pharmacy),personal:F2(p.card.personal),unclassified:F2(p.card.unclassified),
+      separate:{financing:F2(p.financingReceipts+p.principal),externalFunding:F2(p.external),ownerWithdrawals:F2(p.kindWithdrawal),ownerContributions:F2(p.kindContribution),
+        internalMovements:F2(p.internal),provisionalRepayments:F2(p.prov.business+p.prov.shared+p.prov.other),unresolvedAccountMovements:F2(p.unresMoves),
+        capitalInjectionsSourceUnconfirmed:F2(p.capUnconfirmed),otherEntries:F2(p.unknownType)},
+      byKind:Object.keys(p.kinds).reduce(function(o,kd){o[kd]=F2(p.kinds[kd]);return o;},{}),
+      exclusive:Object.keys(p.excl).reduce(function(o,kd){o[kd]=F2(p.excl[kd]);return o;},{}),total:F2(p.total)},
+    entries:p.entries
+  };
+}
+
 /* ── Backup format compatibility (Stage 0; design section 15) ──
    A backup without a `format` block is format 1 (every backup made so far). A newer backup carries
    format: {name: 'koboflow-backup', version, minReader, features}. A reader refuses a file whose
@@ -1892,7 +2234,7 @@ var API={toK:toK,fromK:fromK,num:num,fmtDate:fmtDate,parseDate:parseDate,today:t
   CATEGORIES:CATEGORIES,NATURES:NATURES,STRUCTURES:STRUCTURES,STATUSES:STATUSES,STATUS_LABEL:STATUS_LABEL,OPP_STRUCTURES:OPP_STRUCTURES,REMINDER_TEXT:REMINDER_TEXT,
   isDebt:isDebt,cashReceived:function(t){return fromK(cashReceivedK(t));},buildSchedule:buildSchedule,termsSummary:termsSummary,
   instalmentStates:instalmentStates,extraPrincipalInfo:extraPrincipalInfo,agreementBalances:agreementBalances,allocatePayment:allocatePayment,settlementPlan:settlementPlan,
-  classifyTxn:classifyTxn,accountDeltas:accountDeltas,BACKUP_FORMAT_NAME:BACKUP_FORMAT_NAME,SUPPORTED_BACKUP_FORMAT:SUPPORTED_BACKUP_FORMAT,newFinancialFields:newFinancialFields,backupNewFields:backupNewFields,checkBackupFormat:checkBackupFormat,validateBackupV2:validateBackupV2,accountBalances:accountBalances,mappingImpact:mappingImpact,OUTSIDE:OUTSIDE,sideStatus:sideStatus,unreconciledInflows:unreconciledInflows,movementReview:movementReview,upcomingObligations:upcomingObligations,cashForecast:cashForecast,
+  classifyTxn:classifyTxn,accountDeltas:accountDeltas,SCOPE_KINDS:SCOPE_KINDS,scopeContext:scopeContext,scopeOf:scopeOf,routeObligation:routeObligation,financialMeasures:financialMeasures,BACKUP_FORMAT_NAME:BACKUP_FORMAT_NAME,SUPPORTED_BACKUP_FORMAT:SUPPORTED_BACKUP_FORMAT,newFinancialFields:newFinancialFields,backupNewFields:backupNewFields,checkBackupFormat:checkBackupFormat,validateBackupV2:validateBackupV2,accountBalances:accountBalances,mappingImpact:mappingImpact,OUTSIDE:OUTSIDE,sideStatus:sideStatus,unreconciledInflows:unreconciledInflows,movementReview:movementReview,upcomingObligations:upcomingObligations,cashForecast:cashForecast,
   buildReminders:buildReminders,xirr:xirr,ACCOUNT_KINDS:ACCOUNT_KINDS,LEGACY_ACCOUNTS:LEGACY_ACCOUNTS,bucketSummary:bucketSummary,accountAccess:accountAccess,cashPosition:cashPosition,cashCover:cashCover,reservationPlan:reservationPlan,coveredAmount:coveredAmount,
   OWNERSHIP:OWNERSHIP,accountOwnership:accountOwnership,ownershipConfirmed:ownershipConfirmed,sharedPortion:sharedPortion,pharmacyEligibleAccounts:pharmacyEligibleAccounts,pharmacyCashPosition:pharmacyCashPosition,BILL_REPEAT:BILL_REPEAT,BILL_UNITS:BILL_UNITS,billRepeatLabel:billRepeatLabel,billCustomOk:billCustomOk,billDueDates:billDueDates,billAmountOn:billAmountOn,billOccurrences:billOccurrences,billObligations:billObligations,billUnmatchedPayments:billUnmatchedPayments,validateBill:validateBill,dataQuality:dataQuality,incomeFromFindings:incomeFromFindings,dupName:dupName,PARTY_MAX:PARTY_MAX,dateKey:dateKey,inDateRange:inDateRange,partyField:partyField,cleanParty:cleanParty,partyKey:partyKey,clipParty:clipParty,budgetProgress:budgetProgress,directorPlan:directorPlan,spendingRunway:spendingRunway,validateSetup:validateSetup,cashFlowSummary:cashFlowSummary,oppRepayments:oppRepayments,analyzeOpportunity:analyzeOpportunity,oppToTerms:oppToTerms,parseManualRows:parseManualRows};
 root.KoboFin=API;
@@ -2662,6 +3004,7 @@ body.kf-live .sample-tag{display:inline-block;}
       </div>
       <div class="card"><div class="card-label">Spending by Category</div><div id="cat-breakdown"></div></div>
       <div class="card"><div class="card-label">Insights</div><div id="insights-list"></div></div>
+      <div class="card" id="scope-summary-card" style="display:none"><div class="card-label">Pharmacy / Personal / Unresolved (preview)</div><div id="scope-summary"></div></div>
     </div>
 
     <div class="screen" id="screen-settings">
@@ -5042,6 +5385,43 @@ function renderAnalytics(){
   raf2(function(){document.querySelectorAll('.cat-bar').forEach(function(b){b.style.width=b.getAttribute('data-p')+'%';});});
 }
 
+/* Stage 1 read-only classification preview (design 5, 6; stage 1): this month's live entries as the
+   central engine classifies them. Nothing else on screen uses it yet (reports change in stage 2), it
+   stores nothing and changes no figure. Shown only in live mode. The three totals are income, expense
+   and obligation parts and loan interest and fees only (P-D3); movements, financing, external funding,
+   provisional repayment amounts and the review figures are listed separately, never in the totals.
+   Stored agreements are read (never written) to check a capital injection's agreement nature (N3b). */
+function renderScopeSummary(){
+  var card=qs('scope-summary-card'),el=qs('scope-summary');if(!card||!el)return;
+  if(!isLive()){card.style.display='none';el.innerHTML='';return;}
+  var m;
+  try{m=F.financialMeasures(ACCOUNTS,items,{aliases:SETUP.aliases,agreements:AGR,baselineDate:SETUP.baselineDate,from:monthStartISO(),to:getToday(),today:getToday()});}
+  catch(err){console.error(err);card.style.display='';el.innerHTML='<div class="muted-note">The classification preview could not be calculated ('+esc(errText(err))+'). Nothing else is affected.</div>';return;} // a preview failure never stops the other screens rendering
+  var KIND={pharmacy:'Pharmacy',personal:'Personal',shared:'Shared (split)',owner_withdrawal:'Owner withdrawal',owner_contribution:'Owner contribution',pharmacy_internal:'Pharmacy internal',personal_internal:'Personal internal',
+    cross_pharmacy_paid_personal:'Personal, paid from pharmacy',cross_personal_paid_pharmacy:'Pharmacy, paid from personal',financing:'Financing (loan received)',loan_repayment:'Loan repayment',external_funding:'External funding (not a loan)',unclassified:'Unresolved'};
+  var SEP=[['financing','Financing (loans received, principal repaid)'],['externalFunding','External funding'],['ownerWithdrawals','Owner withdrawals (movements)'],['ownerContributions','Owner contributions (movements)'],
+    ['internalMovements','Internal movements'],['provisionalRepayments','Loan repayments, split not yet confirmed'],['unresolvedAccountMovements','Unresolved account movements'],['capitalInjectionsSourceUnconfirmed','Capital injections, source unconfirmed'],['otherEntries','Other entries']];
+  function n(v){return'₦'+Number(v).toLocaleString('en-NG',{maximumFractionDigits:2});}
+  var sep=SEP.filter(function(x){return Number(m.scope.separate[x[0]])!==0;});
+  card.style.display='';
+  el.innerHTML='<div class="muted-note">This month, how the new classification engine would assign each entry. Preview only: no report, balance or figure uses it yet.</div>'
+    +'<div class="muted-note">Income and spending, including loan interest and fees:</div>'
+    +'<div class="grid2" id="scope-totals"><div><div class="ana-label">Pharmacy</div><div class="ana-val" data-scope="pharmacy">'+n(m.scope.pharmacy)+'</div></div>'
+    +'<div><div class="ana-label">Personal</div><div class="ana-val" data-scope="personal">'+n(m.scope.personal)+'</div></div>'
+    +'<div><div class="ana-label">Unresolved</div><div class="ana-val" data-scope="unclassified">'+n(m.scope.unclassified)+'</div></div></div>'
+    +(sep.length?'<div class="muted-note">Shown separately (not in the totals above):</div><div id="scope-separate">'+sep.map(function(x){
+      return'<div class="insight-row" data-separate="'+x[0]+'"><div class="insight-text">'+esc(x[1])+': '+n(m.scope.separate[x[0]])+'</div></div>';}).join('')+'</div>':'')
+    +(m.entries.length?'<div id="scope-entries">'+m.entries.map(function(e){
+      var c=e.components;
+      return'<div class="insight-row" data-scope-entry="'+esc(String(e.id))+'" data-pharmacy="'+e.parts.pharmacy+'" data-personal="'+e.parts.personal+'" data-unclassified="'+e.parts.unclassified+'" data-kind="'+esc(e.kind)+'"'
+        +(c?' data-principal="'+c.principal+'" data-finance-cost="'+c.financeCost.unclassified+'" data-split-pending="'+c.repaymentSplitPending+'"':'')+'>'
+        +'<div class="insight-text">'+esc(e.date)+' · '+esc(e.desc||e.type)+' · '+n(e.amount)+'<br><span class="muted-note">'+esc(KIND[e.kind]||e.kind)
+        +(c?' (principal '+n(c.principal)+', interest and fees '+n(c.financeCost.unclassified)+(c.repaymentSplitPending?', split not yet confirmed '+n(c.repaymentSplitPending):'')+')'
+          :e.parts.pharmacy&&e.parts.personal?' (pharmacy '+n(e.parts.pharmacy)+', personal '+n(e.parts.personal)+')':'')
+        +(e.flags.length?' · '+esc(e.flags.join(', ').replace(/_/g,' ')):'')+'</span></div></div>';}).join('')+'</div>'
+      :'<div class="muted-note">No entries this month.</div>');
+}
+
 function renderAutopilot(){
   var runway=calcRunway(),liquid=runway.liquid;
   var obs=obligationsWithin(30),cc=cashCoverFor(obs),totalObs=cc.due,free=cc.freeToUse;
@@ -5446,7 +5826,7 @@ function renderAll(){
   renderDashboard();renderTimeline();renderInbox();
   renderVehicles();renderCalendar();renderPressure();
   renderCashDrop();renderCapital();renderNetWorth();
-  renderAnalytics();renderSettings();
+  renderAnalytics();renderScopeSummary();renderSettings();
   renderAutopilot();renderOwnerImpact();renderRestockROI();renderCashFlow();
   renderLoans();renderAgreementDetail();renderOppSaved();renderModeNote();renderBills();renderDirector();
 }

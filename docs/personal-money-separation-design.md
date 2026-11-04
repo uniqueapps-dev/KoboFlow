@@ -286,34 +286,175 @@ One result per live (non-voided, non-sample) entry; nothing else classifies.
 
 ```json
 {
-  "kind": "pharmacy | personal | owner_withdrawal | owner_contribution | pharmacy_internal | personal_internal | cross_pharmacy_paid_personal | cross_personal_paid_pharmacy | unclassified",
+  "kind": "pharmacy | personal | shared | owner_withdrawal | owner_contribution | pharmacy_internal | personal_internal | cross_pharmacy_paid_personal | cross_personal_paid_pharmacy | financing | loan_repayment | external_funding | unclassified",
   "parts": { "pharmacy": 12000, "personal": 8000, "unclassified": 0 },
-  "basis": "explicit_split | explicit_purpose | account_ownership | vehicle_default | movement_rule | none",
+  "basis": "explicit_split | explicit_purpose | account_ownership | vehicle_default | movement_rule | financing_rule | loan_purpose | none",
   "payer": { "side": "from", "status": "mapped | outside | unresolved | none", "ownership": "business | personal | shared | unconfirmed | none", "acct": "acc_opay" },
-  "flags": ["purpose_differs_from_payer", "default_conflict_resolved", "defaults_disagree", "shared_needs_purpose", "split_does_not_reconcile", "outside_needs_purpose", "unresolved_source", "missing_source", "unconfirmed_account"]
+  "flags": ["purpose_differs_from_payer", "default_conflict_resolved", "defaults_disagree", "shared_needs_purpose", "shared_payer", "split_does_not_reconcile", "outside_needs_purpose", "unresolved_source", "missing_source", "unconfirmed_account", "funding_source_unconfirmed", "repayment_split_pending"]
 }
 ```
 
+For a loan repayment the result also carries `components`:
+`{ "principal": 40000, "financeCost": { "pharmacy": 0, "personal": 0, "unclassified": 5000 }, "repaymentSplitPending": 0 }`.
+
 `parts.pharmacy + parts.personal + parts.unclassified` equals the amount exactly, in kobo (`toK`).
+For a loan repayment (`kind: 'loan_repayment'`) the exact partition is over its components:
+`principal + financeCost.pharmacy + financeCost.personal + financeCost.unclassified + repaymentSplitPending`
+equals the amount, in kobo. The repayment's cash moves once, in full, in the cash layer.
 
-### 5.2 Precedence for income, expense, obligation and loan-repayment entries
+- **How parts and components are used.**
+  - For income, expense and obligation entries the parts **are** the classification; the measures
+    table (section 6) uses them.
+  - For `kind: 'loan_repayment'`, **`components` are authoritative and are the only classification
+    inputs to the measures**:
+    - **principal** is financing;
+    - **interest and fees** are an expense with their own pharmacy / personal / unclassified parts;
+    - **`repaymentSplitPending`** is a provisional amount, neither financing nor expense.
 
-The **payer** is the paying side for money out, the receiving side for money in. Evaluated in order;
-the first applicable rule decides:
+    If a `parts` object is present on a loan repayment result (for a uniform interface), it is
+    **informational only**. It never feeds an income, expense, financing, owner-withdrawal or burn
+    measure.
+  - For two-sided movements (5.3), financing and external funding, the parts are **informational
+    only**. They record the position of the account the money left or, for money arriving from
+    outside, the account it arrived in. Their figures use the **kind**, never these parts.
+  - Movements, financing, external funding and provisional repayment amounts are always shown
+    separately from income and expense totals.
+- **`shared`**: an income, expense or obligation entry with an explicit, reconciling split whose
+  pharmacy and personal parts are both above zero (a split with one part zero is `pharmacy` or
+  `personal`). Allocation of Shared **accounts** (running portion, Shared splits, Shared movements)
+  is stage 5.
+- **`financing`**: a loan receipt. That is `type: 'loan_receipt'`, from any debt agreement including
+  profit-share with repayable principal, or the legacy "loan received" capture stored as
+  `type: 'capital_injection'` with category `Loan` and no `fundingKind`. It is never income, expense,
+  owner withdrawal, owner contribution or external funding.
+- **`loan_repayment`**: a repayment **entry** (a transaction). It is not the loan's **instalment**,
+  which is an obligation (12.1). It is classified by its components, from its stored allocation
+  (`alloc`):
+  - **principal**: financing. It reduces the loan's liability, computed from the agreement's own
+    balances (H5), unchanged. It is never an expense.
+  - **interest and fees** (`financeCost`): an **expense** (D7). Their pharmacy / personal /
+    unclassified parts follow the loan's obligation purpose from stage 6; until stage 6 they are all
+    unclassified (unresolved finance cost), whatever purpose the entry carries. They are always
+    reported as an expense, never inside financing.
+  - **`repaymentSplitPending`**: the amount of a provisional repayment whose principal / interest
+    split is not yet confirmed (flag `repayment_split_pending`). Neither financing nor expense. Paid
+    from a confirmed Business or a confirmed Shared account, it is in the pharmacy cash burn
+    (conservative) as a separately identifiable provisional amount (section 6). When the split is
+    confirmed (the payment corrected with its allocation), it leaves this component and becomes
+    principal and finance cost. It is never in two components at once.
+
+  The repayment's cash moves once, in full, in the cash layer. Each component is in exactly one
+  classification figure.
+- **`external_funding`**: money received from a third party that is not a loan (a capital injection
+  whose `fundingKind` is `equity`, `gift`, `profit_share` without repayable principal, or
+  `other_non_loan`). Never income, owner contribution or loan financing; shown separately.
+- **`shared_payer`**: information only. The paying account of an expense or obligation is a Shared
+  account and the entry carries an explicit purpose (5.2 rule 2). It changes no part.
+- **`missing_source`**: the side the rule needs is empty: the **receiving** side of income, or the
+  **paying** side of an expense or obligation (5.5).
+- **`funding_source_unconfirmed`**: a capital injection whose source is not reliably identified:
+  - one with no `fundingKind` and no category `Loan`;
+  - one with `fundingKind: 'capital_injection'` whose agreement reference is missing, deleted,
+    malformed or invalid (no stored agreement found), or whose stored agreement's `terms.nature` is
+    anything other than `'capital_injection'`;
+  - one with an unknown or unsupported `fundingKind` value (not one of `capital_injection`,
+    `equity`, `gift`, `profit_share`, `other_non_loan`).
+
+  It is unclassified pending owner review, and never falls back to an owner contribution. Nothing is
+  inferred from category, description or amount (5.3; explicit identification in stage 3).
+
+### 5.2 Precedence for income, expense and obligation entries
+
+Loan receipts and loan repayment entries are not classified by these rules; see 5.1. A loan
+receipt is `financing`. A loan repayment entry is classified by its components.
+
+- **Principal** is always `financing`. Its liability treatment is the agreement's (H5) and is never
+  changed by any purpose.
+- **Interest and fees, until stage 6:** unresolved finance cost, whatever purpose the entry carries.
+- **Interest and fees, from stage 6:** classified by the **loan's obligation purpose** (12.1):
+  - pharmacy → pharmacy finance cost;
+  - personal → personal finance cost;
+  - shared with a valid split → its pharmacy part to pharmacy finance cost and its personal part to
+    personal finance cost;
+  - shared without a valid split, or unclassified → unresolved finance cost.
+
+  Any unresolved part goes to the unresolved finance-cost figure of the **paying account** (confirmed
+  Business, confirmed Shared, or other). The paying account decides only that figure, never the
+  position. A paying Shared account's declared or running portion never classifies interest and
+  fees.
+- **Paid from the other side, from stage 6** (5.4 applies to interest and fees):
+  - a confirmed Business account paying interest or fees on a personal-purpose loan:
+    `cross_pharmacy_paid_personal` for that interest and fees;
+  - a confirmed Personal account paying them on a pharmacy-purpose loan:
+    `cross_personal_paid_pharmacy`.
+- **Personal-loan principal paid from pharmacy money (from stage 6, which supplies the loan
+  obligation purpose and this rule):**
+  - Principal paid from a confirmed **Business** account on a personal-purpose loan stays `financing`
+    and reduces the liability.
+  - It is **also** reported in the measure "Owner withdrawal — personal loan principal funded by
+    pharmacy" (section 6). That measure is included **once** in the owner-withdrawals total, as an
+    "of which" line.
+  - It counts **once** towards a monthly owner plan's `withdrawn` (10.1, stage 7) **only** when the
+    repayment entry is linked to that plan.
+  - It is never a pharmacy operating expense, and no cash is deducted a second time.
+  - Principal paid from a confirmed **Shared** account is not reported as an owner withdrawal until
+    **both** stage 5 (valid Shared per-part treatment, 9.2) and stage 6 are in place. Even then only
+    its pharmacy-funded portion is included; the whole Shared payment is never an owner withdrawal.
+- **Provisional repayments:** the unsplit amount is `repaymentSplitPending` until the split is
+  confirmed (5.1).
+
+The obligation purpose never changes the principal's liability treatment. The repayment's cash moves
+once, in the cash layer, and no component is counted twice in classification.
+
+The **payer** is the **paying account** (the From side) of an expense or obligation, and the
+**receiving account** (the To side) of income. Evaluated in order; the first applicable rule decides:
 
 1. **Explicit split** (D12): reconciling amounts per position → `parts` from the split
    (`basis: explicit_split`). A non-reconciling split is ignored and the entry is **unclassified**
    (`split_does_not_reconcile`); it never applies "nearly".
-2. **Explicit purpose** (`pharmacy` / `personal`), set only by the owner (`basis: explicit_purpose`).
-   - Agrees with the payer's confirmed ownership, or the payer is outside, Personal Cash or missing →
-     applies as is.
-   - **Differs** from the payer's confirmed ownership → **cross-boundary** (5.4), flagged
-     `purpose_differs_from_payer`.
+2. **Explicit purpose** (`pharmacy` / `personal` / `unclassified`), set only by the owner
+   (`basis: explicit_purpose`). Both the purpose and the account's ownership are kept; neither
+   silently replaces the other.
+   - **Income received into a Shared account:** rule 2 does **not** apply. Shared-account income
+     needs a valid, reconciling split (rule 1). Without one it is unresolved income (rule 3), even
+     when it carries an explicit pharmacy or personal purpose.
+   - **Expense or obligation, purpose agrees** with the **paying account's** confirmed ownership (a
+     Pharmacy purpose paid from a confirmed Business account; a Personal purpose paid from a
+     confirmed Personal account, including Personal Cash) → applies as is.
+   - **Expense or obligation, purpose differs** from the **paying account's** confirmed ownership →
+     **cross-boundary** (5.4), flagged `purpose_differs_from_payer`.
+   - **Expense or obligation paid from a Shared account** → the explicit purpose applies, flagged
+     `shared_payer`, subject to the Shared-account rules (9.1, 9.2; stage 5 for the running portion).
+   - **Income with no receiving account** (the To side is empty, `missing_source`): rule 2 does
+     **not** apply. The income is unresolved even when it carries an explicit purpose (rule 5).
+   - **Income, purpose agrees** with the **receiving account's** confirmed ownership (Business or
+     Personal) → applies as is.
+   - **Income, purpose differs** from the **receiving account's** confirmed ownership → **unresolved
+     income** (unclassified), flagged `purpose_differs_from_payer`, until a cross-boundary rule for
+     receipts is decided (stage 3). Receiving money is never an owner withdrawal or an owner
+     contribution.
+   - **Expense or obligation whose paying account has no confirmed ownership** (outside, missing,
+     unresolved, unconfirmed, not chosen) → the purpose applies as is (5.5), and that side's warning
+     is kept: `outside_needs_purpose`, `missing_source`, `unresolved_source` or
+     `unconfirmed_account`.
+   - **Income received into a known account whose ownership is not confirmed** (an Outside side, an
+     unresolved side, or an account that is unconfirmed or not chosen; **not** a missing side and
+     **not** a Shared account) → the purpose applies as is, and that account's warning is kept:
+     `outside_needs_purpose`, `unresolved_source` or `unconfirmed_account`.
+   - A cross-boundary flow, or unresolved income for a differing purpose, arises only from
+     **confirmed** ownership.
+   - `purpose: 'unclassified'` ("I don't know") is an explicit owner statement: the entry is
+     unclassified and no default applies (rule 4 is not used).
    - `purpose: 'shared'` without a valid split → unclassified (`shared_needs_purpose`).
    - If the explicit purpose resolved a **default conflict** (rule 4), the flag
      `default_conflict_resolved` is kept permanently (Q4: the override stays visible).
-3. **Shared payer** without explicit purpose or split → **unclassified** (`shared_needs_purpose`).
-   The account's declared pharmacy portion is never applied per entry (D12).
+3. **Shared account.**
+   - An expense or obligation paid from a Shared account without an explicit purpose or a valid split
+     → **unclassified** (`shared_needs_purpose`).
+   - Income received into a Shared account without a valid, reconciling split → **unresolved income**
+     (`shared_needs_purpose`), whatever purpose it carries (Q-13).
+   - Shared splits are entered from stage 5; until then all Shared-account income is unresolved.
+   - The account's declared pharmacy portion is never applied per entry (D12).
 4. **Defaults** when there is no explicit purpose (`basis: account_ownership` or `vehicle_default`):
    - payer's **confirmed** ownership: Business → pharmacy, Personal → personal;
    - **vehicle** purpose (D6) when the entry names a vehicle: Pharmacy or Personal;
@@ -323,7 +464,9 @@ the first applicable rule decides:
    - A vehicle purpose of Shared or Unclassified supplies no default.
 5. **No usable default** → **unclassified**: payer outside (`outside_needs_purpose`, D2), unresolved
    (`unresolved_source`), missing (`missing_source`), unconfirmed or not chosen
-   (`unconfirmed_account`).
+   (`unconfirmed_account`). **Income with no receiving account is always unresolved income**, with
+   or without an explicit purpose (rule 2); an expense or obligation with a missing paying side
+   follows 5.5 (unclassified unless the owner gives a purpose).
 
 ### 5.3 Two-sided movements (D13)
 
@@ -337,14 +480,44 @@ ownership of both sides**; purpose does not apply to a movement between accounts
 | Business | Personal (incl. Personal Cash) | `owner_withdrawal` (whether stored as `transfer` or `owner_withdrawal`) |
 | Business | outside | `owner_withdrawal`, destination untracked |
 | Personal | Business | `owner_contribution` |
-| outside | Business | `owner_contribution` (capital injection), source untracked |
-| Shared | anything that changes position, or anything → Shared | per explicit treatment (`split` of the movement: pharmacy part / personal part, section 9); missing → unclassified |
+| outside | Business | `owner_contribution` **only** for a capital injection reliably identified as the owner's own money (its `agreementId` refers to a stored Loans agreement whose `terms.nature` is `'capital_injection'`, "Capital injection (own money)"; from stage 3 also explicit capture), source untracked; third-party non-loan funding is `external_funding`; loans are `financing`; any other capital injection is unclassified (`funding_source_unconfirmed`); any other movement from outside into a Business account is unclassified |
+| Personal | outside | unclassified until stage 3 (rule to be decided then) |
+| outside | Personal | unclassified until stage 3 (rule to be decided then) |
+| outside | outside | unclassified |
+| Shared | anything that changes position, or anything → Shared | **from stage 5:** per explicit treatment (`split` of the movement: pharmacy part / personal part, section 9.2, one result per part); **until stage 5, and whenever the treatment is missing:** unclassified (`shared_needs_purpose`) |
 | any | unresolved, unconfirmed, not chosen | unclassified |
 
 - The stored `type` is never changed automatically. A stored `transfer` Business→Personal is scoped
   as an owner withdrawal and listed with a suggestion to edit the type. New entries: Add Entry saves a
   Business→Personal movement as `owner_withdrawal` and says so before saving.
 - An owner withdrawal is never pharmacy opex and never personal income.
+- **Capital injections and loan receipts (how they are told apart).** The entry's stored type and
+  fields decide; nothing is inferred from category text, description or amount, except the one
+  legacy loan form below, which `classifyTxn` already recognises.
+  - `type: 'loan_receipt'` (every loan received through Add Entry, Quick Capture or a Loans debt
+    agreement, including profit-share with repayable principal): `financing`.
+  - `type: 'capital_injection'`, category `Loan`, no `fundingKind` (legacy Quick Capture "loan
+    received"): `financing`.
+  - `type: 'capital_injection'` with `fundingKind: 'capital_injection'` whose `agreementId` refers
+    to a **stored** Loans agreement whose `terms.nature` is `'capital_injection'` ("Capital injection
+    (own money)", where the owner is told "Your own money put into the business"): this table
+    (outside → confirmed Business = `owner_contribution`). The agreement is looked up and its nature
+    checked each time; an `agreementId` alone is not enough.
+  - `type: 'capital_injection'` with `fundingKind` `equity`, `gift`, `profit_share` or
+    `other_non_loan` (third-party funding through a Loans agreement): `external_funding`.
+  - Any other capital injection is unclassified (`funding_source_unconfirmed`), pending owner review:
+    - `fundingKind: 'capital_injection'` without an `agreementId` (Add Entry, Edit: the owner is not
+      asked whose money it is);
+    - an agreement reference that is missing, deleted, malformed or invalid (no stored agreement
+      found);
+    - a stored agreement whose `terms.nature` is anything other than `'capital_injection'`;
+    - an unknown or unsupported `fundingKind` value;
+    - no `fundingKind` with a category other than `Loan` (Quick Capture, older entries).
+
+    None of these ever falls back to an owner contribution. Nothing is inferred from category,
+    description or amount. Stage 3 adds explicit owner's-own-money identification to Quick Capture,
+    Add Entry and Edit.
+  - `fundingKind` records the funding nature of non-loan capital. It is never read as a loan type.
 
 ### 5.4 Cross-boundary flows (explicit purpose differs from the payer)
 
@@ -395,15 +568,86 @@ Every figure is defined once, here, and every screen reads it from one function:
 |---|---|---|
 | **Account balance** | cash layer | opening (as at the account's effective opening date) + mapped sides of entries dated on/after it |
 | **Confirmed pharmacy cash** | cash layer + ownership | confirmed Business balances + running Shared pharmacy portions (section 9) − held unresolved inflows (capped) |
-| **Pharmacy operating expenses** | classification | `parts.pharmacy` of expense/obligation entries (incl. `cross_personal_paid_pharmacy`) + finance cost of pharmacy-purpose loans |
-| **Unresolved spending (pharmacy accounts)** | classification + cash layer | `parts.unclassified` of expense/obligation entries whose cash movement left a pharmacy account (Business, or the pharmacy-treated part of a Shared account) |
-| **Unresolved spending (other)** | classification | `parts.unclassified` of entries with no pharmacy-account cash movement (outside, missing, personal-account) |
-| **Pharmacy cash burn** (runway denominator) | measures above | pharmacy operating expenses + **unresolved spending (pharmacy accounts)** + pharmacy finance cost |
+| **Pharmacy operating expenses** | classification | `parts.pharmacy` of expense/obligation entries (incl. `cross_personal_paid_pharmacy`) + **pharmacy finance cost** |
+| **Pharmacy finance cost** | classification | from stage 6 (none before), from the `financeCost` component of loan repayment entries: interest and fees on a loan with a pharmacy obligation purpose, plus the **pharmacy part** of interest and fees on a Shared-purpose loan with a valid split, incl. `cross_personal_paid_pharmacy` interest and fees; the position follows the loan's obligation purpose, never the paying account's declared or running portion |
+| **Unresolved spending (pharmacy accounts)** | classification + cash layer | `parts.unclassified` of expense/obligation entries whose paying account is a confirmed Business account, whatever the entry's date; Of which, **pre-opening**: entries dated before that account's effective opening date, shown as a separately identifiable part of this figure (included in it, never added again; they do not change the account's tracked balance, 7.1). |
+| **Unresolved spending (Shared accounts)** | classification + cash layer | `parts.unclassified` of expense/obligation entries whose paying account is a confirmed Shared account, whatever the entry's date; Of which, **pre-opening**: entries dated before that account's effective opening date, shown as a separately identifiable part of this figure (included in it, never added again; they do not change the account's tracked balance, 7.1). **Never pharmacy operating expense**; in the pharmacy cash burn (conservative), listed separately. **From stage 5** the running-portion certainty rule (9.2) replaces the uncertainty, not this conservative treatment: a reconciling split moves its parts to pharmacy and personal expenses; any part still unclassified stays here and in the burn and makes the portion count ₦0 (U5b) until classified |
+| **Unresolved spending (other)** | classification | `parts.unclassified` of expense/obligation entries whose paying side is not a confirmed Business or Shared account (outside, missing, personal, unconfirmed, not chosen, unresolved); an entry is never moved here because of its date |
+| **Unresolved finance cost (Business accounts)** | classification + cash layer | interest and fees, or parts of them, whose position is unclassified, whose repayment's paying account is a confirmed Business account, whatever the entry's date: before stage 6 all of them (whatever purpose the entry carries); from stage 6 those on a loan with no obligation purpose, an unclassified purpose, or a Shared purpose without a valid split; in the pharmacy cash burn. Of which, **pre-opening**: entries dated before that account's effective opening date, shown as a separately identifiable part of this figure (included in it, never added again; they do not change the account's tracked balance, 7.1). |
+| **Unresolved finance cost (Shared accounts)** | classification + cash layer | the same, whose repayment's paying account is a confirmed Shared account, whatever the entry's date; never pharmacy operating expense; in the pharmacy cash burn (conservative), listed separately. Of which, **pre-opening**: entries dated before that account's effective opening date, shown as a separately identifiable part of this figure (included in it, never added again; they do not change the account's tracked balance, 7.1). |
+| **Unresolved finance cost (other)** | classification | the same, whose paying side is not a confirmed Business or Shared account (any other account or none); listed; not in the pharmacy cash burn; never moved here because of its date |
+| **Provisional repayments (Business accounts)** | classification + cash layer | `repaymentSplitPending` of loan repayment entries whose paying account is a confirmed Business account, whatever the entry's date; neither financing nor expense; in the pharmacy cash burn (conservative), separately identifiable; leaves this figure when the split is confirmed. Of which, **pre-opening**: entries dated before that account's effective opening date, shown as a separately identifiable part of this figure (included in it, never added again; they do not change the account's tracked balance, 7.1). |
+| **Provisional repayments (Shared accounts)** | classification + cash layer | the same, whose paying account is a confirmed Shared account, whatever the entry's date; in the pharmacy cash burn (conservative), separately identifiable. Of which, **pre-opening**: entries dated before that account's effective opening date, shown as a separately identifiable part of this figure (included in it, never added again; they do not change the account's tracked balance, 7.1). |
+| **Provisional repayments (other)** | classification | the same, whose paying side is not a confirmed Business or Shared account (any other account or none); listed; not in the pharmacy cash burn; never moved here because of its date |
+| **Pharmacy cash burn** (runway denominator) | measures above | pharmacy operating expenses (incl. pharmacy finance cost) + unresolved spending (pharmacy accounts) + unresolved spending (Shared accounts) + unresolved finance cost (Business accounts) + unresolved finance cost (Shared accounts) + provisional repayments (Business accounts) + provisional repayments (Shared accounts); the Shared-account and provisional amounts are included conservatively and stay separately identifiable (a Shared account is not a pharmacy account) |
 | **Pharmacy runway** | measures above | confirmed pharmacy cash (available) ÷ average daily pharmacy cash burn over the existing window rules |
-| **Personal expenses** | classification | `parts.personal` of expense/obligation entries (incl. `cross_pharmacy_paid_personal`) + personal-purpose finance cost |
-| **Owner withdrawals (actual)** | classification | `owner_withdrawal` kind + `cross_pharmacy_paid_personal` |
-| **Owner contributions** | classification | `owner_contribution` kind + `cross_personal_paid_pharmacy` |
-| **Pharmacy sales / receipts** | unchanged | never affected by personal flows or withdrawals |
+| **Personal expenses** | classification | `parts.personal` of expense/obligation entries (incl. `cross_pharmacy_paid_personal`) + **personal finance cost** |
+| **Personal finance cost** | classification | from stage 6 (none before), from the `financeCost` component of loan repayment entries: interest and fees on a loan with a personal obligation purpose, plus the **personal part** of interest and fees on a Shared-purpose loan with a valid split, incl. `cross_pharmacy_paid_personal` interest and fees; the position follows the loan's obligation purpose, never the paying account's declared or running portion |
+| **Owner withdrawals (actual)** | classification | `owner_withdrawal` kind + `cross_pharmacy_paid_personal` (expense and obligation entries; from stage 6 also the interest and fees so classified) + **owner withdrawal — personal loan principal funded by pharmacy** (included **once**, disclosed as "of which"); never income, financing or external funding. A monthly owner plan's `withdrawn` (10.1, stage 7) uses only the entries of this total that are **linked to that plan** |
+| **of which: owner withdrawal — personal loan principal funded by pharmacy** | classification | from stage 6 (loan obligation purpose and this rule): the principal component of loan repayment entries paid from a confirmed Business account on a personal-purpose loan; only after **both** stage 5 (valid Shared per-part treatment, 9.2) **and** stage 6: also the pharmacy-funded portion of such principal paid from a confirmed Shared account, never the whole Shared payment; the principal stays in **Financing** and reduces the liability (H5); never pharmacy operating expense; inside the owner-withdrawals total once (not added to it again); counts towards a monthly plan only when its repayment entry is linked to that plan (10.1); no second cash deduction; none before stage 6 |
+| **Owner contributions** | classification | `owner_contribution` kind (owner's own money, reliably identified: a confirmed Personal → confirmed Business movement, or a capital injection into a confirmed Business account whose `agreementId` refers to a stored Loans agreement whose `terms.nature` is `'capital_injection'` ("Capital injection (own money)"); from stage 3 also capture that identifies the owner's own money explicitly) + `cross_personal_paid_pharmacy`; never external funding, financing, a capital injection whose source is unconfirmed, or income |
+| **Pharmacy receipts** | classification | `parts.pharmacy` of income entries; never personal income, withdrawals, contributions, financing or external funding (KoboFlow's recorded receipts, not sales: PBSRx is authoritative for sales) |
+| **Personal income** | classification | `parts.personal` of income entries; never part of pharmacy receipts |
+| **Unresolved income** | classification | `parts.unclassified` of income entries: **no receiving account** (always, even with an explicit purpose); received into an unconfirmed, not-chosen, unresolved or Outside account **without** an explicit pharmacy or personal purpose; received into a **Shared** account without a valid, reconciling split (even with an explicit purpose); a split that does not reconcile; a purpose of `unclassified`; or a purpose that differs from the confirmed receiving account's ownership |
+| **Financing** | classification | `financing` kind (loan receipts, incl. the legacy loan capture) + the **principal** component of loan repayment entries; never income or expense; shown separately; the liability itself is computed from agreements (H5) |
+| **External funding** | classification | `external_funding` kind (third-party non-loan funding: `fundingKind` `equity`, `gift`, `profit_share`, `other_non_loan`); never income, owner contribution or financing; shown separately |
+| **Unresolved account movements** | classification | unclassified two-sided movements between accounts (Shared, unresolved, unconfirmed or not-chosen sides; Personal ↔ Outside until stage 3); review action: confirm the accounts' ownership, give the movement's treatment (stage 5 for Shared) or correct the entry; never income, expense or burn |
+| **Capital injections — source unconfirmed** | classification | capital injections flagged `funding_source_unconfirmed`; review action: confirm whose money it was (owner's own money → owner contribution; third party → external funding; loan → financing); never income, expense or burn; may share a review area with unresolved account movements but is always counted and listed as its own figure |
+
+- **Loan repayments, counted once.** A repayment entry's cash moves once, in full, in the cash layer.
+  Its `components` are the only classification inputs to the measures (its `parts`, if present, are
+  informational). In classification its amount is partitioned exactly into:
+  - principal (financing);
+  - interest and fees (one expense figure: pharmacy finance cost, personal finance cost, or one of
+    the unresolved finance cost figures);
+  - any provisional amount (one provisional repayments figure).
+
+  Principal is never an expense. Interest and fees are always expenses (D7) and are never hidden in
+  financing. A provisional amount is in the burn only while unsplit (when paid from a confirmed
+  Business or Shared account). Once the split is confirmed it is recomputed as principal and finance
+  cost and leaves the provisional figure; it is never counted in both. The liability falls by the
+  principal, computed from the agreement (H5), not from this classification.
+- **Instalments and repayments.** A loan **instalment** is an obligation (a schedule row, routed in
+  12.1, counted against the safe amount). A loan **repayment** is an entry (a transaction, classified
+  above). Paying an instalment never creates a second obligation or a second expense, and an
+  instalment is never counted as a repayment.
+- **Each amount in one figure.** Every income, expense and obligation part, every repayment component
+  and every financing, external-funding or movement amount is in exactly one classification figure.
+  The only deliberate double statements answer two different questions, and the two figures of a
+  pair are never added together:
+  - the approved cross-boundary pairs (5.4, criterion 47):
+    - `cross_pharmacy_paid_personal` is both a personal expense and an owner withdrawal (direct);
+    - `cross_personal_paid_pharmacy` is both a pharmacy expense and an owner contribution (implicit);
+  - from stage 6, principal paid from a confirmed Business account on a personal-purpose loan (and,
+    only after both stage 5 and stage 6, the pharmacy-funded portion of such principal paid from a
+    confirmed Shared account)
+    is in **Financing** (the liability falls) **and** in the owner-withdrawals total, once, as the
+    "of which" line "personal loan principal funded by pharmacy" (pharmacy money left the pharmacy
+    position). The "of which" line is part of that total, never added to it.
+- **Effective opening date and pre-opening entries (7.1, 7.4; owner decision R-open).**
+  - **Cash layer (unchanged).** The effective opening date governs account balances, confirmed
+    pharmacy cash and every baseline consumer listed in 7.4. An entry dated before an account's
+    effective opening date never changes that account's tracked balance (7.1).
+  - **Account-tested figures.** Unresolved spending, unresolved finance cost and provisional
+    repayments are assigned according to the **paying-side classification**: confirmed Business
+    account, confirmed Shared account, or other, whatever the entry's date. A pre-opening entry paid from a confirmed Business or Shared account
+    stays in that account's figure; it is never moved to "(other)" because of its date.
+  - **Window.** Any figure counts an entry only when the entry falls in the applicable reporting
+    period or runway window. Inside the runway window, a pre-opening amount from a confirmed Business
+    or Shared account is part of the pharmacy cash burn like any other amount in that figure.
+  - **Pre-opening subdivisions.** Each Business and Shared figure shows its pre-opening amount as a
+    separately identifiable "of which" part. That part is included in its parent total and never
+    added again (to the figure or to the burn).
+  - **Not a second deduction.** The burn is a rate. Including a pre-opening amount in it never
+    deducts that amount from a balance or from confirmed pharmacy cash again, because its effect is
+    already inside the opening amount.
+  - **Non-pharmacy paying sides are unchanged:** a genuinely missing, Outside, Personal,
+    unconfirmed, not-chosen or unresolved paying side goes to the "(other)" figures as before.
+  - **Classification by position is unchanged by date (7.1):** pharmacy operating expenses, pharmacy
+    and personal finance cost, personal expenses, owner withdrawals and contributions, and the income
+    figures.
+- "All recorded income" (every income entry, today's figure) is kept only as a labelled transition
+  comparison; it is not a pharmacy figure.
 
 **Why Q5 never deducts twice.** An unresolved ₦20,000 outflow from Opay reduces the **stock** of cash
 once, in the cash layer (Opay balance, confirmed pharmacy cash). Separately, it is one item in the
@@ -411,7 +655,9 @@ once, in the cash layer (Opay balance, confirmed pharmacy cash). Separately, it 
 pharmacy opex, and no "adjustment" is added anywhere. The partition `pharmacy + personal +
 unclassified = amount` guarantees each naira is in exactly one classification bucket.
 
-**Example 15 — Q5.** ₦20,000 leaves confirmed Pharmacy Opay, purpose unknown:
+**Example 15 — Q5.** ₦20,000 leaves confirmed Pharmacy Opay, and the owner has marked its purpose as
+not known (`purpose: 'unclassified'`, 5.2 rule 2); the result is the same when its vehicle default
+conflicts with the payer (Example B). Without either, rule 4 would classify it as pharmacy:
 
 | Figure | Before | After |
 |---|---|---|
@@ -675,7 +921,9 @@ stays; physical cash never implies ownership (D2).
 
 ### 9.1 Splits
 
-- When a Shared account pays or receives, the entry needs an explicit purpose or a **split**:
+- When a Shared account **pays**, the entry needs an explicit purpose or a **split** (D12). When a
+  Shared account **receives** income, the income needs a valid, reconciling **split**; an explicit
+  purpose alone does not resolve it (5.2 rules 2 and 3). For example:
 
 ```json
 "purpose": "shared",
@@ -686,8 +934,9 @@ stays; physical cash never implies ownership (D2).
   to the larger part; the stored amounts reconcile **exactly** to the entry amount.
 - Missing → unclassified (`shared_needs_purpose`). Incomplete or non-reconciling → refused by the
   form; if found stored (for example after the amount was edited), unclassified
-  (`split_does_not_reconcile`) until corrected. A purpose and a split together: the split wins only if
-  it reconciles.
+  (`split_does_not_reconcile`) until corrected. A purpose and a split together: the split decides when
+  it reconciles; when it does not, the entry is **unclassified whatever its purpose** (5.2 rule 1).
+  The purpose never applies in place of a split that does not reconcile.
 - The declared portion is never applied as a per-entry percentage.
 
 ### 9.2 Running Shared pharmacy portion (U5a — decided, **not implemented today**)
@@ -757,7 +1006,16 @@ Today the portion is a static ceiling. The design:
   linked by this `ownerPlanId` — that is, entries whose `scopeOf` kind is `owner_withdrawal`, plus the
   personal part of `cross_pharmacy_paid_personal` entries, plus the owner-withdrawal part of Shared
   movements (readiness finding F1: direct personal spending from pharmacy money counts against the
-  plan, as section 5.4 says),
+  plan, as section 5.4 says), plus the principal of a personal-purpose loan repaid from a confirmed
+  Business account (the stage 6 measure; and, only after both stage 5 and stage 6, the
+  pharmacy-funded portion of such principal repaid from a confirmed Shared account) **when that
+  repayment entry is linked to this plan**.
+  - The link is the repayment entry's `ownerPlanId`, or the equivalent reliable association that
+    stage 7 provides if repayment entries do not already carry it.
+  - A personal-loan repayment that is not linked to a plan counts in the owner-withdrawals total and
+    its "of which" line, but in no plan's `withdrawn`. No repayment belongs to a plan automatically.
+  - Each linked amount is counted **once**, the same amount as in the "of which" line (section 6).
+  - That principal remains financing for liability reporting and is never an expense,
   `remaining = max(0, approvedAmount − withdrawn)`, `overPlan = max(0, withdrawn − approvedAmount)`,
   displayed status partially / fully withdrawn / over plan.
 - `ownerBucketReference` (D14): optional informational figure from the Owner bucket when it is live
@@ -907,7 +1165,13 @@ remaining ₦0, over plan ₦30,000 (flagged).
   mapping from the existing values with value-based gating and validation. Bills have no `purpose`
   today, so `bills.purpose` is unaffected.
 - A single routing function partitions each obligation occurrence's **remaining** amount, exactly
-  like `scopeOf`: `{pharmacy, personal, unclassified}` summing to the remaining amount.
+  like `scopeOf`: `{pharmacy, personal, unclassified}` summing to the remaining amount. It never reads
+  an agreement's existing `purpose` (loan funding purpose) as an obligation purpose; every existing
+  bill and loan stays unclassified until reviewed (D8). How a split defined on an occurrence's full
+  amount applies once the occurrence is partly paid is decided in stage 6; until then such an
+  occurrence's remainder is unclassified (`split_does_not_reconcile`). The router handles
+  **obligations** only (bill occurrences and loan instalments); loan **repayment entries** are
+  classified by `scopeOf` (5.1) and are never routed here.
 
 | Obligation | Pharmacy Director | Personal Director |
 |---|---|---|
@@ -1479,6 +1743,70 @@ Each is testable with fictional data on both builds (TEST and production candida
 | R3 | Restored opening confirmations reset to "awaiting reconfirmation"; opening date, amount and confirmation history preserved; explicit reconfirmation recorded; ₦0 in available figures until then; distinct from the ownership reset | section 7.5 |
 | R4 | Restored ownership confirmations moved to history (origin: source installation) and marked awaiting; ownership selection preserved, never invented; explicit reconfirmation recorded in account and setup history; existing H-1 financial behaviour unchanged; independent of R3 | section 7.5 |
 
+### 20.2a Stage 1 review: decisions, deferrals and pending items
+
+This register records what came out of the Stage 1 review. It does **not** state that every row is
+decided. The original decisions in 20.1 (D1–D14) and 20.2 (Q1–Q5, R1–R4) are unchanged and remain
+the decision history; nothing here overwrites them.
+
+**Status** of each row:
+- **Approved**: decided by the owner during the Stage 1 review.
+- **Deferred**: recorded now; decided or implemented in the stage named.
+- **Pending**: awaiting the owner's decision.
+
+**Type** of each row:
+- **New**: decides a case the original decisions and design did not decide.
+- **Clarifies**: confirms an original decision or design rule; the financial meaning is unchanged.
+- **Design text**: the wording correction recording a decision; it never decides anything by
+  itself.
+
+No row amends an approved original decision (D1–D14, Q1–Q5, R1–R4, Option C, H5).
+
+| Id | Item | Status | Type | Relation to original decisions and design | Where | Effective |
+|---|---|---|---|---|---|---|
+| P-D1 | `shared` kind for an income, expense or obligation entry with a reconciling split whose two parts are above zero | Approved | New | Implements D12 | 5.1 | stage 1 |
+| P-D1a | Allocation of Shared accounts (running portion, Shared splits, Shared movements, split entry for Shared income) | Deferred | — | U5a; P3 | 9.2, 23 | stage 5 |
+| P-D2 / Q-2 | `financing` kind for loan receipts (debt agreements, incl. profit-share with repayable principal): never income, expense, withdrawal, contribution or external funding | Approved | New | D7, H5; loan proceeds are not income | 5.1, 6 | stage 1 |
+| N1 | The legacy "loan received" capture (`capital_injection`, category `Loan`, no `fundingKind`) is financing | Approved | Clarifies | Already the rule in `classifyTxn` | 5.1, 5.3 | stage 1 |
+| N3a | `external_funding` kind for third-party non-loan funding (`fundingKind` `equity`, `gift`, `profit_share`, `other_non_loan`): not income, not an owner contribution, not loan financing; shown separately | Approved | New | The 5.3 row "outside → Business = owner contribution" no longer covers third-party funding | 5.1, 5.3, 6 | stage 1 |
+| N3b | A capital injection is an owner contribution only when reliably identified as the owner's own money: its `agreementId` refers to a stored Loans agreement whose actual `terms.nature` is `'capital_injection'` ("Capital injection (own money)"), checked each time (an `agreementId` alone is not enough). Every other capital injection is unclassified (`funding_source_unconfirmed`) pending owner review: Add Entry, Edit, Quick Capture and older entries; a missing, deleted, malformed or invalid agreement reference; an unexpected agreement nature; an unknown or unsupported `fundingKind`. None of these falls back to owner contribution; nothing is inferred from category, description or amount | Approved | New | 5.3 row narrowed; D13 unchanged | 5.1, 5.3, 6 | stage 1 |
+| N3c | Explicit owner's-own-money identification in Quick Capture, Add Entry and Edit, and the review action confirming flagged sources | Deferred | — | — | 23 (stage 3) | stage 3 |
+| P-D3 | Movement, financing and external-funding parts are informational; income, expense and obligation measures use their parts; loan repayment entries use their components; all shown apart from income and expense totals | Approved | Clarifies | Section 4; 5.3 | 5.1 | stage 1 |
+| P-D4 | Personal ↔ Outside movements unclassified until decided | Deferred | — | D2, D9 | 5.3 | stage 3 |
+| P-D5 | Movements involving a Shared account unclassified until Shared treatment exists | Deferred | — | D12, U5a, P3 | 5.3 | stage 5 |
+| P-D6 / Q-6 | Purpose and confirmed ownership both kept; a spending purpose that differs from the paying account's confirmed ownership is cross-boundary (5.4) and flagged; the account's warning kept when a purpose applies; `shared_payer` information flag (expenses and obligations) | Approved | Clarifies | 5.4, D13, criterion 47; Q4 unchanged | 5.2 rule 2 | stage 1 |
+| Q-N2 / N2 | Income whose purpose differs from the receiving account's confirmed ownership is unresolved income; never a withdrawal or contribution | Approved | New | 5.4 (spending only) unchanged | 5.2 rule 2 | stage 1 |
+| Q-N2a | Cross-boundary rule for receipts | Deferred | — | — | 5.2 rule 2 | stage 3 |
+| P-D7 | Personal Cash follows 5.4 | Approved | Design text | Replaces the 5.2 rule 2 words "or the payer is outside, Personal Cash or missing → applies as is"; D9 unchanged | 5.2 rule 2 | stage 1 |
+| P-D8 | A split that does not reconcile makes the entry unclassified whatever its purpose | Approved | Design text | Confirms 5.2 rule 1; replaces "the split wins only if it reconciles" in 9.1 | 9.1 | stage 1 |
+| P-D9 | `purpose: 'unclassified'` ("I don't know") overrides every default | Approved | Clarifies | 14.3, Q5 | 5.2 rule 2 | stage 1 |
+| P-D9t | Example 15 restated with its cause | Approved | Design text | Replaces "purpose unknown" | 6 | stage 1 |
+| P-D10 | Unresolved spending from a confirmed Shared account is a separate figure: never pharmacy operating expense, in the pharmacy cash burn (conservative) | Approved | New | Extends Q5; U5b unchanged | 6 | stage 1 |
+| P-D10t | "Unresolved spending (pharmacy accounts)" limited to confirmed Business accounts; new Shared row | Approved | Design text | Replaces "(Business, or the pharmacy-treated part of a Shared account)" | 6 | stage 1 |
+| P-D10a | From stage 5 the running-portion certainty rule replaces the uncertainty; the conservative burn treatment of unclassified parts is kept | Deferred | — | U5a, U5b | 6, 9.2 | stage 5 |
+| P-D11 / Q-11 | Loan repayment entries classified by components: principal is financing and reduces the liability (H5); interest and fees are expenses (D7) whose position is unresolved until stage 6 whatever purpose the entry carries; unresolved interest and fees paid from confirmed Business and from confirmed Shared accounts are in the pharmacy cash burn as two separate figures; the cash moves once; no component counted twice | Approved | New | D7 and H5 unchanged | 5.1, 5.2, 6 | stage 1 |
+| P-D11b | A provisional repayment's unsplit amount is its own component (`repaymentSplitPending`), neither financing nor expense; paid from a confirmed Business or Shared account it is in the pharmacy cash burn as separately identifiable provisional amounts; when the split is confirmed it leaves that figure and becomes principal and finance cost; never counted twice | Approved | New | Today's runway excludes it: a conservative change (lower runway while unsplit) | 5.1, 6 | stage 1 (burn shown in stage 2) |
+| P-D11t | 5.2 heading no longer lists loan repayments; section 6 finance-cost rows rewritten; repayment components and provisional rows added | Approved | Design text | Replaces "Precedence for income, expense, obligation and loan-repayment entries", "+ finance cost of pharmacy-purpose loans", "+ personal-purpose finance cost" and "+ pharmacy finance cost" in the burn row | 5.1, 5.2, 6 | stage 1 |
+| P-D11a | From stage 6 interest and fees follow the loan's obligation purpose (a Shared purpose with a valid split by its pharmacy and personal parts; unresolved parts to the paying account's unresolved figure; never by the paying account's portion), with 5.4 for interest and fees paid from the other side; principal stays financing | Deferred | — | 13.2, Example 13 (describe the stage 6 result) | 5.2, 6, 12.1 | stage 6 |
+| P-D11c | Principal paid from a confirmed Business account on a personal-purpose loan: stays financing and reduces the liability, and is also reported as "owner withdrawal — personal loan principal funded by pharmacy", included **once** in the owner-withdrawals total as an "of which" line; never a pharmacy operating expense; no second cash deduction | Approved | New | 5.4 principle; D7, H5 unchanged | 5.2, 6 | stage 6 (no loan purpose before) |
+| P-D11d | Personal-loan principal paid from a confirmed Shared account is not reported as an owner withdrawal until both stage 5 (valid per-part treatment) and stage 6 (loan purpose and the principal rule) are in place; afterwards only its pharmacy-funded portion is included (measure, and plan when linked), never the whole Shared payment | Approved | New | U5a, U5b, D12 | 5.2, 6, 10.1 | after stages 5 and 6 |
+| P-D11e | For `kind: 'loan_repayment'`, `components` are authoritative and are the only classification inputs to the measures; `parts`, if present, are informational only | Approved | Clarifies | Records P-D11 / P-D11b precisely | 5.1, 6 | stage 1 |
+| P-D17 | The monthly owner plan's `withdrawn` includes personal-loan principal funded by a confirmed Business account (the stage 6 measure; the Shared pharmacy-funded portion only after stages 5 and 6), **only when the repayment entry is linked to that plan**, counted once, the same amount as the "of which" line; an unlinked repayment counts in no plan; it remains financing for liability reporting and is not an expense | Approved | New | Extends F1 (10.1); D3, D4, D5 unchanged | 10.1 | stage 7 (consumes the stage 6 measure) |
+| P-D17a | A reliable link between a qualifying loan repayment entry and an owner plan (the entry's `ownerPlanId`, or an equivalent association) | Deferred | — | D11 (stable ids, reliable links) | 10.1, 23 | stage 7 |
+| P-D12 | Outside side recognised identically by the cash layer and by `scopeOf` | Deferred | — | 8.2; D2 | 23 (stage 3) | stage 3 |
+| P-D13 / Q-13 | Pharmacy receipts, personal income and unresolved income kept apart; personal income never in pharmacy receipts; income into a Shared account needs a valid, reconciling split, and without one it is unresolved even with an explicit purpose; income with no receiving account is unresolved | Approved | New | 2.4, U2, U13 unchanged; D12 (Shared **paying**) unchanged | 5.2 rules 2–3, 6 | stage 1 (display stage 2) |
+| P-D13b | Income with a genuinely missing receiving account is always unresolved, even with an explicit purpose; income into a known account whose ownership is unconfirmed, Outside or unresolved may use an explicit pharmacy or personal purpose, with its warning kept; a confirmed receiving account with a conflicting purpose stays unresolved; Shared-account income needs a valid split | Approved | New | 5.5 (empty source of expenses) unchanged | 5.2 rules 2 and 5, 6 | stage 1 |
+| P-D13t | Section 6 receipts row replaced by the income, financing and external-funding rows; 9.1 first bullet separates Shared paying (purpose or split) from Shared receiving (split only); 5.2 rule 3 extended to Shared income | Approved | Design text | Replaces "Pharmacy sales / receipts — unchanged — never affected by personal flows or withdrawals" and "When a Shared account pays or receives, the entry needs an explicit purpose or a split" | 5.2, 6, 9.1 | stage 1 |
+| P-D14 | An agreement's funding purpose is never read as an obligation purpose; existing obligations unclassified until reviewed | Approved | Clarifies | D8, Q2, the stage 0 field-name record | 12.1 | stage 1 |
+| P-D14a | The field-name decision for agreements' obligation purpose; how a split applies to a partly paid occurrence | Deferred | — | 12.1 | 12.1 | stage 6 |
+| P-D17t | Section 10.1 `withdrawn` extended (linked repayments only); section 6 owner-withdrawals row includes the "of which" line; stage 5, 6 and 7 scopes extended | Approved | Design text | Extends the 10.1 sentence ending "(readiness finding F1 … as section 5.4 says)" and the stage 7 scope line ending "plan export/import (format 2)." | 6, 10.1, 23 | stage 1 (wording) |
+| P-D11at | Section 6 pharmacy and personal finance-cost rows include the Shared-purpose split parts; the unresolved finance-cost rows hold any unclassified part by paying account | Approved | Design text | Records P-D11a in the measures table, consistent with the 5.2 heading | 6 | stage 1 (wording) |
+| P-D13bt | 5.2 rule 2 distinguishes a missing receiving account from a known unconfirmed, Outside or unresolved one; rule 5 states that income with no receiving account is always unresolved | Approved | Design text | Records P-D13b in the rule 2 wording (separate bullets for a missing receiving account and for a known unconfirmed, Outside or unresolved one) and adds a sentence to rule 5; the approved document text replaced is the rule 2 line "Agrees with the payer's confirmed ownership, or the payer is outside, Personal Cash or missing → applies as is" (see also P-D7) | 5.2 | stage 1 |
+| P-D15 | Unclassified account-to-account movements and capital injections with an unconfirmed source are two distinct figures with distinct review actions; they may share a review area | Approved | New | — | 6 | stage 1 (figures); displayed in stage 2; the capital-injection review action remains stage 3 (N3c) |
+| P-D16 | Loan instalments (obligations, routed) and loan repayment entries (classified by components) stay distinct records; neither is counted as the other | Approved | Clarifies | 12.1, 12.2, H5 | 6, 12.1 | stage 1 |
+| R-open | Treatment 2: account-tested unresolved spending, unresolved finance cost and provisional repayments are assigned by the actual confirmed paying account (Business or Shared) whatever the entry's date, counted when inside the reporting period or runway window (and then in the conservative burn); pre-opening amounts are shown as a separately identifiable "of which" part of each Business and Shared figure, included once; never moved to "(other)" because of their date; balances, confirmed pharmacy cash and every 7.4 baseline consumer unchanged (7.1); non-pharmacy paying sides unchanged | Approved | New | Settles a question the approved text left open (section 6 "cash movement left a pharmacy account" vs 7.1); 7.1, 7.4, Q5 unchanged | 6 | stage 1 (the burn effect appears from stage 4, or wherever a window reaches before an opening date) |
+| R-flag | `missing_source` names the empty required side: the receiving side of income, the paying side of an expense or obligation | Approved | Clarifies | 5.5 | 5.1 | stage 1 |
+
 ### 20.3 Remaining owner decisions [Open]
 
 **None.** D1–D14, Q1–Q5 and R1–R4 are decided. No stage depends on an open decision. The final
@@ -1588,12 +1916,19 @@ backup rules. The master plan should be updated separately if the owner approves
 
 1. **Scope:** Analytics, Cash Flow, budgets, Home/Timeline totals, Owner Impact and the runway read the
    measures; pharmacy runway uses pharmacy cash burn (section 6); new personal expense view and
-   unresolved-spending panel.
+   unresolved-spending panel; display of the income measures (pharmacy receipts, personal income,
+   unresolved income, with "all recorded income" as a labelled transition comparison; P-D13); the
+   pharmacy cash burn shown with its Shared-account and provisional-repayment amounts separately
+   identifiable (P-D10, P-D11b); Financing and External funding shown apart from income and expense;
+   display of the two P-D15 figures, unresolved account movements and capital injections with an
+   unconfirmed source, as two separately counted figures (the review action for capital injections
+   remains stage 3, N3c).
 2. **Dependencies:** stage 1; Q5.
 3. **Areas:** `cashFlowSummary`, `spendingRunway`, `budgetProgress`, `renderAnalytics`,
    `renderOwnerImpact`, daily totals.
 4. **Integrity risks:** a screen bypassing the measures; unresolved pharmacy outflows dropped from the
-   burn; withdrawals entering the burn.
+   burn; withdrawals entering the burn; provisional repayments or Shared-account amounts dropped from,
+   or counted twice in, the burn.
 5. **Unit tests:** measures for Examples 3, 15, B; runway with and without unresolved outflows.
 6. **Integrated acceptance tests:** criteria 5–8; one-classification consistency test across all
    screens.
@@ -1605,7 +1940,12 @@ backup rules. The master plan should be updated separately if the owner approves
 ### Stage 3 — Purpose capture, Outside source, vehicle purposes, categories, reconciliation
 
 1. **Scope:** `purpose` (and `split` input, inactive for Shared until stage 5) in Add Entry, Edit and
-   Quick Capture review; `'__outside'` entry side; `ledgerSetup.vehiclePurposes`;
+   Quick Capture review; `'__outside'` entry side, **recognised identically by the cash layer
+   (`sideStatus`) and by `scopeOf`**, together with the decided treatment of an Outside inflow into a
+   pharmacy account; the Personal ↔ Outside rows of 5.3; the cross-boundary rule for receipts (5.2
+   rule 2); explicit owner's-own-money identification for capital injections in Quick Capture, Add
+   Entry and Edit, and the review action confirming the source of capital injections flagged
+   `funding_source_unconfirmed` (5.3); `ledgerSetup.vehiclePurposes`;
    `ledgerSetup.personalCategories`; the reconciliation screen with preview (section 14); format-2
    export when the site's switch is on.
 2. **Dependencies:** stages 0–2; D2, D6, D7, Q4; **the site's guard verified (15.4) before the switch
@@ -1629,7 +1969,9 @@ backup rules. The master plan should be updated separately if the owner approves
    balance rule in every baseline consumer (7.4), Personal Cash account support, D1 Personal Money
    rule, R3 and R4 restore behaviour (`openingConfirmationState`, `openingConfirmationHistory`,
    `ownershipConfirmationState`, `ownershipConfirmationHistory`, separate reconfirmation of each,
-   interface states, F7 notice; section 7.5).
+   interface states, F7 notice; section 7.5); the account's effective opening date also determines the
+   pre-opening "of which" parts of the Business and Shared account-tested figures (R-open; until stage 4
+   the global baseline date is used).
 2. **Dependencies:** stage 3; Q1, R1, R3, R4 (all decided). The restore transformation is part of the
    import plan, so the stage 0 guard and matrix are prerequisites; new fields are written only where
    the site's `NEW_FINANCIAL_FORMAT` gate is on.
@@ -1643,7 +1985,8 @@ backup rules. The master plan should be updated separately if the owner approves
    complete while ownership awaits (F7); the restore transformation not atomic with the import.
 5. **Unit tests:** effective-date arithmetic; Example 16; R1 recognition with no write; corrections in
    7.3; restore transformation for both confirmations (fields preserved, histories moved, markers set)
-   for format-1 and format-2 setups, current, stale and missing source confirmations; Example 18.
+   for format-1 and format-2 setups, current, stale and missing source confirmations; Example 18;
+   pre-opening parts calculated separately for each account (R-open).
 6. **Integrated acceptance tests:** criteria 1–4, 13, 32–46; existing accounts byte-identical balances;
    restore on a disposable profile with byte-identical `use`, opening fields and transactions, then
    reconfirmation of each confirmation separately; stage 0 matrix rerun with confirmation histories in
@@ -1654,7 +1997,12 @@ backup rules. The master plan should be updated separately if the owner approves
 
 ### Stage 5 — Running Shared portion and Shared splits
 
-1. **Scope:** running pharmacy portion (9.2) and Shared splits enabled together; certainty rule (U5b).
+1. **Scope:** running pharmacy portion (9.2) and Shared splits enabled together; certainty rule (U5b);
+   Shared movements with one result per part (5.3, 9.2); Shared spending's certainty rule keeping
+   unclassified parts in the pharmacy cash burn (section 6); split entry for Shared-account income
+   (5.2 rule 3); once stage 6 is also in place, the pharmacy-funded portion of personal-loan
+   principal repaid from a confirmed Shared account in the owner-withdrawals "of which" line (never
+   the whole Shared payment), for the stage 7 plan to consume when linked.
 2. **Dependencies:** stages 1–4; D12, U5a, U5b.
 3. **Areas:** `sharedPortion`, `pharmacyEligibleAccounts`, `scopeOf` split handling, entry forms.
 4. **Integrity risks:** portion and balance double-counted; rounding drift; uncertain portion still
@@ -1670,7 +2018,14 @@ backup rules. The master plan should be updated separately if the owner approves
 
 1. **Scope:** `purpose`/`split` on bills and agreements (on agreements, subject to the field-name
    decision in 12.1: the existing `agreements.purpose` keeps its funding meaning); router (12.1); safe amount (12.2); required
-   purpose on new obligations; review area.
+   purpose on new obligations; review area; loan repayment entries' interest and fees classified by
+   their loan's obligation purpose, including 5.4 for interest and fees paid from the other side,
+   while principal stays financing (5.2 heading); Shared-purpose loans with a valid split allocate
+   interest and fees by their parts (never by the paying account's portion); the "of which" measure
+   "owner withdrawal — personal loan principal funded by pharmacy" inside the owner-withdrawals
+   total (section 6) for confirmed Business payers (Shared payers once stage 5 is also in place);
+   unresolved finance cost replaced by pharmacy or personal finance cost where the purpose is known;
+   partly paid split occurrences (12.1).
 2. **Dependencies:** stages 1, 3, 5; D8, Q2.
 3. **Areas:** bill and agreement forms, `allObligations`, `directorPlan` inputs, Calendar, Pressure,
    Opportunity.
@@ -1687,7 +2042,10 @@ backup rules. The master plan should be updated separately if the owner approves
 
 1. **Scope:** `ownerPlan` records in `meta`; approval and closure; `ownerPlanId` links; derived totals
    (10.1, F1); safety check and override snapshot; `idemKey`; reversal of withdrawals; integrity checks;
-   plan export/import (format 2).
+   plan export/import (format 2); a reliable link between a qualifying loan repayment entry and an
+   owner plan (the entry's `ownerPlanId`, or an equivalent association if repayment entries do not
+   already carry one), so that personal-loan principal funded by pharmacy (the stage 6 measure, and
+   its Shared portion after stages 5 and 6) counts towards a plan only when linked to it, and once.
 2. **Dependencies:** stages 0, 1, 6; D3, D4, D5, D10, D11, D13, D14.
 3. **Areas:** owner-withdrawal form, `reverseTxn`/`reversalOps`, `meta` handling, export/import,
    Owner withdrawals screen.
