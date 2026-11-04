@@ -1562,6 +1562,8 @@ backup rules. The master plan should be updated separately if the owner approves
    export format 1; the switch is off in both outputs; deployed sites refuse format 2 (15.4 step 3).
 9. **Before stage 1:** owner approval. Before **any** site enables `NEW_FINANCIAL_FORMAT`: section
    15.4 steps 2–7 for that site (deployment and verification are separate authorisations).
+10. **Status: accepted** by the owner (source `3359ae0`, TEST deployment `50d30b7`, switches off); the
+   evidence is recorded in `docs/stage-0-acceptance.md`.
 
 ### Stage 1 — `scopeOf` engine and central figures
 
