@@ -2,10 +2,24 @@
 
 - **Status:** revision 6 — complete architecture specification, ready for review and staged
   implementation authorisation. Incorporates the owner's decisions D1–D14, Q1–Q5 and R1–R4, resolves
-  design problems P1–P8, and includes the final consistency and readiness review (section 24). **Documentation only:
-  nothing described here as design is implemented.** No application code, test, database schema or
-  version, master plan, PBSRx, deployment or Git history was changed to write it. Revision 6 has been
-  committed locally.
+  design problems P1–P8, and includes the final consistency and readiness review (section 24). No
+  application code, test, database schema or version, master plan, PBSRx, deployment or Git history was
+  changed to write it. Revision 6 was committed in `db7e499` (status line corrected in `ce046a2`).
+- **Amendments after revision 6** (the document's revision number was not changed):
+  - section 20.2a, the Stage 1 review register, together with the A1–A12 replacement wording at **its**
+    revision 9 (the revision of that wording set, not of this document), including the corrected A6
+    wording and owner decision R-open, treatment 2, and the approved roadmap corrections in section 23
+    (commit `ff6e626`);
+  - the Stage 0 "Status: accepted" line in section 23 (commit `1ccb369`);
+  - register row P-D13c and its wording (commit `ddd6be5`).
+
+  Sections 20.1 and 20.2 (the original decision history) are unchanged.
+- **Implementation status:** this document is the design; its [Design] sections do not by themselves
+  mean anything is built. Implementation status is recorded per stage in its own record:
+  - **Stage 0:** accepted (`docs/stage-0-acceptance.md`).
+  - **Stage 1:** implemented on the feature branch (commits `ff6e626` and `ddd6be5`). It is under
+    owner review and **not accepted** (`docs/stage-1-verification.md`).
+  - **Stages 2–8:** not implemented.
 - **Code basis:** branch `claude/koboflow-loan-management-qn2vql` at
   `03d8dee190b000457b25e298f323af8976668389` (also what the isolated TEST site serves).
 - **Relationship to the master plan:** details and extends section 3 (Owner bucket) and section 4
@@ -24,7 +38,7 @@ personal position.
 |---|---|
 | **[Existing]** | Verified in the code at `03d8dee` (function or line named) |
 | **[Owner-approved]** | An owner decision: Option C, D1–D14, Q1–Q5, R1–R4, or an earlier decided master-plan item |
-| **[Design]** | This document's technical design implementing the approved direction; not yet built |
+| **[Design]** | This document's technical design implementing the approved direction; whether a part is built is recorded per stage (see "Implementation status" above), not by this label |
 | **[Open]** | A question still needing the owner's answer (section 20.3) |
 | **[Future]** | Implementation work, sequenced in section 23 |
 

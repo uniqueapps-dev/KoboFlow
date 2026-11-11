@@ -11,15 +11,21 @@
   - The Stage 0 acceptance record is commit `1ccb369`.
   - The Stage 1 implementation (completion WP1–WP8 and the I-4 correction) is preserved in commit
     `ff6e626`, a checkpoint, **not** Stage 1 acceptance.
-  - The I-2 revision (P-D13c) and this record's later updates are uncommitted working-copy changes on
-    top of `ff6e626` until the owner authorises a commit.
+  - The I-2 revision (P-D13c) and this record's revision 4 updates were committed and pushed in commit
+    `ddd6be56deef04839c7fb536d296e0fd110e4c22` (parent `ff6e626`).
+  - Neither `ff6e626` nor `ddd6be5` constitutes Stage 1 acceptance. Stage 1 remains under owner review,
+    and Stage 2 remains unauthorised.
 
 ## Architecture decisions recorded during the Stage 1 review
 
-The owner-approved Stage 1 review decisions (revision 9 of the A1–A12 wording, including the
-corrected A6 wording and decision R-open, treatment 2) are recorded in
-`docs/personal-money-separation-design.md`. The register is section 20.2a ("Stage 1 review: decisions,
-deferrals and pending items"); sections 20.1 and 20.2 are unchanged.
+The owner-approved Stage 1 review decisions are recorded in `docs/personal-money-separation-design.md`.
+The register is section 20.2a ("Stage 1 review: decisions, deferrals and pending items"); sections 20.1
+and 20.2 are unchanged.
+- They were applied as the A1–A12 replacement wording at **revision 9 of that wording set**, including
+  the corrected A6 wording and decision R-open, treatment 2.
+- Revision 9 is the revision of the A1–A12 wording, not of the design document. The design document
+  remains at revision 6, with these amendments recorded in its status block.
+- P-D13c was added later (section 20.2a; commit `ddd6be5`).
 
 ## Full-suite investigation (intermittent failures)
 
@@ -178,6 +184,7 @@ In `docs/personal-money-separation-design.md`:
 
 All runs are on the working copy after the I-2 revision (`koboflow.html`, the regenerated
 `koboflow-test.html` and `tests/stage1-scope.test.js`, each MD5-checked as unchanged across the runs).
+Those three files were committed unchanged in `ddd6be5`.
 
 | Run | Result |
 |---|---|
