@@ -1,8 +1,8 @@
 # Stage 1 verification record: classification engine (`scopeOf`) and measures
 
 - **Status:** Stage 1 implementation complete, including the Stage 1 completion (work packages
-  WP1–WP8 of the owner-approved implementation plan, decisions Q1–Q10) and the I-4 correction. Under
-  owner review. **Not yet accepted.** Stage 2 is not authorised.
+  WP1–WP8 of the owner-approved implementation plan, decisions Q1–Q10), the I-4 correction and the
+  I-2 revision (P-D13c). Under owner review. **Not yet accepted.** Stage 2 is not authorised.
 - **Scope of this record:** evidence gathered during the Stage 1 review. It records results; it
   changes no code, test, build, deployment or Git history. It is separate from the Stage 0 acceptance
   record (`docs/stage-0-acceptance.md`).

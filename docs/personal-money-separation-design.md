@@ -21,7 +21,11 @@
     owner review and **not accepted** (`docs/stage-1-verification.md`).
   - **Stages 2–8:** not implemented.
 - **Code basis:** branch `claude/koboflow-loan-management-qn2vql` at
-  `03d8dee190b000457b25e298f323af8976668389` (also what the isolated TEST site serves).
+  `03d8dee190b000457b25e298f323af8976668389`. This is the historical basis the architecture was
+  verified against ([Existing] items); it does not change with later deployments. The isolated TEST
+  site served `03d8dee` when this document was written. It was later deployed from source commit
+  `3359ae0` (Stage 0), as deployment commit `50d30b7c52ba10c6067b3ad29d8c7a8809ec15a3` in the TEST-site
+  repository (`docs/stage-0-acceptance.md`).
 - **Relationship to the master plan:** details and extends section 3 (Owner bucket) and section 4
   ("Business and household money") of `docs/financial-turnaround-master-plan.md` (revision 8). The
   master plan's decided items (U2–U5, U4a, U5a, U5b, U9, U12, U13, H5, G1–G5) stay in force; section 21
@@ -80,7 +84,8 @@ are planned in full before one atomic write.
    `ownerPlanId`, a safety check with an audited override (D10).
 7. **Versioned backup format (Q3, R2)** with the `transactions` collection kept in its normal shape,
    whole-file validation before any write, and a refusal guard. Builds already deployed (up to
-   `03d8dee`, and production `main`) cannot detect a newer format, so **each site** must have the guard
+   `03d8dee`, and production `main`) cannot detect a newer format (the TEST site has had the guard
+   since its Stage 0 deployment, `50d30b7`), so **each site** must have the guard
    deployed and verified before that site writes any new financial field or new-format backup
    (section 15, site-by-site sequence).
 8. **Historical reconciliation** through the existing Edit path (same id, `edits[]`), previewed,
@@ -1386,7 +1391,7 @@ Either map Personal Cash (the legacy quick-capture id) to Outside and state purp
 ### 15.1 What exists and why a version number alone is not enough
 
 - `planImport` has **no upper version check** and refuses a file only when `transactions` is missing.
-  Builds up to `03d8dee` (and the TEST site) would therefore **accept** a new-format backup and
+  Builds up to `03d8dee` (and the TEST site until its Stage 0 deployment, `50d30b7`) would therefore **accept** a new-format backup and
   restore it with the wrong meaning (purposes, splits, opening dates and outside sides ignored).
   Production `main` (`2f4ab03`) would replace its transaction list with the file's without asking.
 - **Already-deployed builds cannot be taught to refuse a format they do not know.** With the
@@ -2169,4 +2174,6 @@ Every check below was made against the whole document after incorporating R1–R
 
 **Assessment:** the specification is complete and internally consistent, with no open owner decision.
 It is ready for the owner's authorisation to commit the document; Stage 0 then needs its own separate
-implementation authorisation.
+implementation authorisation. (Written at revision 6. Since then the document has been committed,
+Stage 0 has been implemented and accepted, and Stage 1 has been implemented and is under owner
+review, not accepted. Stage 2 is not authorised. See the status block at the top.)

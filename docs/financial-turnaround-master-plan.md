@@ -765,7 +765,7 @@ Changes:
 | 10 | End-to-end acceptance, offline and reopen reconciliation, release readiness | P2-7, audit G | all | Not started |
 
 **Implementation-scope note (revision 7).** An integrated implementation pass on
-`claude/koboflow-loan-management-qn2vql` (uncommitted; independently audited) delivered, together
+`claude/koboflow-loan-management-qn2vql` (committed in `80eeb52`; independently audited) delivered, together
 and as one unit, work this plan's sequence above assigns separately to stages 1, 2, 3 and 5:
 - **Stage 1** (loan principal and settlement integrity), in full, as already recorded above.
 - **Stage 2**, only its interim, conservative parts (item 10 of the Stage 2 detail below): the one
