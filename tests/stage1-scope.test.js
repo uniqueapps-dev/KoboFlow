@@ -68,8 +68,10 @@ const SINGLE = { expense: 'from', obligation: 'from', income: 'to' };
 // account) and for income (the receiving account).
 function expected52(type, payer, purpose, split) {
   const P = PAYERS[payer], income = type === 'income';
-  // P-D13b, 5.2 rule 5: income with no receiving account is always unresolved, even with a purpose or split.
-  if (income && payer === 'missing') return { kind: 'unclassified', basis: 'none', flag: 'missing_source' };
+  // P-D13c (owner-approved revision of P-D13b; I-2): income with no receiving account follows the general
+  // rules below — a valid split or an explicit purpose classifies it, with its missing_source warning kept;
+  // otherwise it is unresolved. (Previously this line returned unresolved for every such case, whatever
+  // its split or purpose.)
   if (split === 'valid') return { kind: 'shared', basis: 'explicit_split' };
   if (split === 'bad') return { kind: 'unclassified', basis: 'none', flag: 'split_does_not_reconcile' };
   // P-D13 / Q-13, 5.2 rule 3: Shared-account income needs a valid split; rule 2 does not apply.
@@ -104,6 +106,7 @@ test('5.2 truth table: every income, expense and obligation entry × payer state
     if (x.flag) assert.ok(s.flags.includes(x.flag), `${label}: flag ${x.flag} in ${s.flags}`);
     if (x.flag !== 'shared_payer') assert.ok(!s.flags.includes('shared_payer'), `${label}: no shared_payer`);
     if (type === 'income') assert.ok(!/^(cross_|owner_)/.test(s.kind), `${label}: income is never cross-boundary, a withdrawal or a contribution (N2)`);
+    if (type === 'income' && payer === 'missing') assert.ok(s.flags.includes('missing_source'), `${label}: P-D13c keeps the missing_source warning in every case`);
     assert.equal(sumParts(s), K(amount), `${label}: partition equals the amount in kobo`);
     assert.ok(F.SCOPE_KINDS.includes(s.kind));
     if (s.kind === 'unclassified') assert.deepEqual(s.parts, { pharmacy: 0, personal: 0, unclassified: K(amount) }, label);
@@ -726,8 +729,10 @@ test('N-T7 income measures (P-D13, P-D13b, Q-N2 / N2 regression): pharmacy recei
     ['N2: Personal + pharmacy purpose', { toAcct: 'pb', purpose: 'pharmacy' }, 'unclassified', 'purpose_differs_from_payer'],
     ['Shared, no split', { toAcct: 'sh' }, 'unclassified', 'shared_needs_purpose'], ['Shared + pharmacy purpose', { toAcct: 'sh', purpose: 'pharmacy' }, 'unclassified', 'shared_needs_purpose'],
     ['Shared + valid split', { toAcct: 'sh', split: { pharmacy: 600, personal: 400, method: 'amount' } }, 'split', null],
-    ['missing receiving account', { toAcct: '' }, 'unclassified', 'missing_source'], ['missing + pharmacy purpose', { toAcct: '', purpose: 'pharmacy' }, 'unclassified', 'missing_source'],
-    ['missing + valid split', { toAcct: '', split: { pharmacy: 600, personal: 400, method: 'amount' } }, 'unclassified', 'missing_source'],
+    // P-D13c: a purpose or a valid split classifies income with no receiving account, warning kept
+    // (previously both of the next two cases were unresolved under P-D13b).
+    ['missing receiving account', { toAcct: '' }, 'unclassified', 'missing_source'], ['missing + pharmacy purpose', { toAcct: '', purpose: 'pharmacy' }, 'pharmacy', 'missing_source'],
+    ['missing + valid split', { toAcct: '', split: { pharmacy: 600, personal: 400, method: 'amount' } }, 'split', 'missing_source'],
     ['unconfirmed + pharmacy purpose', { toAcct: 'un', purpose: 'pharmacy' }, 'pharmacy', 'unconfirmed_account'], ['unconfirmed, no purpose', { toAcct: 'un' }, 'unclassified', 'unconfirmed_account'],
     ['not chosen + personal purpose', { toAcct: 'nc', purpose: 'personal' }, 'personal', 'unconfirmed_account'],
     ['Outside + personal purpose', { toAcct: OUTSIDE, purpose: 'personal' }, 'personal', 'outside_needs_purpose'],
@@ -747,6 +752,93 @@ test('N-T7 income measures (P-D13, P-D13b, Q-N2 / N2 regression): pharmacy recei
   assert.deepEqual([m.pharmacyReceipts, m.personalIncome, m.unresolvedIncome], [want.pharmacy, want.personal, want.unresolved]);
   assert.equal(m.allRecordedIncome, 1000 * cases.length); assert.equal(m.ownerWithdrawals, 0); assert.equal(m.ownerContributions, 0);
   assert.equal(m.pharmacyCashBurn, 0);
+});
+
+test('N-T7b income with no receiving account (P-D13c, the owner-approved revision of P-D13b): classified by a valid split or explicit purpose with missing_source kept; "of which" figures are subdivisions, never additional income; no account and no confirmed cash until reconciled; the same entry edited counts once; a separate second entry is a known stage 3 risk', () => {
+  nid = 9800;
+  const inc = (o) => e({ type: 'income', amount: 1000, toAcct: '', ...o });
+  // 1. Classification and flags (plan section 1.1); a vehicle gives no default (Q-C).
+  const vctx = F.scopeContext(ACCTS, { aliases: ALIASES, agreements: AGRS, vehiclePurposes: { green: 'pharmacy' } });
+  const cases = [
+    ['valid split', { split: { pharmacy: 600, personal: 400, method: 'amount' } }, 'shared', 'explicit_split', ['missing_source']],
+    ['valid split, pharmacy only', { split: { pharmacy: 1000, personal: 0, method: 'amount' } }, 'pharmacy', 'explicit_split', ['missing_source']],
+    ['split does not reconcile', { split: { pharmacy: 600, personal: 300, method: 'amount' } }, 'unclassified', 'none', ['split_does_not_reconcile', 'missing_source']],
+    ['purpose pharmacy', { purpose: 'pharmacy' }, 'pharmacy', 'explicit_purpose', ['missing_source']],
+    ['purpose personal', { purpose: 'personal' }, 'personal', 'explicit_purpose', ['missing_source']],
+    ['purpose unclassified', { purpose: 'unclassified' }, 'unclassified', 'none', ['missing_source']],
+    ['purpose shared, no split', { purpose: 'shared' }, 'unclassified', 'none', ['shared_needs_purpose', 'missing_source']],
+    ['no split, no purpose', {}, 'unclassified', 'none', ['missing_source']],
+    ['vehicle only (no default, Q-C)', { vehicle: 'green' }, 'unclassified', 'none', ['missing_source']],
+  ];
+  for (const [label, o, kind, basis, flags] of cases) {
+    const r = F.scopeOf(inc(o), vctx);
+    assert.equal(r.kind, kind, label); assert.equal(r.basis, basis, label);
+    for (const f of flags) assert.ok(r.flags.includes(f), `${label}: ${f} in ${r.flags}`);
+    assert.equal(sumParts(r), K(1000), label);
+    assert.ok(!/^(cross_|owner_)/.test(r.kind) && !r.flags.includes('shared_payer'), label);
+  }
+  // 2. Parent and "of which" figures: subdivisions, never additional income.
+  const base = [e({ type: 'income', amount: 50000, toAcct: 'opay', desc: 'Sales' }), e({ type: 'income', amount: 20000, toAcct: 'pb', desc: 'Personal income' }),
+    e({ amount: 10000, fromAcct: 'opay', desc: 'Stock' })];
+  const ph = inc({ amount: 3500, purpose: 'pharmacy', desc: 'Cash sale, account not recorded' });
+  const pe = inc({ amount: 1500, purpose: 'personal', desc: 'Personal receipt, account not recorded' });
+  const sp = inc({ amount: 1000, split: { pharmacy: 600, personal: 400, method: 'amount' }, desc: 'Split, account not recorded' });
+  const un = inc({ amount: 700, desc: 'No purpose, account not recorded' });
+  const noAcct = [ph, pe, sp, un], with_ = base.concat(noAcct);
+  const m0 = F.financialMeasures(ACCTS, base, MOPTS), m1 = F.financialMeasures(ACCTS, with_, MOPTS);
+  assert.deepEqual([m0.pharmacyReceipts, m0.pharmacyReceiptsNoReceivingAccount, m0.personalIncome, m0.personalIncomeNoReceivingAccount], [50000, 0, 20000, 0]);
+  assert.deepEqual([m1.pharmacyReceipts, m1.pharmacyReceiptsNoReceivingAccount], [50000 + 3500 + 600, 3500 + 600]);
+  assert.deepEqual([m1.personalIncome, m1.personalIncomeNoReceivingAccount], [20000 + 1500 + 400, 1500 + 400]);
+  assert.equal(m1.unresolvedIncome, 700, 'no purpose and no split: unresolved');
+  assert.ok(m1.pharmacyReceiptsNoReceivingAccount <= m1.pharmacyReceipts && m1.personalIncomeNoReceivingAccount <= m1.personalIncome, 'each "of which" is a part of its parent');
+  assert.equal(m1.pharmacyReceipts - m1.pharmacyReceiptsNoReceivingAccount, m0.pharmacyReceipts, 'parent = ordinary + account-less');
+  assert.equal(m1.personalIncome - m1.personalIncomeNoReceivingAccount, m0.personalIncome);
+  // Single counting: every total rises by exactly the entries' amount once; the "of which" figures add nothing.
+  const added = 3500 + 1500 + 1000 + 700;
+  assert.equal(m1.allRecordedIncome - m0.allRecordedIncome, added);
+  assert.equal((m1.pharmacyReceipts + m1.personalIncome + m1.unresolvedIncome) - (m0.pharmacyReceipts + m0.personalIncome + m0.unresolvedIncome), added);
+  assert.equal(K(m1.scope.total) - K(m0.scope.total), K(added));
+  assert.equal(Object.values(m1.scope.exclusive).reduce((s, v) => s + K(v), 0) - Object.values(m0.scope.exclusive).reduce((s, v) => s + K(v), 0), K(added));
+  assert.equal((m1.scope.pharmacy + m1.scope.personal + m1.scope.unclassified) - (m0.scope.pharmacy + m0.scope.personal + m0.scope.unclassified), added);
+  assert.ok(!Object.keys(m1.scope.exclusive).some(k => /NoAcct|NoReceiving/.test(k)), 'the "of which" figures are not exclusive buckets');
+  assert.equal(m1.pharmacyCashBurn, m0.pharmacyCashBurn, 'income is never in the burn');
+  // 3. Cash exclusion: no account is assigned; balances, confirmed cash, held inflows and runway cash are unchanged.
+  assert.deepEqual(m1.balances, m0.balances);
+  assert.deepEqual([m1.confirmedPharmacyCash.available, m1.confirmedPharmacyCash.total, m1.confirmedPharmacyCash.heldUnresolvedInflows], [m0.confirmedPharmacyCash.available, m0.confirmedPharmacyCash.total, m0.confirmedPharmacyCash.heldUnresolvedInflows]);
+  assert.equal(m1.runway.days, m0.runway.days);
+  // 4. The missing-account warning stays active (unchanged dataQuality, high severity) and every result keeps missing_source.
+  const dq = txns => F.dataQuality({ txns, accountIds: ACCTS.map(a => a.id), aliases: ALIASES, baselineDate: MOPTS.baselineDate, today: '2026-11-30' }).find(q => q.key === 'missing_account') || { ids: [] };
+  const w1 = dq(with_);
+  assert.equal(w1.severity, 'high'); for (const t of noAcct) assert.ok(w1.ids.includes(t.id), 'missing_account lists ' + t.desc);
+  for (const t of noAcct) assert.ok(F.scopeOf(t, CTX).flags.includes('missing_source'));
+  // 5. Path 1: the SAME entry (same id) edited to add its receiving account (confirmed Business Opay) — counted once.
+  const edited = { ...ph, toAcct: 'opay' };
+  assert.equal(edited.id, ph.id);
+  const m2 = F.financialMeasures(ACCTS, base.concat([edited, pe, sp, un]), MOPTS);
+  assert.equal(m2.pharmacyReceipts, m1.pharmacyReceipts, 'parent unchanged: the income was already counted, once');
+  assert.equal(m2.pharmacyReceiptsNoReceivingAccount, m1.pharmacyReceiptsNoReceivingAccount - 3500, 'it leaves the "of which" part');
+  assert.equal(m2.allRecordedIncome, m1.allRecordedIncome);
+  assert.equal(m2.balances.opay - m1.balances.opay, 3500, 'the cash layer now moves the account, once');
+  assert.equal(m2.confirmedPharmacyCash.available - m1.confirmedPharmacyCash.available, 3500, 'confirmed pharmacy cash rises by the amount, once');
+  assert.equal(m2.entries.filter(x => x.id === ph.id).length, 1, 'one entry, one id');
+  assert.ok(!dq(base.concat([edited, pe, sp, un])).ids.includes(ph.id), 'no longer a missing-account finding');
+  // 6. Q-F: existing rules apply after reconciliation; still counted exactly once.
+  const toPersonal = F.financialMeasures(ACCTS, base.concat([{ ...ph, toAcct: 'pb' }, pe, sp, un]), MOPTS);
+  const rP = F.scopeOf({ ...ph, toAcct: 'pb' }, CTX);
+  assert.equal(rP.kind, 'unclassified'); assert.ok(rP.flags.includes('purpose_differs_from_payer'), 'N2');
+  assert.equal(toPersonal.unresolvedIncome - m1.unresolvedIncome, 3500); assert.equal(m1.pharmacyReceipts - toPersonal.pharmacyReceipts, 3500);
+  assert.deepEqual([toPersonal.ownerWithdrawals, toPersonal.ownerContributions], [m1.ownerWithdrawals, m1.ownerContributions], 'never a withdrawal or contribution');
+  assert.equal(toPersonal.allRecordedIncome, m1.allRecordedIncome);
+  const rS = F.scopeOf({ ...ph, toAcct: 'sh' }, CTX);
+  assert.equal(rS.kind, 'unclassified'); assert.ok(rS.flags.includes('shared_needs_purpose'), 'rule 3');
+  assert.equal(F.financialMeasures(ACCTS, base.concat([{ ...ph, toAcct: 'sh' }, pe, sp, un]), MOPTS).allRecordedIncome, m1.allRecordedIncome);
+  // 7. Path 2 — documented, NOT prevented in Stage 1: a separate second entry for the same money is counted in
+  //    addition. Possible-repeat detection that treats a missing side as matching is stage 3 work (P-D13c).
+  const second = e({ type: 'income', amount: 3500, toAcct: 'opay', purpose: 'pharmacy', desc: 'Cash sale, recorded again into Opay' });
+  const m3 = F.financialMeasures(ACCTS, with_.concat(second), MOPTS);
+  assert.notEqual(second.id, ph.id);
+  assert.equal(m3.pharmacyReceipts - m1.pharmacyReceipts, 3500, 'known Stage 1 limit: the second entry adds the income again');
+  assert.equal(m3.allRecordedIncome - m1.allRecordedIncome, 3500);
 });
 
 test('N-T8 payer warnings kept and shared_payer (P-D6, Q8)', () => {
@@ -809,10 +901,15 @@ test('N-T10 conservation: on a completion fixture and a generated grid, every ko
   assert.deepEqual(got, {
     financing: 30000 + 3000 + 10000, externalFunding: 40000, ownerContributions: 25000, capitalInjectionsSourceUnconfirmed: 9000,
     provB: 12000, provS: 8000, provO: 500, finB: 0, finS: 1000, finO: 500,
-    pharmacyReceipts: 2200, personalIncome: 0, unresolvedIncome: 9000 + 3500 + 6500, allRecordedIncome: 9000 + 3500 + 6500 + 2200,
+    // P-D13c: F10 (no receiving account, purpose pharmacy) is a pharmacy receipt with no receiving account
+    // (previously unresolved income: pharmacyReceipts 2,200; unresolvedIncome 19,000).
+    pharmacyReceipts: 2200 + 3500, personalIncome: 0, unresolvedIncome: 9000 + 6500, allRecordedIncome: 9000 + 3500 + 6500 + 2200,
     ownerWithdrawals: 0, unresolvedAccountMovements: 15000 + 4000, opex: 7000, burn: 7000 + 1000 + 12000 + 8000,
   });
-  assert.deepEqual([m.scope.pharmacy, m.scope.personal, m.scope.unclassified], [7000 + 2200, 0, 19000 + 1000 + 500]);
+  assert.equal(m.pharmacyReceiptsNoReceivingAccount, 3500, 'of which: no receiving account (a subdivision of pharmacy receipts)');
+  assert.equal(m.personalIncomeNoReceivingAccount, 0);
+  // Card totals (previously pharmacy 9,200 and unresolved 20,500): F10 moves from unresolved to pharmacy.
+  assert.deepEqual([m.scope.pharmacy, m.scope.personal, m.scope.unclassified], [7000 + 2200 + 3500, 0, 15500 + 1000 + 500]);
   const total = fx.reduce((s, t) => s + K(t.amount), 0);
   assert.equal(total, K(186200));
   assert.equal(Object.values(m.scope.exclusive).reduce((s, v) => s + K(v), 0), total);

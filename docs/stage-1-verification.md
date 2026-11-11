@@ -6,8 +6,13 @@
 - **Scope of this record:** evidence gathered during the Stage 1 review. It records results; it
   changes no code, test, build, deployment or Git history. It is separate from the Stage 0 acceptance
   record (`docs/stage-0-acceptance.md`).
-- **Base:** branch `claude/koboflow-loan-management-qn2vql`, accepted Stage 0 commit `3359ae0`. All
-  Stage 1 changes are uncommitted working-copy changes until the owner authorises a commit.
+- **Base:** branch `claude/koboflow-loan-management-qn2vql`.
+  - The Stage 1 work starts from the accepted Stage 0 commit `3359ae0`.
+  - The Stage 0 acceptance record is commit `1ccb369`.
+  - The Stage 1 implementation (completion WP1–WP8 and the I-4 correction) is preserved in commit
+    `ff6e626`, a checkpoint, **not** Stage 1 acceptance.
+  - The I-2 revision (P-D13c) and this record's later updates are uncommitted working-copy changes on
+    top of `ff6e626` until the owner authorises a commit.
 
 ## Architecture decisions recorded during the Stage 1 review
 
@@ -100,7 +105,7 @@ and tested:
 | Q-N2 / N2 | income with a differing purpose is unresolved |
 | P-D10 | separate Business and Shared figures |
 | P-D11, P-D11b, P-D11e | repayment components and provisional repayments |
-| P-D13, P-D13b | the three income measures |
+| P-D13, P-D13b (revised by P-D13c) | the three income measures |
 | P-D15 | the two review figures |
 | R-open | pre-opening parts for every Business and Shared figure |
 
@@ -138,22 +143,54 @@ In `docs/personal-money-separation-design.md`:
 | Section 23, Stage 4 unit tests | pre-opening parts calculated separately for each account |
 | Register 20.2a, row P-D15, Effective | "stage 1 (figures); displayed in stage 2; the capital-injection review action remains stage 3 (N3c)" |
 
+### Owner decisions I-1 and I-2 (after the Stage 1 checkpoint `ff6e626`)
+
+- **I-1, confirmed: the strict rule is retained.** Only a capital injection whose stored agreement has
+  the nature "capital injection (own money)" is an owner contribution. Every other Outside → Business
+  movement remains an unresolved account movement unless its nature is established. No code change was
+  needed.
+- **I-2, revised: register row P-D13c, revising the first clause of P-D13b.** Income with no receiving
+  account is classified by a valid, reconciling split or an explicit pharmacy or personal purpose, with
+  its `missing_source` warning kept. Without either it is unresolved income, and no vehicle default
+  applies.
+  - **Cash:** classification is separate from cash. No account is assigned, and the income is in no
+    balance, confirmed pharmacy cash, held unresolved inflows or runway cash until a receiving account
+    is recorded.
+  - **Warning:** the `missing_account` data-quality warning stays active until then.
+  - **"Of which" figures:** two new figures, `pharmacyReceiptsNoReceivingAccount` and
+    `personalIncomeNoReceivingAccount`, are informational subdivisions of their parent income figures,
+    never additional income and never added to any total.
+  - **Reconciliation:** editing the original entry to add its receiving account keeps the entry's
+    identity, so its income is counted exactly once. The existing rules then apply: a differing
+    confirmed ownership gives unresolved income (N2), and a Shared account needs a valid split
+    (rule 3).
+  - **Known limit:** a separate second entry recorded for the same money is **not** detected in
+    Stage 1 and can be counted twice. Its detection (possible-repeat matching that treats a missing side
+    as matching any account, and linking during reconciliation) is **deferred to stage 3** and recorded
+    in the stage 3 scope.
+- **Code:** the change is confined to `scopeSingle`, `scopeTotals` and `financialMeasures`. The card
+  layout is unchanged; the new figures are displayed in stage 2.
+- **Tests:** the 5.2 truth table, N-T7 and N-T10 were updated (with the old expectations in comments).
+  The new N-T7b was added. Before the engine change, all four were shown to fail against `ff6e626` for
+  the expected reason, and they pass after it.
+
 ### Verification results
 
-All runs are on the working copy after the I-4 correction (`koboflow.html`, the regenerated
+All runs are on the working copy after the I-2 revision (`koboflow.html`, the regenerated
 `koboflow-test.html` and `tests/stage1-scope.test.js`, each MD5-checked as unchanged across the runs).
 
 | Run | Result |
 |---|---|
 | Baseline before the Stage 1 completion (full suite, frozen copy) | 418 / 418 passed, 0 skipped |
-| `tests/stage1-scope.test.js`, 3 runs | 29 / 29 passed each run, 0 skipped |
+| `tests/stage1-scope.test.js`, 3 runs | 30 / 30 passed each run, 0 skipped |
 | Stage 0: `tests/backup-format-guard.test.js`, 2 runs | 28 / 28 passed each run, 0 skipped |
 | `tests/engine.test.js` | 78 / 78 passed |
-| Full suite (`npm test`), run 1 | 429 / 429 passed, 0 failed, 0 skipped (340 s) |
-| Full suite (`npm test`), run 2 | 429 / 429 passed, 0 failed, 0 skipped (326 s) |
+| Full suite (`npm test`), run 1 | 430 / 430 passed, 0 failed, 0 skipped (332 s) |
+| Full suite (`npm test`), run 2 | 430 / 430 passed, 0 failed, 0 skipped (325 s) |
 | `node scripts/build-test-file.js --check` | up to date; `koboflow-test.html` byte-identical to `build(koboflow.html)` |
 
-The Stage 1 browser tests, on the TEST build and the production candidate, check the following:
+The Stage 1 browser tests, on the TEST build and the production candidate, check the following. They
+run on a fixed browser seed, which contains **no income without a receiving account**:
 
 | Check | Result |
 |---|---|
@@ -166,8 +203,13 @@ The Stage 1 browser tests, on the TEST build and the production candidate, check
 | Demo mode | shows no summary |
 | Page errors | none |
 
-The full suite grew from 418 to 429 tests. The additions are the 11 new Stage 1 tests: N-T1 to N-T10
-and N-T4b, the I-4 correction. Superseded Stage 1 assertions were rewritten to the approved decisions,
+Income with no receiving account (P-D13c) is verified in **Node** by N-T7b, N-T7, N-T10 and the 5.2
+truth table, against the engine block loaded from `koboflow.html`, which is the same code the page
+runs. There is **no direct browser test** of account-less income. Browser parity is demonstrated for
+the seeded data only.
+
+The full suite grew from 418 to 430 tests. The additions are the 12 new Stage 1 tests: N-T1 to N-T10,
+N-T4b (the I-4 correction) and N-T7b (P-D13c). Superseded Stage 1 assertions were rewritten to the approved decisions,
 which are named in the test file. No test was deleted or weakened, and no timeout was changed.
 
 ### Remaining limitations and deferred work
@@ -180,6 +222,10 @@ which are named in the test file. No test was deleted or weakened, and no timeou
   - Financing and External funding;
   - the two P-D15 figures.
 - The capital-injection review action and explicit own-money capture (stage 3, N3c).
+- Reconciliation of income with no receiving account, and detection of a separate second entry for
+  the same money (stage 3, P-D13c). Until then such a second entry can be counted twice. The
+  account-less entry stays visible through the `missing_account` warning, its `missing_source` flag and
+  the "of which" figures.
 - Loan-purpose finance cost and the related "of which" lines (stage 6). Plan linkage (stage 7).
   Shared allocation (stage 5).
 - The card performance and lifecycle clean-up remains deferred (owner decision).

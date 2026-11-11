@@ -1733,12 +1733,14 @@ function scopeSingle(t,ctx,k){
   function res(kind,parts,basis){return{kind:kind,parts:parts,basis:basis,payer:p,flags:flags};}
   function unc(flag){if(flag&&flags.indexOf(flag)<0)flags.push(flag);return res('unclassified',scopeAll('unclassified',k),'none');}
   var payerPos=p.status==='mapped'?scopeBucket(p.ownership):null,shared=p.status==='mapped'&&p.ownership==='shared',sideFlag=scopeStatusFlag(p);
+  // Income with no receiving account (P-D13c, revising P-D13b): classified only by a valid split or an
+  // explicit pharmacy or personal purpose, with its missing_source warning kept in every outcome; no vehicle
+  // default. Classification only: no account is assigned (the cash layer moves none for an empty side).
+  var noAcct=income&&!!p.missing;
+  if(noAcct)flags.push('missing_source');
   var vid=ctx.vehicleOf?ctx.vehicleOf(t):(t.vehicle||null),vp=vid?ctx.vehiclePurposes[vid]:null;
-  var vehPos=vp==='pharmacy'||vp==='personal'?vp:null; // a Shared or Unclassified vehicle purpose gives no default
+  var vehPos=!noAcct&&(vp==='pharmacy'||vp==='personal')?vp:null; // a Shared or Unclassified vehicle purpose gives no default; none for account-less income
   var disagree=!!(payerPos&&vehPos&&payerPos!==vehPos);
-  // Income with no receiving account is ALWAYS unresolved income (5.2 rule 5; P-D13b; section 6
-  // "Unresolved income": "no receiving account (always, even with an explicit purpose)").
-  if(income&&p.missing)return unc('missing_source');
   // 1. Explicit split: exact kobo partition, or unclassified (never applied "nearly").
   if(hasOwn(t,'split')){
     if(splitProblem(t.split,t.amount))return unc('split_does_not_reconcile');
@@ -1761,7 +1763,7 @@ function scopeSingle(t,ctx,k){
         return res(t.purpose==='personal'?'cross_pharmacy_paid_personal':'cross_personal_paid_pharmacy',scopeAll(t.purpose,k),'explicit_purpose');
       }
       if(shared)flags.push('shared_payer');      // spending paid from a Shared account: information only
-      else if(sideFlag)flags.push(sideFlag);     // no confirmed ownership: the side's warning is kept
+      else if(sideFlag&&flags.indexOf(sideFlag)<0)flags.push(sideFlag); // no confirmed ownership: the side's warning is kept
       return res(t.purpose,scopeAll(t.purpose,k),'explicit_purpose');
     }
     // 'shared' without a valid split, 'unclassified' ("I don't know") or anything else: no default applies.
@@ -1772,7 +1774,7 @@ function scopeSingle(t,ctx,k){
   // 4. Defaults: confirmed ownership, vehicle purpose; two that disagree give no default (Q4).
   if(disagree)return unc('defaults_disagree');
   if(payerPos)return res(payerPos,scopeAll(payerPos,k),'account_ownership');
-  if(vehPos){if(sideFlag)flags.push(sideFlag);return res(vehPos,scopeAll(vehPos,k),'vehicle_default');}
+  if(vehPos){if(sideFlag&&flags.indexOf(sideFlag)<0)flags.push(sideFlag);return res(vehPos,scopeAll(vehPos,k),'vehicle_default');}
   // 5. No usable default.
   return unc(sideFlag);
 }
@@ -1896,7 +1898,7 @@ function scopePaySide(s){
 function scopeTotals(txns,ctx,from,to,baselineDate){
   function acct(){return{business:0,businessPreOpening:0,shared:0,sharedPreOpening:0,other:0};}
   var z={opex:0,personal:0,unresSpend:acct(),finPh:0,finPe:0,finUnres:acct(),prov:acct(),withdrawals:0,contributions:0,
-    receiptsPh:0,incomePe:0,incomeUnres:0,allIncome:0,financingReceipts:0,principal:0,external:0,unresMoves:0,capUnconfirmed:0,unknownType:0,
+    receiptsPh:0,incomePe:0,incomeUnres:0,receiptsPhNoAcct:0,incomePeNoAcct:0,allIncome:0,financingReceipts:0,principal:0,external:0,unresMoves:0,capUnconfirmed:0,unknownType:0,
     kindWithdrawal:0,kindContribution:0,internal:0,card:{pharmacy:0,personal:0,unclassified:0},total:0,kinds:{},entries:[]};
   function add(b,side,pre,v){b[side]+=v;if(pre&&side!=='other')b[side+'PreOpening']+=v;}
   (txns||[]).forEach(function(t){
@@ -1911,6 +1913,9 @@ function scopeTotals(txns,ctx,from,to,baselineDate){
       z.card.pharmacy+=P.pharmacy;z.card.personal+=P.personal;z.card.unclassified+=P.unclassified;
     }else if(t.type==='income'){
       z.receiptsPh+=P.pharmacy;z.incomePe+=P.personal;z.incomeUnres+=P.unclassified;
+      // "Of which, no receiving account" (P-D13c): informational subdivisions of the two parents above, in
+      // addition to (never instead of) them; never in excl, card or total, so never additional income.
+      if(s.payer&&s.payer.missing){z.receiptsPhNoAcct+=P.pharmacy;z.incomePeNoAcct+=P.personal;}
       z.card.pharmacy+=P.pharmacy;z.card.personal+=P.personal;z.card.unclassified+=P.unclassified;
     }else if(s.kind==='loan_repayment'){
       // Components only (P-D11e): principal is financing; interest and fees are an expense; the
@@ -1991,7 +1996,9 @@ function financialMeasures(accounts,txns,opts){
     ownerWithdrawals:F2(p.withdrawals),
     ownerContributions:F2(p.contributions),
     pharmacyReceipts:F2(p.receiptsPh),                                 // P-D13
+    pharmacyReceiptsNoReceivingAccount:F2(p.receiptsPhNoAcct),         // of which (P-D13c): informational subdivision of pharmacyReceipts, never added to any total
     personalIncome:F2(p.incomePe),
+    personalIncomeNoReceivingAccount:F2(p.incomePeNoAcct),             // of which (P-D13c): informational subdivision of personalIncome, never added to any total
     unresolvedIncome:F2(p.incomeUnres),
     allRecordedIncome:F2(p.allIncome),                                 // transition comparison only; not a pharmacy figure
     financing:F2(p.financingReceipts+p.principal),                     // P-D2: loan receipts + principal repaid
