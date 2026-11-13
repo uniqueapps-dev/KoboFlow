@@ -2,7 +2,9 @@
 
 - **Status:** Stage 1 implementation complete, including the Stage 1 completion (work packages
   WP1–WP8 of the owner-approved implementation plan, decisions Q1–Q10), the I-4 correction and the
-  I-2 revision (P-D13c). Under owner review. **Not yet accepted.** Stage 2 is not authorised.
+  I-2 revision (P-D13c). **Accepted** by the owner (source `3bdacf3`, TEST deployment `97e3342`); the
+  acceptance is recorded in `docs/stage-1-acceptance.md`. Stage 2 implementation is not yet
+  authorised.
 - **Scope of this record:** evidence gathered during the Stage 1 review. It records results; it
   changes no code, test, build, deployment or Git history. It is separate from the Stage 0 acceptance
   record (`docs/stage-0-acceptance.md`).
@@ -13,8 +15,9 @@
     `ff6e626`, a checkpoint, **not** Stage 1 acceptance.
   - The I-2 revision (P-D13c) and this record's revision 4 updates were committed and pushed in commit
     `ddd6be56deef04839c7fb536d296e0fd110e4c22` (parent `ff6e626`).
-  - Neither `ff6e626` nor `ddd6be5` constitutes Stage 1 acceptance. Stage 1 remains under owner review,
-    and Stage 2 remains unauthorised.
+  - Neither `ff6e626` nor `ddd6be5` constituted Stage 1 acceptance. The direct browser tests were added
+    in `3bdacf3`. **Stage 1 was accepted at `3bdacf3`**, deployed to TEST as `97e3342`
+    (`docs/stage-1-acceptance.md`).
 
 ## Architecture decisions recorded during the Stage 1 review
 

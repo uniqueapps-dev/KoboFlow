@@ -17,9 +17,11 @@
 - **Implementation status:** this document is the design; its [Design] sections do not by themselves
   mean anything is built. Implementation status is recorded per stage in its own record:
   - **Stage 0:** accepted (`docs/stage-0-acceptance.md`).
-  - **Stage 1:** implemented on the feature branch (commits `ff6e626` and `ddd6be5`). It is under
-    owner review and **not accepted** (`docs/stage-1-verification.md`).
-  - **Stages 2–8:** not implemented.
+  - **Stage 1:** accepted (source `3bdacf3`, TEST deployment `97e3342`; `docs/stage-1-acceptance.md`;
+    evidence in `docs/stage-1-verification.md`).
+  - **Stage 2:** specified (owner's Stage 2 brief v1.0, 13 November 2026). Implementation is not yet
+    authorised.
+  - **Stages 3–8:** not implemented.
 - **Code basis:** branch `claude/koboflow-loan-management-qn2vql` at
   `03d8dee190b000457b25e298f323af8976668389`. This is the historical basis the architecture was
   verified against ([Existing] items); it does not change with later deployments. The isolated TEST
@@ -1934,6 +1936,8 @@ backup rules. The master plan should be updated separately if the owner approves
 8. **Completion criteria:** every report figure can be produced from the measures function on a
    fixture, matching the hand-calculated values.
 9. **Before stage 2:** owner review of the summary on the TEST fixture.
+10. **Status: accepted** by the owner (source `3bdacf3`, TEST deployment `97e3342`, switches off); the
+   evidence is recorded in `docs/stage-1-acceptance.md`.
 
 ### Stage 2 — Reports, runway, budgets, personal and unresolved views
 
@@ -2175,5 +2179,5 @@ Every check below was made against the whole document after incorporating R1–R
 **Assessment:** the specification is complete and internally consistent, with no open owner decision.
 It is ready for the owner's authorisation to commit the document; Stage 0 then needs its own separate
 implementation authorisation. (Written at revision 6. Since then the document has been committed,
-Stage 0 has been implemented and accepted, and Stage 1 has been implemented and is under owner
-review, not accepted. Stage 2 is not authorised. See the status block at the top.)
+Stage 0 has been implemented and accepted, and Stage 1 has been implemented and accepted. See the
+status block at the top for Stage 2.)
