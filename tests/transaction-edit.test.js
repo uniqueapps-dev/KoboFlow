@@ -137,6 +137,12 @@ const saveEditForm = async page => { await reviewChanges(page); await confirmRev
 // A refused value is reported on SAVE CHANGES, before any review.
 const editError = async page => { await page.click('#edit-save-btn'); await page.waitForSelector('#edit-msg .form-err'); return (await text(page, '#edit-msg')).trim(); };
 // A failure while writing is reported after CONFIRM AND SAVE; the form returns to the fields.
+// Stage 2 (plan v11 3E; owner-approved fixture correction, 13 Nov 2026): the single "Operating Cash Flow" total is retired.
+// The Cash Flow screen shows OP-R (pharmacy operating result) and OP-C (pharmacy cash movement from operations); entries
+// that are unresolved or provisional are shown separately, in neither total.
+const opFigures = page => page.evaluate(() => ({ opR: Number(document.querySelector('#cf-op-result [data-fig="opResult"]').getAttribute('data-value')),
+  opC: Number(document.querySelector('#cf-op-cash [data-opc]').getAttribute('data-value')),
+  unresolved: Number(document.querySelector('#cf-op-unresolved [data-fig="burnUnresolvedBusiness"]').getAttribute('data-value')) }));
 const confirmError = async page => { await reviewChanges(page); await confirmReview(page); await page.waitForSelector('#edit-msg .form-err'); return (await text(page, '#edit-msg')).trim(); };
 
 for (const b of BUILDS) {
@@ -153,7 +159,9 @@ for (const b of BUILDS) {
     await nav(page, 'director');
     assert.equal(await dirRow(page, 'cash'), '₦595,000');
     await nav(page, 'cashflow');
-    assert.equal((await text(page, '#cf-op-total')).trim(), '-₦5,000');
+    // The lunch has no purpose and is paid from a confirmed Business account: pharmacy (Stage 1 rule 4), F1, so it is in
+    // both OP-R and OP-C, once (previously "Operating Cash Flow" −₦5,000).
+    assert.deepEqual(await opFigures(page), { opR: -5000, opC: -5000, unresolved: 0 });
 
     // The form opens from History, prefilled with exactly what was saved.
     await openEditFrom(page, 'timeline', orig.id);
@@ -180,7 +188,7 @@ for (const b of BUILDS) {
     await nav(page, 'director');
     assert.equal(await dirRow(page, 'cash'), '₦592,500');
     await nav(page, 'cashflow');
-    assert.equal((await text(page, '#cf-op-total')).trim(), '-₦7,500');
+    assert.deepEqual(await opFigures(page), { opR: -7500, opC: -7500, unresolved: 0 }, 'the edit moves both by the new amount, once (previously "Operating Cash Flow" −₦7,500)');
     await nav(page, 'timeline');
     const tl = await text(page, '#timeline-list');
     assert.match(tl, /Fictional lunch and drinks[\s\S]*Household[\s\S]*-₦7,500/);
@@ -374,7 +382,10 @@ test('TEST build: transfers, owner withdrawals, investments, capital injections 
   // Opay 100,000 −12,500 +7,000 +3,000; Bank 500,000 −7,000 −25,000 +18,000; Coop 80,000 +12,500 +25,000.
   assert.deepEqual([await acctBal(page, 'Opay'), await acctBal(page, 'Fictional Bank'), await acctBal(page, 'Fictional Coop')], [97500, 486000, 117500]);
   await nav(page, 'cashflow');
-  assert.equal((await text(page, '#cf-op-total')).trim(), '+₦3,000', 'the refund is now income, not spending');
+  // The refund, now income into a confirmed Business account: line (i), so +₦3,000 in both OP-R and OP-C, once. The
+  // transfers, owner draw, deposit and capital are movements or capital: in neither total. (Previously "Operating Cash
+  // Flow" +₦3,000.)
+  assert.deepEqual(await opFigures(page), { opR: 3000, opC: 3000, unresolved: 0 }, 'the refund is now income, not spending');
   assert.deepEqual(page.errors, []);
   await context.close();
 });

@@ -692,12 +692,15 @@ test('partial payment, correction, schedule amendment and cash-flow screen stay 
   assert.match(await page.textContent('#agr-detail'), /Outstanding₦172,955/);
   // Historical cash flow shows actual cash only: +150,000 proceeds, −35,000 repaid.
   await nav(page, 'cashflow');
-  const finText = await page.textContent('#cf-financing');
-  assert.match(finText, /Loan proceeds received\+₦150,000/);
-  assert.match(finText, /Loan principal repaid-₦17,045/);
-  assert.match(finText, /Loan interest & fees paid-₦17,955/);
-  const fin = await page.textContent('#cf-fin-total');
-  assert.equal(fin, '+₦115,000');
+  // Stage 2 (plan v11 2.1, 6.3): the financing section reads the measures (loan receipts, principal, interest and fees,
+  // provisional repayments, external funding and capital of unconfirmed source, each apart); previously #cf-financing.
+  const finVals = await page.$$eval('#cf-s2 [data-cf-section="financing"] [data-fig]', els => Object.fromEntries(els.map(e => [e.getAttribute('data-fig'), Number(e.getAttribute('data-value'))])));
+  assert.equal(finVals.loanReceipts, 150000);
+  assert.equal(finVals.principalRepaid, 17045);
+  assert.equal(finVals.unresolvedFinanceCost, 17955);
+  assert.equal(finVals.provisionalRepayments, 0);
+  const fin = (await page.textContent('#cf-fin-net [data-fig="financingNet"]')).trim();
+  assert.equal(fin, '₦115,000'); assert.equal(finVals.financingNet, 115000, '150,000 − 17,045 − 17,955: the same net as before');
   assert.deepEqual(page.errors, []);
   await context.close();
 });

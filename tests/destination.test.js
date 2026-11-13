@@ -164,6 +164,12 @@ const byDesc = (txs, d) => txs.find(t => t.desc === d);
 const dirRow = async (page, k) => (await text(page, `#director-body [data-dir-row="${k}"] .autopilot-val`)).trim();
 
 // Opay 100,000; Fictional Bank 500,000; Fictional Coop 80,000 (restricted). Baseline 60 days ago.
+// Stage 2 (plan v11 3E; owner-approved fixture correction, 13 Nov 2026): the single "Operating Cash Flow" total is retired.
+// The Cash Flow screen shows OP-R (pharmacy operating result) and OP-C (pharmacy cash movement from operations); entries
+// that are unresolved or provisional are shown separately, in neither total.
+const opFigures = page => page.evaluate(() => ({ opR: Number(document.querySelector('#cf-op-result [data-fig="opResult"]').getAttribute('data-value')),
+  opC: Number(document.querySelector('#cf-op-cash [data-opc]').getAttribute('data-value')),
+  unresolved: Number(document.querySelector('#cf-op-unresolved [data-fig="burnUnresolvedBusiness"]').getAttribute('data-value')) }));
 async function liveSetup(page) {
   await page.click('#settings-nav-btn'); await page.click('#setup-open-btn'); await page.waitForSelector('#setup-modal.open');
   await page.fill('#setup-baseline', daysAgo(60));
@@ -262,7 +268,9 @@ for (const b of BUILDS) {
     await nav(page, 'director');
     assert.equal(await dirRow(page, 'cash'), '₦593,000', 'counted once');
     await nav(page, 'cashflow');
-    assert.equal((await text(page, '#cf-op-total')).trim(), '-₦7,000');
+    // Fuel (₦5,000) and bread (₦2,000) have no purpose and are paid from a confirmed Business account: pharmacy (Stage 1
+    // rule 4; no vehicle purpose is stored), F1, so both are in OP-R and OP-C, once (previously "Operating Cash Flow" −₦7,000).
+    assert.deepEqual(await opFigures(page), { opR: -7000, opC: -7000, unresolved: 0 });
 
     // Income received from a customer: arrives in the To account only.
     await openAdd(page, 'income');

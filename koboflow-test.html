@@ -1996,53 +1996,190 @@ function scopePaySide(s){
   var p=s&&s.payer;if(!p||p.side!=='from'||p.status!=='mapped')return'other';
   return p.ownership==='business'?'business':p.ownership==='shared'?'shared':'other';
 }
+/* ── Stage 2 (P-D18, D-F2, O1, D-F2c; design 3C.1a): the Shared-account replay ──
+   For every confirmed Shared account, the account's entries (dated on or after the opening date) are
+   replayed in ONE fixed order, so the result never depends on database retrieval or display order:
+   date, then time (a missing time first), then id (numeric ids by value before any other id, which
+   sort as text). The replay keeps the recorded balance B (the cash layer's own deltas, from the
+   opening balance) and the held unresolved inflows H (the cash layer's own unreconciledInflows rule,
+   applied entry by entry at each entry's own position, starting at 0). After each entry the confirmed
+   pharmacy portion is asked of the cash layer itself (pharmacyEligibleAccounts on the one account with
+   balance B and held H), so the rule is never re-implemented here. A pharmacy-purpose payment from the
+   account is counted in the pharmacy cash burn (C2) only for min(its pharmacy part, the fall in the
+   confirmed portion it caused) (D-F2c); the rest of its pharmacy part is "Amount not counted against
+   the confirmed pharmacy portion", and any further fall is the existing discrepancy rule (never
+   spending). Payments dated before the opening date contribute 0 ("Paid before the opening date").
+   Read-only: nothing is stored and the cash layer is unchanged. */
+function replayIdNum(id){
+  if(typeof id==='number'&&isFinite(id))return id;
+  if(typeof id==='string'&&/^\d+$/.test(id))return Number(id);
+  return null;
+}
+function replayOrder(a,b){
+  var da=String(a&&a.date||''),db=String(b&&b.date||'');if(da!==db)return da<db?-1:1;
+  var ta=String(a&&a.time||''),tb=String(b&&b.time||'');if(ta!==tb)return ta<tb?-1:1;
+  var na=replayIdNum(a&&a.id),nb=replayIdNum(b&&b.id);
+  if(na!==null&&nb!==null)return na<nb?-1:na>nb?1:0;
+  if(na!==null)return -1;if(nb!==null)return 1;
+  var sa=String(a&&a.id),sb=String(b&&b.id);return sa<sb?-1:sa>sb?1:0;
+}
+/* The confirmed pharmacy portion (kobo) the cash layer counts for account a with recorded balance B and
+   held unresolved inflows H (both kobo). */
+function replayPortionK(a,B,H){
+  var u={};if(H)u[a.id]=fromK(H);
+  var r=pharmacyEligibleAccounts([Object.assign({},a,{balance:fromK(B)})],{unreconciled:u});
+  return toK(r.accounts[0].balance);
+}
+function sharedReplay(accounts,txns,ctx,opts){
+  opts=opts||{};var bl=opts.baselineDate||null,aliases=opts.aliases||{},byEntry={},byAccount={};
+  (accounts||[]).forEach(function(a){
+    if(!a||!a.id||accountOwnership(a)!=='shared'||!ownershipConfirmed(a))return;
+    var X=a.id,list=[],pre=[];
+    (txns||[]).forEach(function(t){
+      if(!t||t.voided||t.demo)return;
+      var d=accountDeltas(t,aliases);if(!(X in d))return;
+      if(bl&&(t.date||'')<bl)pre.push(t);else list.push(t);
+    });
+    list.sort(replayOrder);
+    var B=toK(a.opening!==undefined?a.opening:a.balance),H=0,rows=[],tot={c2:0,notCounted:0,preOpening:0,discrepancy:0};
+    function payment(t){
+      if(t.type!=='expense'&&t.type!=='obligation')return 0;
+      var s=scopeOf(t,ctx);if(!s||!s.payer||s.payer.status!=='mapped'||s.payer.acct!==X||s.payer.ownership!=='shared')return 0;
+      return s.parts.pharmacy;
+    }
+    pre.forEach(function(t){
+      var P=payment(t);if(!(P>0))return;
+      byEntry[t.id]={acct:X,pharmacyPart:fromK(P),c2:0,notCounted:0,preOpening:fromK(P),row:null};tot.preOpening+=P;
+    });
+    list.forEach(function(t){
+      var before=replayPortionK(a,B,H),bBefore=B;
+      B+=toK(accountDeltas(t,aliases)[X]||0);
+      var h=toK(unreconciledInflows(accounts,[t],{baselineDate:bl,aliases:aliases}).byAccount[X]||0);H+=h;
+      var after=replayPortionK(a,B,H),fall=Math.max(0,before-after),P=payment(t),c=P>0?Math.min(P,fall):0;
+      var row={id:t.id,date:t.date||'',time:t.time||'',balanceBefore:fromK(bBefore),balanceAfter:fromK(B),held:fromK(H),heldInflow:fromK(h),
+        portionBefore:fromK(before),portionAfter:fromK(after),fall:fromK(fall),pharmacyPart:fromK(P),c2:fromK(c),notCounted:fromK(P>0?P-c:0),discrepancyReduction:fromK(fall-c)};
+      rows.push(row);tot.discrepancy+=fall-c;
+      if(P>0){byEntry[t.id]={acct:X,pharmacyPart:fromK(P),c2:fromK(c),notCounted:fromK(P-c),preOpening:0,row:row};tot.c2+=c;tot.notCounted+=P-c;}
+    });
+    byAccount[X]={id:X,label:a.label||X,declared:sharedPortion(a).amount,finalBalance:fromK(B),finalHeld:fromK(H),finalPortion:fromK(replayPortionK(a,B,H)),
+      rows:rows,c2:fromK(tot.c2),notCounted:fromK(tot.notCounted),preOpening:fromK(tot.preOpening),discrepancyReductions:fromK(tot.discrepancy)};
+  });
+  return{byEntry:byEntry,byAccount:byAccount};
+}
+/* The funding line of an entry's pharmacy-purpose expenditure (3C.1), by its paying side: a confirmed
+   Business account (F1), a confirmed Shared account (F2), a confirmed Personal account (F3), or any
+   other side: Outside, missing, unresolved, unconfirmed or not chosen (F4). */
+function scopeFundLine(p){
+  if(!p||p.status!=='mapped')return'f4';
+  return p.ownership==='business'?'f1':p.ownership==='shared'?'f2':p.ownership==='personal'?'f3':'f4';
+}
+/* Where income was recorded (3A): (iv) no receiving account; (ii) a confirmed Business account but dated
+   before the opening date or held as an unresolved inflow; (i) a confirmed Business account otherwise;
+   (iii) any other recorded receiving side. The first matching row decides. */
+function scopeIncomeLine(p,pre,held){
+  if(!p||p.missing)return'incomeNoAccount';
+  if(p.status==='mapped'&&p.ownership==='business')return pre||held?'incomeNotConfirmedCash':'incomeCashReceived';
+  return'incomeOtherAccount';
+}
+/* Every per-entry contribution key (kobo inside the engine, naira in results). Each figure of the Stage 2
+   screens is the sum of one key over the entries of its period; explain(m, key) lists those entries. */
+var FIGURE_KEYS=['pharmacyReceipts','incomeCashReceived','incomeNotConfirmedCash','incomeOtherAccount','incomeNoAccount','personalIncome','unresolvedIncome','unresolvedIncomeConfirmedPharmacy','allRecordedIncome',
+  'b1','f1','f2','f2Counted','f2NotCounted','f2PreOpening','f3','f4','personalExpenses','unresolvedSpending','unresolvedSpendingBusiness','unresolvedSpendingShared','unresolvedSpendingOther',
+  'unresolvedFinanceCost','unresolvedFinanceCostBusiness','unresolvedFinanceCostShared','unresolvedFinanceCostOther','provisionalRepayments','provisionalBusiness','provisionalShared','provisionalOther',
+  'burn','burnConfirmed','burnUnresolvedOrProvisional','burnUnresolvedBusiness','burnUnresolvedShared',
+  'loanReceipts','principalRepaid','externalFunding','capitalOwnMoney','capitalInjectionsSourceUnconfirmed','ownerWithdrawals','ownerContributions','implicitOwnerContribution',
+  'internalMovements','unresolvedAccountMovements','otherEntries','opResult','opCash','opDiff','opDiffIncome','opDiffSpending'];
 /* Sums of the classification of live entries dated from..to (inclusive), by the measures table. Every
    kobo of every entry goes to exactly one exclusive bucket (`excl`); the owner-withdrawal and
    owner-contribution totals also carry the approved cross-boundary double statements (5.4). The
-   pre-opening parts are "of which" parts of their Business or Shared figure, never added again. */
-function scopeTotals(txns,ctx,from,to,baselineDate){
+   pre-opening parts are "of which" parts of their Business or Shared figure, never added again.
+   Stage 2 (additive): each entry also carries its paying side, where it was received, whether it is
+   pre-opening or held, its category, and its contribution to every Stage 2 figure (FIGURE_KEYS); the
+   pharmacy-purpose expenditure is split by funding line F1–F4 (3C.1) and the Shared part by the
+   replay (rep, from sharedReplay). */
+function scopeTotals(txns,ctx,from,to,baselineDate,rep){
   function acct(){return{business:0,businessPreOpening:0,shared:0,sharedPreOpening:0,other:0};}
   var z={opex:0,personal:0,unresSpend:acct(),finPh:0,finPe:0,finUnres:acct(),prov:acct(),withdrawals:0,contributions:0,
     receiptsPh:0,incomePe:0,incomeUnres:0,receiptsPhNoAcct:0,incomePeNoAcct:0,allIncome:0,financingReceipts:0,principal:0,external:0,unresMoves:0,capUnconfirmed:0,unknownType:0,
-    kindWithdrawal:0,kindContribution:0,internal:0,card:{pharmacy:0,personal:0,unclassified:0},total:0,kinds:{},entries:[]};
+    kindWithdrawal:0,kindContribution:0,internal:0,card:{pharmacy:0,personal:0,unclassified:0},total:0,kinds:{},entries:[],fig:{},
+    breakdown:{pharmacyExpenses:{},personalExpenses:{},unresolvedSpending:{},pharmacyIncome:{},personalIncome:{},unresolvedIncome:{}}};
+  FIGURE_KEYS.forEach(function(k){z.fig[k]=0;});
+  var held=rep&&rep.held||null;
   function add(b,side,pre,v){b[side]+=v;if(pre&&side!=='other')b[side+'PreOpening']+=v;}
+  function cat(map,c,v){if(v)map[c]=(map[c]||0)+v;}
   (txns||[]).forEach(function(t){
     var d=String(t&&t.date||'').slice(0,10);if(!d||(from&&d<from)||(to&&d>to))return;
     var s=scopeOf(t,ctx);if(!s)return;
     var P=s.parts,c=s.components,k=c?c.principal+c.financeCost.pharmacy+c.financeCost.personal+c.financeCost.unclassified+c.repaymentSplitPending:P.pharmacy+P.personal+P.unclassified;
     var side=scopePaySide(s),pre=side!=='other'&&!!(baselineDate&&d<baselineDate);
+    var preDate=!!(baselineDate&&d<baselineDate),isHeld=!!(held&&held[t.id]),ck={},ec=String(t.cat||'Other');
+    function cadd(key,v){if(v)ck[key]=(ck[key]||0)+v;}
     z.total+=k;z.kinds[s.kind]=(z.kinds[s.kind]||0)+k;
-    z.allIncome+=toK(classifyTxn(t).income); // "all recorded income": a labelled transition comparison only
+    var inc=toK(classifyTxn(t).income);z.allIncome+=inc;cadd('allRecordedIncome',inc); // "all recorded income": a labelled transition comparison only
     if(t.type==='expense'||t.type==='obligation'){
       z.opex+=P.pharmacy;z.personal+=P.personal;add(z.unresSpend,side,pre,P.unclassified);
       z.card.pharmacy+=P.pharmacy;z.card.personal+=P.personal;z.card.unclassified+=P.unclassified;
+      if(P.pharmacy){
+        var fl=scopeFundLine(s.payer);cadd('b1',P.pharmacy);cadd(fl,P.pharmacy);cat(z.breakdown.pharmacyExpenses,ec,P.pharmacy);
+        if(fl==='f2'){
+          var r=rep&&rep.byEntry&&rep.byEntry[t.id],rc=r?toK(r.c2):0,rpre=r?toK(r.preOpening):(preDate?P.pharmacy:0);
+          cadd('f2Counted',rc);cadd('f2PreOpening',rpre);cadd('f2NotCounted',P.pharmacy-rc-rpre);
+        }
+      }
+      cadd('personalExpenses',P.personal);cat(z.breakdown.personalExpenses,ec,P.personal);
+      if(P.unclassified){cadd('unresolvedSpending',P.unclassified);cadd(side==='business'?'unresolvedSpendingBusiness':side==='shared'?'unresolvedSpendingShared':'unresolvedSpendingOther',P.unclassified);cat(z.breakdown.unresolvedSpending,ec,P.unclassified);}
     }else if(t.type==='income'){
       z.receiptsPh+=P.pharmacy;z.incomePe+=P.personal;z.incomeUnres+=P.unclassified;
       // "Of which, no receiving account" (P-D13c): informational subdivisions of the two parents above, in
       // addition to (never instead of) them; never in excl, card or total, so never additional income.
       if(s.payer&&s.payer.missing){z.receiptsPhNoAcct+=P.pharmacy;z.incomePeNoAcct+=P.personal;}
       z.card.pharmacy+=P.pharmacy;z.card.personal+=P.personal;z.card.unclassified+=P.unclassified;
+      if(P.pharmacy){cadd('pharmacyReceipts',P.pharmacy);cadd(scopeIncomeLine(s.payer,preDate,isHeld),P.pharmacy);cat(z.breakdown.pharmacyIncome,ec,P.pharmacy);}
+      cadd('personalIncome',P.personal);cat(z.breakdown.personalIncome,ec,P.personal);
+      if(P.unclassified){cadd('unresolvedIncome',P.unclassified);cat(z.breakdown.unresolvedIncome,ec,P.unclassified);
+        if(s.payer&&s.payer.status==='mapped'&&s.payer.ownership==='business')cadd('unresolvedIncomeConfirmedPharmacy',P.unclassified);}
     }else if(s.kind==='loan_repayment'){
       // Components only (P-D11e): principal is financing; interest and fees are an expense; the
       // provisional amount is neither. The informational parts are never read.
       z.principal+=c.principal;z.finPh+=c.financeCost.pharmacy;z.finPe+=c.financeCost.personal;
       add(z.finUnres,side,pre,c.financeCost.unclassified);add(z.prov,side,pre,c.repaymentSplitPending);
       z.card.pharmacy+=c.financeCost.pharmacy;z.card.personal+=c.financeCost.personal;z.card.unclassified+=c.financeCost.unclassified;
-    }else if(s.kind==='financing')z.financingReceipts+=k;
-    else if(s.kind==='external_funding')z.external+=k;
+      cadd('principalRepaid',c.principal);
+      if(c.financeCost.pharmacy){var fl2=scopeFundLine(s.payer);cadd('b1',c.financeCost.pharmacy);cadd(fl2,c.financeCost.pharmacy);if(fl2==='f2')cadd('f2NotCounted',c.financeCost.pharmacy);cat(z.breakdown.pharmacyExpenses,'Loan interest & fees',c.financeCost.pharmacy);} // none before stage 6
+      cadd('personalExpenses',c.financeCost.personal);cat(z.breakdown.personalExpenses,'Loan interest & fees',c.financeCost.personal);
+      if(c.financeCost.unclassified){cadd('unresolvedFinanceCost',c.financeCost.unclassified);cadd(side==='business'?'unresolvedFinanceCostBusiness':side==='shared'?'unresolvedFinanceCostShared':'unresolvedFinanceCostOther',c.financeCost.unclassified);cat(z.breakdown.unresolvedSpending,'Loan interest & fees',c.financeCost.unclassified);}
+      if(c.repaymentSplitPending){cadd('provisionalRepayments',c.repaymentSplitPending);cadd(side==='business'?'provisionalBusiness':side==='shared'?'provisionalShared':'provisionalOther',c.repaymentSplitPending);}
+    }else if(s.kind==='financing'){z.financingReceipts+=k;cadd('loanReceipts',k);}
+    else if(s.kind==='external_funding'){z.external+=k;cadd('externalFunding',k);}
     else if(s.kind==='owner_withdrawal')z.kindWithdrawal+=k;
-    else if(s.kind==='owner_contribution')z.kindContribution+=k;
-    else if(s.kind==='pharmacy_internal'||s.kind==='personal_internal')z.internal+=k;
-    else if(s.flags.indexOf('funding_source_unconfirmed')>=0)z.capUnconfirmed+=k;     // P-D15 (Q7: only here)
-    else if(SCOPE_MOVE[t.type]||t.type==='capital_injection')z.unresMoves+=k;          // P-D15
-    else z.unknownType+=k; // a type the design does not define: unclassified, in no section 6 figure
-    if(s.kind==='owner_withdrawal'||s.kind==='cross_pharmacy_paid_personal')z.withdrawals+=k;
-    if(s.kind==='owner_contribution'||s.kind==='cross_personal_paid_pharmacy')z.contributions+=k;
+    else if(s.kind==='owner_contribution'){z.kindContribution+=k;if(t.type==='capital_injection')cadd('capitalOwnMoney',k);}
+    else if(s.kind==='pharmacy_internal'||s.kind==='personal_internal'){z.internal+=k;cadd('internalMovements',k);}
+    else if(s.flags.indexOf('funding_source_unconfirmed')>=0){z.capUnconfirmed+=k;cadd('capitalInjectionsSourceUnconfirmed',k);}     // P-D15 (Q7: only here)
+    else if(SCOPE_MOVE[t.type]||t.type==='capital_injection'){z.unresMoves+=k;cadd('unresolvedAccountMovements',k);}          // P-D15
+    else{z.unknownType+=k;cadd('otherEntries',k);} // a type the design does not define: unclassified, in no section 6 figure
+    if(s.kind==='owner_withdrawal'||s.kind==='cross_pharmacy_paid_personal'){z.withdrawals+=k;cadd('ownerWithdrawals',k);}
+    if(s.kind==='owner_contribution'||s.kind==='cross_personal_paid_pharmacy'){z.contributions+=k;cadd('ownerContributions',k);}
+    if(s.kind==='cross_personal_paid_pharmacy')cadd('implicitOwnerContribution',k);
+    // Pharmacy cash burn (P-D18): F1 + C2 + C3..C8. Derived figures (3E): OP-R, OP-C and their difference.
+    var conf=(ck.f1||0)+(ck.f2Counted||0),unr=(ck.unresolvedSpendingBusiness||0)+(ck.unresolvedSpendingShared||0)+(ck.unresolvedFinanceCostBusiness||0)+(ck.unresolvedFinanceCostShared||0)+(ck.provisionalBusiness||0)+(ck.provisionalShared||0);
+    cadd('burnConfirmed',conf);cadd('burnUnresolvedOrProvisional',unr);cadd('burn',conf+unr);
+    cadd('burnUnresolvedBusiness',(ck.unresolvedSpendingBusiness||0)+(ck.unresolvedFinanceCostBusiness||0)+(ck.provisionalBusiness||0));
+    cadd('burnUnresolvedShared',(ck.unresolvedSpendingShared||0)+(ck.unresolvedFinanceCostShared||0)+(ck.provisionalShared||0));
+    cadd('opResult',(ck.pharmacyReceipts||0)-(ck.b1||0));
+    cadd('opCash',(ck.incomeCashReceived||0)-conf);
+    var dI=(ck.incomeNotConfirmedCash||0)+(ck.incomeOtherAccount||0)+(ck.incomeNoAccount||0),dS=(ck.f3||0)+(ck.f4||0)+(ck.f2NotCounted||0)+(ck.f2PreOpening||0);
+    cadd('opDiffIncome',dI);cadd('opDiffSpending',dS);cadd('opDiff',dI-dS);
+    for(var key in ck)z.fig[key]+=ck[key];
     // The entry's stored amount (legacy Number(amount) || 0). It equals k for every entry except a repayment
     // with a non-positive amount, whose components (and so its classified total) are zero.
     var e={id:t.id,date:d,desc:t.desc||'',type:t.type||'',amount:fromK(toK(Number(t.amount)||0)),kind:s.kind,basis:s.basis,flags:s.flags.slice(),
       parts:{pharmacy:fromK(P.pharmacy),personal:fromK(P.personal),unclassified:fromK(P.unclassified)}};
     if(c)e.components={principal:fromK(c.principal),financeCost:{pharmacy:fromK(c.financeCost.pharmacy),personal:fromK(c.financeCost.personal),unclassified:fromK(c.financeCost.unclassified)},repaymentSplitPending:fromK(c.repaymentSplitPending)};
+    // Stage 2 (additive): the facts behind every Stage 2 figure, read only.
+    e.time=String(t.time||'');e.cat=ec;e.paySide=side;e.preOpening=preDate;e.held=isHeld;
+    e.recv=t.type==='income'&&s.payer?{status:s.payer.status,ownership:s.payer.ownership,acct:s.payer.acct,missing:!!s.payer.missing}:null;
+    e.contrib={};for(var key2 in ck)e.contrib[key2]=fromK(ck[key2]);
+    if(rep&&rep.byEntry&&rep.byEntry[t.id]&&rep.byEntry[t.id].row)e.replay=rep.byEntry[t.id].row;
     z.entries.push(e);
   });
   // The exclusive buckets: their sum equals the sum of the entries' amounts (no kobo lost or counted twice).
@@ -2053,31 +2190,41 @@ function scopeTotals(txns,ctx,from,to,baselineDate){
     unresMoves:z.unresMoves,capUnconfirmed:z.capUnconfirmed,unknownType:z.unknownType};
   return z;
 }
-/* The pharmacy cash burn (section 6): pharmacy operating expenses (incl. pharmacy finance cost) +
-   unresolved spending, unresolved finance cost and provisional repayments of confirmed Business and
-   confirmed Shared accounts. The pre-opening parts are inside these parents and never added again. */
-function scopeBurnK(z){return z.opex+z.finPh+z.unresSpend.business+z.unresSpend.shared+z.finUnres.business+z.finUnres.shared+z.prov.business+z.prov.shared;}
+/* The pharmacy cash burn (section 6, revised by P-D18): pharmacy operating expenditure paid from
+   confirmed pharmacy cash (F1, and C2: the part of Shared payments counted against the account's
+   confirmed pharmacy portion by the replay) + unresolved spending, unresolved finance cost and
+   provisional repayments of confirmed Business and confirmed Shared accounts (C3–C8, in full: D-F2b).
+   Pharmacy expenditure paid personally (F3), with an unconfirmed funding source (F4), or not counted
+   against a Shared account's confirmed portion is in pharmacy operating expenditure but not in the burn.
+   The pre-opening parts are inside these parents and never added again. */
+function scopeBurnK(z){return z.fig.burn;}
 /* The measures table (design section 6) as ONE function returning every figure, from the cash layer
    (unchanged) and scopeOf. opts: {aliases, agreements, baselineDate, buckets, from, to, today,
    historyStart, vehiclePurposes, vehicleOf}. Period figures cover from..to; the runway uses the existing
    window rules (spendingRunway: from historyStart, at least 30 and at most 90 days, up to today).
-   Read-only. */
+   Read-only. Stage 2 adds (never changing a Stage 1 key other than the burn, P-D18): `figures` (every
+   FIGURE_KEYS total for the period), `breakdown` (per-category totals), the per-entry facts, the Shared
+   replay (`sharedReplay`), and the runway window's own figures (`runway.figures`). */
+function figuresOut(z){var o={};FIGURE_KEYS.forEach(function(k){o[k]=fromK(z.fig[k]);});return o;}
+function breakdownOut(z){var o={};Object.keys(z.breakdown).forEach(function(g){o[g]={};Object.keys(z.breakdown[g]).forEach(function(c){o[g][c]=fromK(z.breakdown[g][c]);});});return o;}
 function financialMeasures(accounts,txns,opts){
   opts=opts||{};var td=opts.today||today(),ctx=scopeContext(accounts,opts),bl=opts.baselineDate||null;
   var bal=accountBalances(accounts||[],txns,{baselineDate:bl,aliases:opts.aliases});
   var withBal=(accounts||[]).map(function(a){return Object.assign({},a,{balance:bal[a.id]});});
   var held=unreconciledInflows(accounts||[],txns,{baselineDate:bl,aliases:opts.aliases});
   var cash=pharmacyCashPosition(withBal,opts.buckets||[],{unreconciled:held.byAccount});
-  var p=scopeTotals(txns,ctx,opts.from||null,opts.to||null,bl);
+  var rep=sharedReplay(accounts||[],txns,ctx,{baselineDate:bl,aliases:opts.aliases});
+  rep.held={};held.entries.forEach(function(h){rep.held[h.id]=true;});
+  var p=scopeTotals(txns,ctx,opts.from||null,opts.to||null,bl,rep);
   // Runway: confirmed pharmacy cash (available) / average daily pharmacy cash burn over the window.
   var start=parseDate(opts.historyStart)?String(opts.historyStart).slice(0,10):td;if(start>td)start=td;
-  var days=Math.min(RUNWAY_MAX_DAYS,daysBetween(start,td)+1),wFrom=addDays(td,1-days),w=scopeTotals(txns,ctx,wFrom,td,bl);
+  var days=Math.min(RUNWAY_MAX_DAYS,daysBetween(start,td)+1),wFrom=addDays(td,1-days),w=scopeTotals(txns,ctx,wFrom,td,bl,rep);
   var burnK=scopeBurnK(w),reason=days<RUNWAY_MIN_DAYS?'short_history':burnK<=0?'no_spending':null,daily=fromK(burnK)/days;
   var opexK=p.opex+p.finPh,F2=fromK;
   return{
     period:{from:opts.from||null,to:opts.to||null},
     balances:bal,
-    confirmedPharmacyCash:{available:cash.available,restricted:cash.restricted,total:cash.total,heldUnresolvedInflows:held.total,warnings:cash.warnings},
+    confirmedPharmacyCash:{available:cash.available,restricted:cash.restricted,total:cash.total,earmarked:cash.earmarked,unearmarked:cash.unearmarked,heldUnresolvedInflows:held.total,warnings:cash.warnings},
     pharmacyOperatingExpenses:F2(opexK),
     pharmacyFinanceCost:F2(p.finPh),                                   // from stage 6; none before
     unresolvedSpendingPharmacyAccounts:F2(p.unresSpend.business),      // confirmed Business accounts (P-D10t)
@@ -2095,7 +2242,7 @@ function financialMeasures(accounts,txns,opts){
     provisionalRepaymentsSharedAccounts:F2(p.prov.shared),
     provisionalRepaymentsSharedAccountsPreOpening:F2(p.prov.sharedPreOpening),
     provisionalRepaymentsOther:F2(p.prov.other),
-    pharmacyCashBurn:F2(scopeBurnK(p)),
+    pharmacyCashBurn:F2(scopeBurnK(p)),                                // P-D18: F1 + C2 + C3..C8
     personalExpenses:F2(p.personal+p.finPe),
     personalFinanceCost:F2(p.finPe),                                   // from stage 6; none before
     ownerWithdrawals:F2(p.withdrawals),
@@ -2107,11 +2254,14 @@ function financialMeasures(accounts,txns,opts){
     unresolvedIncome:F2(p.incomeUnres),
     allRecordedIncome:F2(p.allIncome),                                 // transition comparison only; not a pharmacy figure
     financing:F2(p.financingReceipts+p.principal),                     // P-D2: loan receipts + principal repaid
+    financingReceipts:F2(p.financingReceipts),                         // Stage 2, of which: loan receipts
+    loanPrincipalRepaid:F2(p.principal),                               // Stage 2, of which: principal repaid
     externalFunding:F2(p.external),                                    // N3a
     unresolvedAccountMovements:F2(p.unresMoves),                       // P-D15
     capitalInjectionsSourceUnconfirmed:F2(p.capUnconfirmed),           // P-D15, N3b
     runway:{known:!reason,reason:reason,historyDays:days,minDays:RUNWAY_MIN_DAYS,windowStart:wFrom,burn:F2(burnK),
-      dailyBurn:reason?null:daily,days:reason?null:Math.round((Number(cash.available)||0)/daily)},
+      dailyBurn:reason?null:daily,days:reason?null:Math.round((Number(cash.available)||0)/daily),
+      figures:figuresOut(w),entries:w.entries,available:cash.available},
     // The read-only summary (P-D3): income, expense and obligation parts and loan interest and fees only;
     // everything else is shown separately and never added to these totals.
     scope:{pharmacy:F2(p.card.pharmacy),personal:F2(p.card.personal),unclassified:F2(p.card.unclassified),
@@ -2120,8 +2270,89 @@ function financialMeasures(accounts,txns,opts){
         capitalInjectionsSourceUnconfirmed:F2(p.capUnconfirmed),otherEntries:F2(p.unknownType)},
       byKind:Object.keys(p.kinds).reduce(function(o,kd){o[kd]=F2(p.kinds[kd]);return o;},{}),
       exclusive:Object.keys(p.excl).reduce(function(o,kd){o[kd]=F2(p.excl[kd]);return o;},{}),total:F2(p.total)},
+    figures:figuresOut(p),
+    breakdown:breakdownOut(p),
+    sharedReplay:rep.byAccount,
     entries:p.entries
   };
+}
+/* ── Stage 2 derivations: pure functions of ONE measures result (never of transactions), so every
+   screen shows the same figures (design 23; plan 2.1). ── */
+function mK(v){return toK(Number(v)||0);}
+/* The Cash Flow statement (plan 3E): the operating section has TWO distinct, named measures and the
+   reconciling line between them, with unresolved and provisional cash movements identified separately
+   and inside neither total.
+   OP-R Pharmacy operating result = recorded pharmacy income − pharmacy operating expenditure (B1, every
+   funding source). OP-C Pharmacy cash movement from operations = cash received into confirmed pharmacy
+   accounts (3A line (i)) − pharmacy expenditure paid from confirmed pharmacy cash (F1 + C2).
+   Identity: OP-R − OP-C = (lines (ii) + (iii) + (iv)) − (F3 + F4 + F2 not counted, including pre-opening). */
+function cashFlowStatement(m){
+  var f=m.figures,K2=function(k){return mK(f[k]);};
+  var loans=K2('loanReceipts'),prin=K2('principalRepaid'),fc=K2('unresolvedFinanceCost'),prov=K2('provisionalRepayments'),ext=K2('externalFunding'),capU=K2('capitalInjectionsSourceUnconfirmed');
+  var finNet=loans-prin-fc-prov+ext+capU;
+  return{
+    period:m.period,
+    operatingResult:fromK(K2('opResult')),
+    operatingResultParts:{pharmacyReceipts:f.pharmacyReceipts,incomeCashReceived:f.incomeCashReceived,incomeNotConfirmedCash:f.incomeNotConfirmedCash,incomeOtherAccount:f.incomeOtherAccount,incomeNoAccount:f.incomeNoAccount,
+      b1:f.b1,f1:f.f1,f2:f.f2,f2Counted:f.f2Counted,f2NotCounted:f.f2NotCounted,f2PreOpening:f.f2PreOpening,f3:f.f3,f4:f.f4},
+    operatingCash:fromK(K2('opCash')),
+    operatingCashParts:{incomeCashReceived:f.incomeCashReceived,f1:f.f1,f2Counted:f.f2Counted,paidFromConfirmedCash:fromK(K2('f1')+K2('f2Counted'))},
+    difference:{total:fromK(K2('opDiff')),incomeNotConfirmedCash:f.opDiffIncome,spendingNotFromConfirmedCash:f.opDiffSpending},
+    separate:{unresolvedOrProvisionalBusiness:f.burnUnresolvedBusiness,unresolvedOrProvisionalShared:f.burnUnresolvedShared,
+      unresolvedIncomeConfirmedPharmacy:f.unresolvedIncomeConfirmedPharmacy,heldUnresolvedInflows:m.confirmedPharmacyCash?m.confirmedPharmacyCash.heldUnresolvedInflows:0},
+    personal:{income:f.personalIncome,spending:f.personalExpenses,net:fromK(K2('personalIncome')-K2('personalExpenses'))},
+    unresolved:{income:f.unresolvedIncome,spending:fromK(K2('unresolvedSpending')+K2('unresolvedFinanceCost'))},
+    financing:{loanReceipts:f.loanReceipts,principalRepaid:f.principalRepaid,financeCost:f.unresolvedFinanceCost,provisionalRepayments:f.provisionalRepayments,
+      externalFunding:f.externalFunding,capitalInjectionsSourceUnconfirmed:f.capitalInjectionsSourceUnconfirmed,net:fromK(finNet)},
+    owner:{withdrawals:f.ownerWithdrawals,contributions:f.ownerContributions,implicitContribution:f.implicitOwnerContribution,capitalOwnMoney:f.capitalOwnMoney},
+    movements:{internal:f.internalMovements,unresolved:f.unresolvedAccountMovements}
+  };
+}
+/* Budget consumption (plan 2.1; brief 6.3): per budget category, the classified pharmacy and personal
+   spending of the period, shown apart. Unresolved spending in the category is shown, never consumed.
+   Financing, principal, transfers and withdrawals are never consumption. */
+function budgetConsumption(budgets,m){
+  return(budgets||[]).filter(function(b){return b&&b.cat;}).map(function(b){
+    var ph=0,pe=0,un=0;
+    (m.entries||[]).forEach(function(e){if(e.cat!==b.cat)return;var c=e.contrib||{};ph+=mK(c.b1);pe+=mK(c.personalExpenses);un+=mK(c.unresolvedSpending);});
+    var amt=Number(b.amount)||0,used=ph+pe;
+    return{cat:b.cat,amount:amt,pharmacy:fromK(ph),personal:fromK(pe),used:fromK(used),unresolved:fromK(un),pct:amt>0?Math.round(fromK(used)/amt*100):0};
+  });
+}
+/* Daily totals (plan 2.1; brief 6.4), from the measures' entries: pharmacy income and pharmacy operating
+   expenditure, personal income and spending, unresolved income and spending, per date. */
+function dailyTotals(m){
+  var out={};
+  (m.entries||[]).forEach(function(e){
+    var d=e.date,c=e.contrib||{};if(!out[d])out[d]={date:d,pharmacyIn:0,pharmacyOut:0,personalIn:0,personalOut:0,unresolvedIn:0,unresolvedOut:0};
+    var o=out[d];o.pharmacyIn+=mK(c.pharmacyReceipts);o.pharmacyOut+=mK(c.b1);o.personalIn+=mK(c.personalIncome);o.personalOut+=mK(c.personalExpenses);
+    o.unresolvedIn+=mK(c.unresolvedIncome);o.unresolvedOut+=mK(c.unresolvedSpending)+mK(c.unresolvedFinanceCost);
+  });
+  Object.keys(out).forEach(function(d){var o=out[d];['pharmacyIn','pharmacyOut','personalIn','personalOut','unresolvedIn','unresolvedOut'].forEach(function(k){o[k]=fromK(o[k]);});o.pharmacyNet=fromK(mK(o.pharmacyIn)-mK(o.pharmacyOut));});
+  return out;
+}
+/* Burn report (plan 2.1; brief 6.7): pharmacy operating expenditure (B1) with its funding lines, the
+   pharmacy cash burn with its components C1–C8, personal expenditure and finance cost, for the period of
+   the measures result (or, with window: true, the runway window). */
+function burnReport(m,opts){
+  var f=opts&&opts.window&&m.runway&&m.runway.figures?m.runway.figures:m.figures;
+  return{period:opts&&opts.window?{from:m.runway.windowStart,to:null,days:m.runway.historyDays}:m.period,
+    b1:f.b1,funding:{f1:f.f1,f2:f.f2,f2Counted:f.f2Counted,f2NotCounted:f.f2NotCounted,f2PreOpening:f.f2PreOpening,f3:f.f3,f4:f.f4},
+    components:{c1:f.f1,c2:f.f2Counted,c3:f.unresolvedSpendingBusiness,c4:f.unresolvedSpendingShared,c5:f.unresolvedFinanceCostBusiness,c6:f.unresolvedFinanceCostShared,c7:f.provisionalBusiness,c8:f.provisionalShared},
+    burn:f.burn,confirmed:f.burnConfirmed,unresolvedOrProvisional:f.burnUnresolvedOrProvisional,
+    unresolvedShare:mK(f.burn)>0?Math.round(mK(f.burnUnresolvedOrProvisional)/mK(f.burn)*1000)/10:0,
+    personalExpenditure:f.personalExpenses,financeCost:{unresolved:f.unresolvedFinanceCost},
+    notInBurn:{f3:f.f3,f4:f.f4,f2NotCounted:f.f2NotCounted,f2PreOpening:f.f2PreOpening,personal:f.personalExpenses,unresolvedOther:fromK(mK(f.unresolvedSpendingOther)+mK(f.unresolvedFinanceCostOther)+mK(f.provisionalOther)),
+      principal:f.principalRepaid,ownerWithdrawals:f.ownerWithdrawals}};
+}
+/* The contributing entries of one figure (plan 4.3 explainability): every entry of the period whose
+   contribution to `key` is not zero, with that contribution; they sum exactly to the figure. With
+   window: true, the runway window's figure and entries are used (its entries come from a separate
+   classification pass over the window). */
+function explain(m,key,opts){
+  var list=(opts&&opts.entries)||m.entries||[],tot=0,rows=[];
+  list.forEach(function(e){var v=e.contrib&&e.contrib[key];if(v){tot+=mK(v);rows.push({id:e.id,date:e.date,desc:e.desc,type:e.type,kind:e.kind,cat:e.cat,amount:e.amount,contribution:v,flags:e.flags,replay:e.replay||null});}});
+  return{key:key,period:m.period,total:fromK(tot),figure:m.figures?m.figures[key]:undefined,entries:rows};
 }
 
 /* ── Backup format compatibility (Stage 0; design section 15) ──
@@ -2241,7 +2472,7 @@ var API={toK:toK,fromK:fromK,num:num,fmtDate:fmtDate,parseDate:parseDate,today:t
   CATEGORIES:CATEGORIES,NATURES:NATURES,STRUCTURES:STRUCTURES,STATUSES:STATUSES,STATUS_LABEL:STATUS_LABEL,OPP_STRUCTURES:OPP_STRUCTURES,REMINDER_TEXT:REMINDER_TEXT,
   isDebt:isDebt,cashReceived:function(t){return fromK(cashReceivedK(t));},buildSchedule:buildSchedule,termsSummary:termsSummary,
   instalmentStates:instalmentStates,extraPrincipalInfo:extraPrincipalInfo,agreementBalances:agreementBalances,allocatePayment:allocatePayment,settlementPlan:settlementPlan,
-  classifyTxn:classifyTxn,accountDeltas:accountDeltas,SCOPE_KINDS:SCOPE_KINDS,scopeContext:scopeContext,scopeOf:scopeOf,routeObligation:routeObligation,financialMeasures:financialMeasures,BACKUP_FORMAT_NAME:BACKUP_FORMAT_NAME,SUPPORTED_BACKUP_FORMAT:SUPPORTED_BACKUP_FORMAT,newFinancialFields:newFinancialFields,backupNewFields:backupNewFields,checkBackupFormat:checkBackupFormat,validateBackupV2:validateBackupV2,accountBalances:accountBalances,mappingImpact:mappingImpact,OUTSIDE:OUTSIDE,sideStatus:sideStatus,unreconciledInflows:unreconciledInflows,movementReview:movementReview,upcomingObligations:upcomingObligations,cashForecast:cashForecast,
+  classifyTxn:classifyTxn,accountDeltas:accountDeltas,SCOPE_KINDS:SCOPE_KINDS,scopeContext:scopeContext,scopeOf:scopeOf,routeObligation:routeObligation,financialMeasures:financialMeasures,FIGURE_KEYS:FIGURE_KEYS,replayOrder:replayOrder,sharedReplay:sharedReplay,cashFlowStatement:cashFlowStatement,budgetConsumption:budgetConsumption,dailyTotals:dailyTotals,burnReport:burnReport,explain:explain,BACKUP_FORMAT_NAME:BACKUP_FORMAT_NAME,SUPPORTED_BACKUP_FORMAT:SUPPORTED_BACKUP_FORMAT,newFinancialFields:newFinancialFields,backupNewFields:backupNewFields,checkBackupFormat:checkBackupFormat,validateBackupV2:validateBackupV2,accountBalances:accountBalances,mappingImpact:mappingImpact,OUTSIDE:OUTSIDE,sideStatus:sideStatus,unreconciledInflows:unreconciledInflows,movementReview:movementReview,upcomingObligations:upcomingObligations,cashForecast:cashForecast,
   buildReminders:buildReminders,xirr:xirr,ACCOUNT_KINDS:ACCOUNT_KINDS,LEGACY_ACCOUNTS:LEGACY_ACCOUNTS,bucketSummary:bucketSummary,accountAccess:accountAccess,cashPosition:cashPosition,cashCover:cashCover,reservationPlan:reservationPlan,coveredAmount:coveredAmount,
   OWNERSHIP:OWNERSHIP,accountOwnership:accountOwnership,ownershipConfirmed:ownershipConfirmed,sharedPortion:sharedPortion,pharmacyEligibleAccounts:pharmacyEligibleAccounts,pharmacyCashPosition:pharmacyCashPosition,BILL_REPEAT:BILL_REPEAT,BILL_UNITS:BILL_UNITS,billRepeatLabel:billRepeatLabel,billCustomOk:billCustomOk,billDueDates:billDueDates,billAmountOn:billAmountOn,billOccurrences:billOccurrences,billObligations:billObligations,billUnmatchedPayments:billUnmatchedPayments,validateBill:validateBill,dataQuality:dataQuality,incomeFromFindings:incomeFromFindings,dupName:dupName,PARTY_MAX:PARTY_MAX,dateKey:dateKey,inDateRange:inDateRange,partyField:partyField,cleanParty:cleanParty,partyKey:partyKey,clipParty:clipParty,budgetProgress:budgetProgress,directorPlan:directorPlan,spendingRunway:spendingRunway,validateSetup:validateSetup,cashFlowSummary:cashFlowSummary,oppRepayments:oppRepayments,analyzeOpportunity:analyzeOpportunity,oppToTerms:oppToTerms,parseManualRows:parseManualRows};
 root.KoboFin=API;
@@ -2704,10 +2935,11 @@ body.kf-live .sample-tag{display:inline-block;}
         </div>
       </div>
       <div class="grid3">
-        <div class="stat-card"><div class="stat-label">Yesterday In</div><div class="stat-val" id="yd-in" style="color:var(--green);">--</div></div>
-        <div class="stat-card"><div class="stat-label">Yesterday Out</div><div class="stat-val" id="yd-out" style="color:var(--red);">--</div></div>
-        <div class="stat-card"><div class="stat-label">Net</div><div class="stat-val" id="yd-net">--</div></div>
+        <div class="stat-card"><div class="stat-label" id="yd-in-lbl">Yesterday In</div><div class="stat-val" id="yd-in" style="color:var(--green);">--</div></div>
+        <div class="stat-card"><div class="stat-label" id="yd-out-lbl">Yesterday Out</div><div class="stat-val" id="yd-out" style="color:var(--red);">--</div></div>
+        <div class="stat-card"><div class="stat-label" id="yd-net-lbl">Net</div><div class="stat-val" id="yd-net">--</div></div>
       </div>
+      <div id="yd-note" data-stage2="yesterday-note"></div>
 
       <!-- MORNING AUTOPILOT (v2.1) -->
       <div class="autopilot-card" id="autopilot-card">
@@ -2718,13 +2950,13 @@ body.kf-live .sample-tag{display:inline-block;}
       <div class="runway-card" id="runway-card">
         <div style="display:flex;justify-content:space-between;align-items:flex-start;">
           <div>
-            <div class="card-label" style="margin-bottom:4px;">SPENDING RUNWAY</div>
+            <div class="card-label" id="runway-title" style="margin-bottom:4px;">SPENDING RUNWAY</div>
             <div class="runway-days" id="runway-days">--</div>
             <div class="runway-label">DAYS REMAINING</div>
           </div>
           <div style="text-align:right;">
             <div id="runway-status" style="font-size:11px;font-weight:700;letter-spacing:.08em;text-transform:uppercase;margin-bottom:6px;">Calculating...</div>
-            <div style="font-size:10px;color:var(--muted);">If no new income arrives</div>
+            <div style="font-size:10px;color:var(--muted);" id="runway-if">If no new income arrives</div>
           </div>
         </div>
         <div class="muted-note" id="runway-basis" style="margin:6px 0 0;">Spending runway: expenses + interest/fees; excludes owner withdrawals and loan principal. Available cash excludes restricted accounts (coop, fixed deposit). Averaged over the days recorded since your baseline (up to the last 90); at least 30 days are needed.</div>
@@ -2834,6 +3066,7 @@ body.kf-live .sample-tag{display:inline-block;}
       <div class="screen-title">CAPITAL CENTER</div>
       <div class="screen-sub">How your growth is being financed</div>
       <div class="grid2" id="cap-summary"></div>
+      <div id="cap-financing" data-stage2="capital-financing"></div>
       <div class="cap-section">
         <div class="cap-section-title">ACTIVE LOANS &amp; FINANCING</div>
         <div id="loans-list"></div>
@@ -3005,13 +3238,16 @@ body.kf-live .sample-tag{display:inline-block;}
     <div class="screen" id="screen-analytics">
       <div class="screen-title">INTEL</div>
       <div class="screen-sub">Income &amp; spending &mdash; financing excluded</div>
+      <div id="ana-classic">
       <div class="grid2">
         <div class="ana-card income-card"><div class="ana-label">Income</div><div class="ana-val" id="ana-in">--</div></div>
         <div class="ana-card expense-card"><div class="ana-label">Spending</div><div class="ana-val" id="ana-out">--</div></div>
       </div>
       <div class="card"><div class="card-label">Spending by Category</div><div id="cat-breakdown"></div></div>
       <div class="card"><div class="card-label">Insights</div><div id="insights-list"></div></div>
-      <div class="card" id="scope-summary-card" style="display:none"><div class="card-label">Pharmacy / Personal / Unresolved (preview)</div><div id="scope-summary"></div></div>
+      </div>
+      <div id="ana-s2" data-stage2="analytics"></div>
+      <div class="card" id="scope-summary-card" style="display:none"><div class="card-label">Pharmacy / Personal / Unresolved: entries this month</div><div id="scope-summary"></div></div>
     </div>
 
     <div class="screen" id="screen-settings">
@@ -3087,6 +3323,8 @@ body.kf-live .sample-tag{display:inline-block;}
     <div class="screen" id="screen-ownerimpact">
       <div class="screen-title">OWNER IMPACT</div>
       <div class="screen-sub">Am I starving the business?</div>
+      <div id="oi-s2" data-stage2="ownerimpact"></div>
+      <div id="oi-classic">
       <div class="grid2" id="wd-stats"></div>
       <div class="card">
         <div class="card-label">Withdrawal vs Income Ratio</div>
@@ -3101,6 +3339,7 @@ body.kf-live .sample-tag{display:inline-block;}
         </div>
       </div>
       <div class="card"><div class="card-label">Insights</div><div id="wd-insights"></div></div>
+      </div>
     </div>
 
     <!-- RESTOCK ROI (v2.1) -->
@@ -3120,6 +3359,8 @@ body.kf-live .sample-tag{display:inline-block;}
     <div class="screen" id="screen-cashflow">
       <div class="screen-title">CASH FLOW</div>
       <div class="screen-sub">True cash flow statement</div>
+      <div id="cf-s2" data-stage2="cashflow"></div>
+      <div id="cf-classic">
       <div class="grid3" id="cf-summary-grid" style="margin-bottom:12px;"></div>
       <div class="card">
         <div class="cf-section-title">OPERATING ACTIVITIES</div>
@@ -3141,6 +3382,7 @@ body.kf-live .sample-tag{display:inline-block;}
         <div class="roi-bar-row" id="cf-trend-chart"></div>
       </div>
       <div class="card"><div class="card-label">Insights</div><div id="cf-insights"></div></div>
+      </div>
     </div>
   </div>
 
@@ -3450,6 +3692,12 @@ body.kf-live .sample-tag{display:inline-block;}
     </div>
   </div>
 
+  <div class="modal-overlay" id="explain-modal">
+    <div class="modal-box">
+      <div class="modal-head"><div class="modal-title">HOW THIS IS CALCULATED</div><button class="modal-close" data-close="explain-modal">&#215;</button></div>
+      <div id="explain-body"></div>
+    </div>
+  </div>
   <div class="modal-overlay" id="funds-modal">
     <div class="modal-box">
       <div class="modal-head"><div class="modal-title">CONFIRM FUNDS RECEIVED</div><button class="modal-close" data-close="funds-modal">&#215;</button></div>
@@ -3678,13 +3926,14 @@ function pill(text,bg,color){return'<span class="pill" style="background:'+bg+';
 
 function renderScore(){
   var lb=liveBudgets(),prog=null;
-  if(isLive()&&lb.length){prog=F.budgetProgress(lb,items,monthStartISO(),getToday());}
+  if(isLive()&&lb.length){prog=budgetsS2();['score-num','score-msg'].forEach(function(id){var x=qs(id);if(x)x.setAttribute('data-stage2','score');});} // Stage 2: classified spending (budgetConsumption)
   else if(isLive()){ // the score was built from sample budgets: never show it as a live result
     var a0=qs('score-arc');if(a0){a0.style.transition='none';a0.setAttribute('stroke','#4A4858');a0.setAttribute('stroke-dasharray','213.6 213.6');a0.setAttribute('stroke-dashoffset','213.6');}
     var n0=qs('score-num');if(n0){n0.textContent='--';n0.style.color='#7A7880';}
     var m0=qs('score-msg');if(m0)m0.textContent='Not available: no budgets set yet.';
     return;
   }
+  if(!prog)['score-num','score-msg'].forEach(function(id){var x=qs(id);if(x)x.removeAttribute('data-stage2');});
   var src=prog?prog.map(function(b){return{used:b.used,total:b.amount};}):BUDGETS;
   var avg=src.reduce(function(s,b){return s+pct(b.used,b.total);},0)/src.length;
   var score=Math.max(0,Math.round(100-avg*0.8));
@@ -3802,6 +4051,8 @@ function renderCashDrop(){
    V2.1 — CASH RUNWAY ENGINE
 ═══════════════════════════════════════════════════════════════ */
 function calcRunway(){
+  if(isLive())return calcRunwayS2(); // Stage 2: pharmacy cash runway from the measures (plan 3B)
+  runwayClassicLabels();
   // Available cash: the shared cash rule (restricted accounts such as coop and fixed deposits excluded).
   var liquid = cashNow().available;
 
@@ -3841,6 +4092,8 @@ function calcRunway(){
    V2.1 — OWNER WITHDRAWAL ANALYTICS
 ═══════════════════════════════════════════════════════════════ */
 function renderOwnerImpact(){
+  if(isLive()){classicArea('oi-classic',false);renderOwnerImpactS2();return;}
+  s2Area('oi-s2',false);classicArea('oi-classic',true);
   var now = new Date();
   var y   = now.getFullYear();
   var m   = now.getMonth();
@@ -5212,21 +5465,25 @@ function confirmSetup(){if(saving){setupResult(SETUP_BUSY_MSG);return;}guard(fun
 
 function renderDashboard(){
   renderScore();
+  var el;
+  if(isLive())yesterdayS2(); // Stage 2: pharmacy, personal and unresolved apart, from the measures
+  else{
+  yesterdayClassicLabels();
   var yd=getYest(),ydIn=0,ydOut=0;
   items.forEach(function(i){if(i.date!==yd)return;var c=F.classifyTxn(i);ydIn+=c.income;ydOut+=c.expense+c.financeCost;});
   var net=ydIn-ydOut;
-  var el;
   el=qs('yd-in');if(el)el.textContent=fmt(ydIn);
   el=qs('yd-out');if(el)el.textContent=fmt(ydOut);
   el=qs('yd-net');if(el){el.textContent=(net<0?'-':'')+fmt(net);el.style.color=net>=0?'#22C55E':'#EF4444';}
+  }
   el=qs('accounts-scroll');
   if(el)el.innerHTML=ACCOUNTS.map(function(a){return'<div class="acct-card"><div class="acct-name">'+a.icon+' '+esc(a.label)+'</div><div class="acct-bal">'+fmt(a.balance)+'</div><div class="acct-type">'+esc(a.type)+'</div></div>';}).join('');
   el=qs('ob-list');
   if(el){var obs=obligationsWithin(14);el.innerHTML=obs.length?obs.map(function(o){var od=o.dueDate<getToday();return'<div class="ob-item'+(od?' overdue':'')+'"'+(o.agreementId?' data-open-agr="'+esc(o.agreementId)+'" style="cursor:pointer;"':o.billId?' data-nav="bills" style="cursor:pointer;"':'')+'><div class="ob-left"><span>'+o.icon+'</span><div><div class="ob-desc">'+esc(o.label)+'</div><div class="ob-due">'+dueText(o.dueDate)+' &middot; '+esc(o.source)+'</div></div></div><div class="ob-amount">'+fmt(o.remaining)+'</div></div>';}).join(''):'<div class="muted-note">Nothing due in the next 14 days.</div>';}
   el=qs('budget-list');
   var lbg=liveBudgets();
-  if(el&&isLive()&&lbg.length)el.innerHTML=F.budgetProgress(lbg,items,monthStartISO(),getToday()).map(function(b){var c=hColor(b.pct);return'<div class="budget-row" data-budget="'+esc(b.cat)+'"><div class="budget-top"><div class="budget-cat">'+esc(b.cat)+'</div><div class="budget-right"><span class="budget-fig">'+fmt(b.used)+' of '+fmt(b.amount)+'</span><span class="budget-pct" style="color:'+c+'">'+b.pct+'%</span></div></div><div class="budget-track"><div class="budget-bar" data-pct="'+Math.min(100,b.pct)+'" style="background:'+c+';"></div></div></div>';}).join('')+'<div class="muted-note">Budgets you set in Settings &rarr; Accounts. This month so far.</div>';
-  else if(el&&isLive())el.innerHTML='<div class="muted-note" data-live-na="budgets">No budgets set yet.</div>';
+  if(el)el.removeAttribute('data-stage2');
+  if(el&&isLive()){budgetListS2(el);raf2(function(){document.querySelectorAll('#budget-list .budget-bar').forEach(function(b){b.style.width=b.getAttribute('data-pct')+'%';});});}
   else if(el){
     el.innerHTML=BUDGETS.map(function(b){var p=pct(b.used,b.total),c=hColor(p);return'<div class="budget-row"><div class="budget-top"><div class="budget-cat"><span>'+b.icon+'</span> '+b.cat+'</div><div class="budget-right"><span class="budget-fig">'+fmt(b.used)+' of '+fmt(b.total)+'</span><span class="budget-pct" style="color:'+c+'">'+p+'%</span></div></div><div class="budget-track"><div class="budget-bar" style="background:'+c+';" data-pct="'+p+'"></div></div></div>';}).join('');
     raf2(function(){document.querySelectorAll('.budget-bar').forEach(function(b){b.style.width=b.getAttribute('data-pct')+'%';});});
@@ -5260,8 +5517,8 @@ function renderTimeline(){
   var el=qs('timeline-list');if(!el)return;
   if(!filtered.length){el.innerHTML='<div class="empty-state"><div class="empty-icon">&#128197;</div><div>No entries match your filter.</div></div>';return;}
   el.innerHTML=order.map(function(date){
-    var di=groups[date],dn=0;
-    di.forEach(function(i){var c=F.classifyTxn(i);dn+=c.income-c.expense-c.financeCost;});
+    var di=groups[date],dn=0,live=isLive();
+    if(!live)di.forEach(function(i){var c=F.classifyTxn(i);dn+=c.income-c.expense-c.financeCost;});
     var nc=dn>=0?'#22C55E':'#EF4444';
     var rows=di.map(function(i){
       var ac=(i.fromAcct||i.toAcct)?' &middot; '+(i.fromAcct?esc(acctLabel(i.fromAcct)):'')+(i.toAcct?' &gt; '+esc(acctLabel(i.toAcct)):''):'';
@@ -5272,7 +5529,7 @@ function renderTimeline(){
       var hint=i.agreementId&&!i.voided?' &middot; tap to open the loan':'';
       return'<div class="tl-item'+(i.voided?' voided':'')+'"'+open+'><div class="tl-dot '+cls(i.type)+'"></div><div class="tl-body"><div class="tl-desc">'+esc(i.desc)+'</div><div class="tl-meta">'+esc(i.time)+' &middot; '+esc(i.cat)+partyText(i)+ac+note+hint+(i.demo?' &middot; sample':'')+'</div></div><div class="'+amtc+'">'+txSign(i)+fmt(i.amount)+'</div>'+(ed?'<button class="act-btn act-edit" data-edit-txn="'+esc(i.id)+'" aria-label="Edit this entry">EDIT</button>':'')+'</div>';
     }).join('');
-    return'<div class="tl-day-header"><div class="tl-day-label">'+esc(dateLabel(date).toUpperCase())+'</div><div class="tl-day-net" style="color:'+nc+';">Net income less spending: '+(dn>=0?'+':'-')+fmt(Math.abs(dn))+'</div></div>'+rows;
+    return'<div class="tl-day-header"><div class="tl-day-label">'+esc(dateLabel(date).toUpperCase())+'</div>'+(live?dayHeaderS2(date):'<div class="tl-day-net" style="color:'+nc+';">Net income less spending: '+(dn>=0?'+':'-')+fmt(Math.abs(dn))+'</div>')+'</div>'+rows;
   }).join('');
 }
 
@@ -5314,6 +5571,9 @@ function renderCapital(){
   var views=activeDebtViews(),out=views.reduce(function(s,v){return s+v.bal.outstanding.total;},0);
   var capTx=items.filter(function(t){return !t.demo&&F.classifyTxn(t).capitalIn>0;});
   var ti=(isLive()?0:INJECTIONS.reduce(function(s,i){return s+i.amount;},0))+capTx.reduce(function(s,t){return s+t.amount;},0);
+  var csEl=qs('cap-summary');
+  if(isLive()){ti=capitalS2();if(csEl)csEl.setAttribute('data-stage2','capital-summary');} // Stage 2: own money + external funding + source unconfirmed (measures)
+  else{s2Area('cap-financing',false);if(csEl)csEl.removeAttribute('data-stage2');}
   var due30=sumRem(obligationsWithin(30).filter(function(o){return o.kind==='loan';}));
   var cs=qs('cap-summary');
   if(cs)cs.innerHTML=[{label:'Loans Outstanding',val:fmt(out),color:'#EF4444'},{label:'Capital Injected',val:fmt(ti),color:'#22C55E'},{label:'Loan Repayments (30d)',val:fmt(due30),color:'#F5A623'},{label:'Active Loans',val:views.length,color:'#3B82F6'}].map(function(s){return'<div class="stat-card"><div class="stat-label">'+s.label+'</div><div class="stat-val" style="color:'+s.color+';">'+s.val+'</div></div>';}).join('');
@@ -5363,6 +5623,8 @@ function renderNetWorth(){
 }
 
 function renderAnalytics(){
+  if(isLive()){classicArea('ana-classic',false);renderAnalyticsS2();return;}
+  s2Area('ana-s2',false);classicArea('ana-classic',true);
   var tin=0,tout=0,cats={},fin=0;
   items.forEach(function(i){var c=F.classifyTxn(i);tin+=c.income;tout+=c.expense+c.financeCost;if(c.expense)cats[i.cat]=(cats[i.cat]||0)+c.expense;fin+=c.financeCost;});
   if(fin)cats['Loan Interest & Fees']=fin;
@@ -5402,7 +5664,7 @@ function renderScopeSummary(){
   var card=qs('scope-summary-card'),el=qs('scope-summary');if(!card||!el)return;
   if(!isLive()){card.style.display='none';el.innerHTML='';return;}
   var m;
-  try{m=F.financialMeasures(ACCOUNTS,items,{aliases:SETUP.aliases,agreements:AGR,baselineDate:SETUP.baselineDate,from:monthStartISO(),to:getToday(),today:getToday()});}
+  try{m=measuresFor(monthStartISO(),getToday());} // Stage 2: the same single measures result as every report (plan 2.2)
   catch(err){console.error(err);card.style.display='';el.innerHTML='<div class="muted-note">The classification preview could not be calculated ('+esc(errText(err))+'). Nothing else is affected.</div>';return;} // a preview failure never stops the other screens rendering
   var KIND={pharmacy:'Pharmacy',personal:'Personal',shared:'Shared (split)',owner_withdrawal:'Owner withdrawal',owner_contribution:'Owner contribution',pharmacy_internal:'Pharmacy internal',personal_internal:'Personal internal',
     cross_pharmacy_paid_personal:'Personal, paid from pharmacy',cross_personal_paid_pharmacy:'Pharmacy, paid from personal',financing:'Financing (loan received)',loan_repayment:'Loan repayment',external_funding:'External funding (not a loan)',unclassified:'Unresolved'};
@@ -5411,7 +5673,7 @@ function renderScopeSummary(){
   function n(v){return'₦'+Number(v).toLocaleString('en-NG',{maximumFractionDigits:2});}
   var sep=SEP.filter(function(x){return Number(m.scope.separate[x[0]])!==0;});
   card.style.display='';
-  el.innerHTML='<div class="muted-note">This month, how the new classification engine would assign each entry. Preview only: no report, balance or figure uses it yet.</div>'
+  el.innerHTML='<div class="muted-note">This month, how the classification engine assigns each entry. The Stage 2 reports above, Cash Flow, Owner Impact, the runway and the Director use the same classification.</div>'
     +'<div class="muted-note">Income and spending, including loan interest and fees:</div>'
     +'<div class="grid2" id="scope-totals"><div><div class="ana-label">Pharmacy</div><div class="ana-val" data-scope="pharmacy">'+n(m.scope.pharmacy)+'</div></div>'
     +'<div><div class="ana-label">Personal</div><div class="ana-val" data-scope="personal">'+n(m.scope.personal)+'</div></div>'
@@ -5437,10 +5699,12 @@ function renderAutopilot(){
   var now=new Date();
   var monthStart=now.getFullYear()+'-'+(now.getMonth()+1<10?'0':'')+(now.getMonth()+1)+'-01';
   var wdThisMonth=items.filter(function(i){return i.type==='owner_withdrawal'&&!i.voided&&i.date>=monthStart;}).reduce(function(s,i){return s+i.amount;},0);
+  var live=isLive(),mAp=live?measuresFor(monthStartISO(),getToday()):null;
+  if(live)wdThisMonth=mAp.figures.ownerWithdrawals; // Stage 2: owner withdrawals per the measures (incl. personal spending paid from pharmacy)
   var vCosts=VEHICLES.reduce(function(s,v){return s+vehicleLogs(v).filter(function(l){return l.date>=monthStart;}).reduce(function(s2,l){return s2+l.amount;},0);},0);
   var restock=items.filter(function(i){return i.cat==='Restocking'&&!i.voided&&i.date>=monthStart;}).reduce(function(s,i){return s+i.amount;},0);
   var largest=obs.slice().sort(function(a,b){return b.remaining-a.remaining;})[0];
-  var incomeM=items.filter(function(i){return i.date>=monthStart;}).reduce(function(s,i){return s+F.classifyTxn(i).income;},0);
+  var incomeM=live?mAp.figures.pharmacyReceipts:items.filter(function(i){return i.date>=monthStart;}).reduce(function(s,i){return s+F.classifyTxn(i).income;},0); // Stage 2: recorded pharmacy income
   var wdRatio=wdThisMonth/(incomeM||1);
   var views=activeDebtViews(),overdueLoans=views.reduce(function(s,v){return s+v.bal.overdue;},0);
   var liquidityScore=Math.min(30,Math.round((free/(totalObs||1))*15));
@@ -5453,10 +5717,10 @@ function renderAutopilot(){
   var warnings=[];
   if(overdueLoans>0)warnings.push('Loan repayments of '+fmt(overdueLoans)+' are overdue.');
   if(gap<0)warnings.push('Known obligations in the next 30 days exceed free-to-use cash (after earmarks) by '+fmt(Math.abs(gap))+'.');
-  if(runway.known&&runway.runwayDays<90)warnings.push('Spending runway is critical: available cash covers less than 90 days of expenses + interest/fees.');
+  if(runway.known&&runway.runwayDays<90)warnings.push(live?'Pharmacy cash runway is critical: confirmed available pharmacy cash covers less than 90 days of pharmacy cash burn.':'Spending runway is critical: available cash covers less than 90 days of expenses + interest/fees.');
   var cp=cashNow();
   cp.overEarmarked.forEach(function(o){warnings.push('Earmarks in '+esc(o.label)+' ('+fmt(o.earmarked)+') exceed its balance ('+fmt(o.balance)+') by '+fmt(o.shortBy)+'.');});
-  if(wdRatio>0.30)warnings.push('Owner withdrawals exceed 30% of income: business may be underfunded.');
+  if(wdRatio>0.30)warnings.push(live?'Owner withdrawals exceed 30% of recorded pharmacy income: the business may be underfunded.':'Owner withdrawals exceed 30% of income: business may be underfunded.');
   if(restock>liquid*0.5)warnings.push('Restocking is consuming more than 50% of available cash.');
   if(loanDue>liquid*0.2)warnings.push('Loan repayments due in 30 days are more than 20% of available cash.');
   if(unlinkedLoanReceipts().length)warnings.push('A loan receipt has no agreement: what you owe on it is unknown. Link it in Loans.');
@@ -5477,6 +5741,7 @@ function renderAutopilot(){
     {lbl:'Financial Health (rule-of-thumb)',val:runway.known?health+'/100':runway.reason==='short_history'?'Not available: not enough spending history yet':'Not available: no spending recorded yet',color:runway.known?hColor2:'#7A7880'},
   ];
   var body=qs('autopilot-body');if(!body)return;
+  if(live)body.setAttribute('data-stage2','autopilot');else body.removeAttribute('data-stage2');
   body.innerHTML=reminderHTML(3)
     +rows.map(function(r){return'<div class="autopilot-row"><span class="autopilot-lbl">'+r.lbl+'</span><span class="autopilot-val" style="color:'+r.color+';">'+r.val+'</span></div>';}).join('')
     +'<div class="muted-note" style="margin-bottom:0;">"Left after" is free-to-use cash less obligations due in 30 days, and assumes no new income arrives. Scheduled repayments are not deducted from your balances until paid.</div>'
@@ -5518,6 +5783,8 @@ function renderRestockROI(){
 }
 
 function renderCashFlow(){
+  if(isLive()){classicArea('cf-classic',false);renderCashFlowS2();return;}
+  s2Area('cf-s2',false);classicArea('cf-classic',true);
   var now=new Date(),y=now.getFullYear(),m=now.getMonth();
   function mStr(yr,mo){return yr+'-'+(mo+1<10?'0':'')+(mo+1)+'-01';}
   function monthLines(start,end){return F.cashFlowSummary(items,start,end);}
@@ -5815,21 +6082,419 @@ function renderDirector(){
       +'<div class="muted-note" style="margin:3px 0;">Why: '+esc(a.why)+'</div><div class="muted-note" style="margin:0;">If not: '+esc(a.consequence)+'</div></div>';}).join('')
     +'<div class="muted-note">Ranked by urgency and risk: overdue payments, then any shortfall, then payments due within 7 days, then payments due within 30 days, then working capital, then record problems and setup. No fixed percentage split is used.</div></div>';
   var todayIn=items.filter(function(t){return !t.voided&&t.date===td&&F.classifyTxn(t).income>0;}),inTot=todayIn.reduce(function(t,x){return t+F.classifyTxn(x).income;},0);
+  if(live){
+    // Stage 2 (S-6): today's income line is recorded pharmacy income, with all recorded income as the comparison.
+    var mt=measuresFor(td,td),ft=mt.figures;
+    h+='<div class="card" data-stage2="director-income"><div class="card-label">Today\'s income</div>'
+      +row('Pharmacy income recorded today',fmt(ft.pharmacyReceipts),'#22C55E','today-income')
+      +row('&nbsp;&nbsp;of which cash received into confirmed pharmacy accounts',fmt(ft.incomeCashReceived),'#22C55E','today-cash-received')
+      +row('All recorded income today (comparison)',fmt(ft.allRecordedIncome),'#7A7880','today-all-income')
+      +'<div class="muted-note" style="margin-bottom:0;">'+esc(S2L.recordedIncome)+' Income received into a confirmed pharmacy account is already inside Cash Now above; the Director plans from balances, so it is not allocated a second time. Personal, unresolved and account-less income are in the comparison only.</div>'
+      +'<div class="muted-note" style="margin-bottom:0;">PBSRx sales are not imported. KoboFlow counts only the cash you record here; a sale recorded in PBSRx is not treated as cash received until you record it.</div></div>';
+  }else{
   h+='<div class="card"><div class="card-label">Today\'s income</div>'
     +(todayIn.length?row(todayIn.length+' entr'+(todayIn.length>1?'ies':'y')+' recorded today',fmt(inTot),'#22C55E','today-income')
       +'<div class="muted-note" style="margin-bottom:0;">Recorded income is cash received into the account you chose, so it is already inside Cash Now above. The Director plans from balances, so this money is not allocated a second time.</div>'
       :'<div class="muted-note" style="margin-bottom:0;">No income recorded today.</div>')
     +'<div class="muted-note" style="margin-bottom:0;">PBSRx sales are not imported. KoboFlow counts only the cash you record here; a sale recorded in PBSRx is not treated as cash received until you record it.</div></div>';
+  }
   var q=liveQuality();
   h+='<div class="card"><div class="card-label">Missing or uncertain</div>'
     +(q.length?q.map(function(x){return'<div class="muted-note" data-dir-quality="'+x.key+'" style="color:'+(x.severity==='high'?'var(--red)':x.severity==='medium'?'var(--amber)':'var(--muted)')+';">'+esc(x.text)+'</div>'+(x.key==='income_with_from'?incomeFromList():'');}).join(''):'')
     +(f.floor===null?'<div class="muted-note" data-dir-quality="no_floor">No working-capital floor is set (Settings &rarr; Accounts).</div>':'')
     +(live&&!BILLS.length?'<div class="muted-note" data-dir-quality="no_bills">No bills set up yet: add rent, electricity, salaries and other regular payments in Bills so they count in these figures.</div>':'')
+    +(live?directorQualificationsS2():'')
     +'</div>';
   body.innerHTML=h;
 }
+/* ═══════════════ STAGE 2 — ONE MEASURES RESULT FOR EVERY REPORT ═══════════════
+   Every Stage 2 figure (Analytics, Cash Flow, budgets, Home "yesterday", Timeline daily totals, Owner
+   Impact, runway and burn, financing summaries, Director income and qualifications) comes from ONE
+   memoised F.financialMeasures result per period and render pass (measuresFor), and from the unchanged
+   cash layer for cash. No report figure is computed from classifyTxn here. Read-only: nothing is stored.
+   Demo mode keeps the earlier sample screens: the measures never classify sample entries (Stage 1 rule),
+   so Stage 2 figures are shown only for live records. Every element rendered from the measures carries a
+   data-stage2 marker. */
+var MEASURES={};
+function measuresClear(){MEASURES={};}
+function measuresFor(from,to){
+  var k=getToday()+'|'+(from||'')+'|'+(to||'');if(MEASURES[k])return MEASURES[k];
+  var m=F.financialMeasures(ACCOUNTS,items,{aliases:SETUP.aliases,agreements:AGR,baselineDate:SETUP.baselineDate,buckets:reservations().effective,
+    from:from||null,to:to||null,today:getToday(),historyStart:SETUP.baselineDate});
+  MEASURES[k]=m;return m;
+}
+function monthEndISO(iso){var d=F.parseDate(iso);return F.fmtDate(new Date(d.getFullYear(),d.getMonth()+1,0));}
+function monthShift(iso,n){var d=F.parseDate(iso);return F.fmtDate(new Date(d.getFullYear(),d.getMonth()+n,1));}
+/* The earlier screens' markup, kept for demo mode. In live mode it is removed (not just hidden), so no
+   earlier figure or label (such as the single "Operating Cash Flow" total) remains on a live screen. */
+var CLASSIC={};
+function classicArea(id,show){
+  var el=qs(id);if(!el)return;if(!(id in CLASSIC))CLASSIC[id]=el.innerHTML;
+  if(show){if(!el.innerHTML)el.innerHTML=CLASSIC[id];el.style.display='';}else{el.innerHTML='';el.style.display='none';}
+}
+function s2Area(id,show){var el=qs(id);if(!el)return null;if(!show){el.innerHTML='';el.style.display='none';return null;}el.style.display='';return el;}
+function nSigned(v){return(v<0?'-':'')+fmt(v);}
+function nDelta(v){return(v<0?'-':v>0?'+':'')+fmt(v);}
+/* The owner's OP-C qualification (plan 3E.4, revision 10): verbatim, immediately below the OP-C figure
+   wherever OP-C is displayed (the Cash Flow operating card, the Cash Flow summary grid and the OP-C
+   explanation sheet). One constant, one helper: no screen writes the OP-C figure without it. */
+var OPC_QUALIFICATION='This is the cash movement from classified pharmacy operations only. Unresolved and provisional payments from pharmacy accounts are shown separately below and are not included in this figure.';
+function opcFigureHTML(value,tag,cls,style,attrs){
+  tag=tag||'div';
+  return'<'+tag+' class="'+(cls||'')+'" data-opc data-fig="opCash" data-value="'+value+'"'+(style?' style="'+style+'"':'')+(attrs||'')+'>'+nSigned(value)+'</'+tag+'>'
+    +'<p class="muted-note" data-opc-qualification style="margin:4px 0 6px;flex-basis:100%;width:100%;">'+esc(OPC_QUALIFICATION)+'</p>';
+}
+/* Labels (plan 3A, 3C, 3E; owner wording). */
+var S2L={
+  recordedIncome:'Recorded income — not sales. Pharmacy sales are recorded in PBSRx.',
+  incomeCashReceived:'Cash received into confirmed pharmacy accounts — not sales.',
+  incomeNotConfirmedCash:'Recorded, not in confirmed cash (before the opening date, or source unresolved)',
+  incomeOtherAccount:'Received into an account not confirmed as pharmacy — not confirmed pharmacy cash',
+  incomeNoAccount:'No receiving account — not in any balance',
+  f1:'Paid from pharmacy accounts',
+  f2:'Paid from Shared accounts',
+  f2Counted:'Counted against the confirmed pharmacy portion',
+  f2NotCounted:'Amount not counted against the confirmed pharmacy portion.',
+  f2PreOpening:'Paid before the opening date — not in the tracked balance',
+  f3:'Paid personally for the pharmacy — Implicit owner contribution — not a formal capital contribution.',
+  f4:'Funding source unconfirmed — not counted in pharmacy cash burn.',
+  precaution:'Counted in full as a precaution — not pharmacy-owned money.',
+  implicit:'Implicit owner contribution — not a formal capital contribution.',
+  b1Gap:'Paid personally, funding source unconfirmed, or not counted against a Shared account\'s confirmed pharmacy portion: not cash out of confirmed pharmacy cash.',
+  completed:'Completed recorded movements only.',
+  opR:'Recorded pharmacy income minus all pharmacy operating expenditure, however it was paid (including paid personally or from an unconfirmed source). Recorded income — not sales. Pharmacy sales are recorded in PBSRx.',
+  opC:'Cash received into confirmed pharmacy accounts minus pharmacy expenditure paid from confirmed pharmacy cash (pharmacy accounts and Shared accounts\' confirmed pharmacy portion).'
+};
+/* What each figure means, for its explanation sheet (plan 4.3). */
+var S2DEF={
+  pharmacyReceipts:['Pharmacy income (recorded)','The pharmacy part of recorded income entries in the period. '+S2L.recordedIncome],
+  incomeCashReceived:['of which (i) confirmed pharmacy cash received','Pharmacy income received into a confirmed Business account, on or after the opening date, and not held. '+S2L.incomeCashReceived],
+  incomeNotConfirmedCash:['of which (ii) not in confirmed cash','Pharmacy income received into a confirmed Business account but dated before the opening date, or received from an account that is not resolved (held).'],
+  incomeOtherAccount:['of which (iii) other receiving account','Pharmacy income received into an account that is not a confirmed Business account (Shared, Personal, unconfirmed, not chosen, Outside or unresolved).'],
+  incomeNoAccount:['of which (iv) no receiving account','Pharmacy income with no receiving account: it is not in any balance.'],
+  personalIncome:['Personal income','The personal part of recorded income entries.'],
+  unresolvedIncome:['Unresolved income','Income whose position is not established (for example no purpose, or income into a Shared account without a split). It is never pharmacy or personal income.'],
+  unresolvedIncomeConfirmedPharmacy:['Unresolved income received into confirmed pharmacy accounts','Unresolved income — purpose not stated; not counted as pharmacy cash received.'],
+  b1:['Pharmacy operating expenditure (B1)','Every classified pharmacy-purpose expense and obligation in the period, however it was paid (pharmacy accounts, Shared accounts, paid personally, or funding source unconfirmed). Pharmacy finance cost is none until stage 6.'],
+  f1:['F1 '+S2L.f1,'Pharmacy expenditure paid from confirmed Business accounts. In the pharmacy cash burn.'],
+  f2:['F2 '+S2L.f2,'Pharmacy expenditure paid from confirmed Shared accounts. Only the part counted against the account\'s confirmed pharmacy portion is in the burn.'],
+  f2Counted:['C2 '+S2L.f2Counted,'For each pharmacy payment from a Shared account: the smaller of its pharmacy part and the fall it caused in the confirmed pharmacy portion. The account is replayed in date, time and entry order from its opening balance, with held unresolved inflows applied at their own position (O1, D-F2c).'],
+  f2NotCounted:['F2 not counted',S2L.f2NotCounted+' Not in the pharmacy cash burn. No ownership conclusion is drawn about it.'],
+  f2PreOpening:['F2 before the opening date',S2L.f2PreOpening+'. Not in the pharmacy cash burn.'],
+  f3:['F3 Paid personally',S2L.f3+' Not in the pharmacy cash burn. No reimbursement is tracked.'],
+  f4:['F4 Funding source unconfirmed',S2L.f4],
+  personalExpenses:['Personal spending','The personal part of expenses and obligations (and personal finance cost, none before stage 6).'],
+  unresolvedSpending:['Unresolved spending','Spending whose position is not established. Unresolved spending from confirmed Business or Shared accounts is in the pharmacy cash burn, conservatively.'],
+  unresolvedFinanceCost:['Loan interest and fees (unresolved finance cost)','Interest and fees of loan repayments. They have no position until stage 6.'],
+  provisionalRepayments:['Loan repayments, split not yet confirmed','The unsplit amount of loan repayments. It may contain principal; it is not a finance cost.'],
+  burn:['Pharmacy cash burn','C1 pharmacy expenditure paid from pharmacy accounts + C2 the part of Shared payments counted against the confirmed pharmacy portion + C3–C8 unresolved spending, unresolved finance cost and provisional repayments from confirmed Business and Shared accounts (Shared ones: '+S2L.precaution+'). '+S2L.b1Gap+' It is not in the burn.'],
+  burnConfirmed:['Confirmed part of the burn (C1 + C2)','Pharmacy expenditure paid from confirmed pharmacy cash.'],
+  burnUnresolvedOrProvisional:['Unresolved or provisional (included conservatively)','C3–C8: unresolved spending, unresolved finance cost and provisional repayments from confirmed Business and Shared accounts.'],
+  burnUnresolvedBusiness:['Unresolved or provisional — paid from pharmacy accounts; included in the pharmacy cash burn','C3, C5 and C7: from confirmed Business accounts.'],
+  burnUnresolvedShared:['Unresolved or provisional — paid from Shared accounts; included in the pharmacy cash burn','C4, C6 and C8: from confirmed Shared accounts. '+S2L.precaution],
+  opResult:['Pharmacy operating result',S2L.opR],
+  opCash:['Pharmacy cash movement from operations',S2L.opC],
+  opDiff:['Difference between the two','Pharmacy income not received into confirmed pharmacy cash (lines ii, iii and iv), less pharmacy expenditure not paid from confirmed pharmacy cash (F3, F4, and the part of F2 not counted, including before the opening date).'],
+  ownerWithdrawals:['Owner withdrawals','Money moved from pharmacy to personal, including personal spending paid from pharmacy accounts. A movement, never spending.'],
+  ownerContributions:['Owner contributions','Money moved from personal to pharmacy, own-money capital injections with a checked agreement, and pharmacy spending paid personally ('+S2L.implicit+'). A movement, never income.'],
+  implicitOwnerContribution:['of which implicit',S2L.implicit+' Pharmacy spending paid personally. No reimbursement is tracked.'],
+  capitalOwnMoney:['Capital injections, own money','Capital injections with a stored agreement whose nature is checked as the owner\'s own money.'],
+  loanReceipts:['Loans received','Loan proceeds. Financing: never income.'],
+  principalRepaid:['Loan principal repaid','The principal part of loan repayments. Financing: never spending.'],
+  externalFunding:['External funding (not a loan)','Equity, gifts, profit share without repayable principal and other non-loan funding. Never income.'],
+  capitalInjectionsSourceUnconfirmed:['Capital injections, source unconfirmed','Capital injections without a confirmed own-money agreement. Pending review; never income or an owner contribution.'],
+  internalMovements:['Internal movements','Business ↔ Business and Personal ↔ Personal transfers. Never income or spending.'],
+  unresolvedAccountMovements:['Unresolved account movements','Movements whose sides are not confirmed, including Shared movements (stage 5). Never income or spending.'],
+  allRecordedIncome:['All recorded income (comparison)','Every recorded income entry, whatever its position. A comparison only: it includes personal, unresolved and account-less income.']
+};
+function explainAttrs(key,from,to,win){return' data-explain="'+key+'" data-ex-from="'+(from||'')+'" data-ex-to="'+(to||'')+'"'+(win?' data-ex-window="1"':'')+' style="cursor:pointer;"';}
+/* One figure row: label, value and an explanation link, with its key and raw value for checking. */
+function figRow(label,key,value,from,to,opts){
+  opts=opts||{};var v=Number(value)||0,col=opts.color||(opts.signed?(v>=0?'#22C55E':'#EF4444'):'var(--text)');
+  return'<div class="autopilot-row" data-s2-row="'+key+'"'+explainAttrs(key,from,to,opts.window)+'><span class="autopilot-lbl">'+(opts.indent?'&nbsp;&nbsp;':'')+label+' <span style="color:var(--muted);">&#9432;</span>'
+    +(opts.note?'<br><span style="font-size:10px;color:var(--muted);">'+opts.note+'</span>':'')+'</span><span class="autopilot-val" data-fig="'+key+'" data-value="'+v+'" style="color:'+col+';">'+(opts.signed?nSigned(v):fmt(v))+'</span></div>';
+}
+function periodText(from,to){return from&&to?(from===to?fmtD(from):fmtD(from)+' to '+fmtD(to)+', both days included'):from?'from '+fmtD(from):'all recorded dates';}
+/* The one shared explanation sheet (plan 4.3): the period, the definition, the contributing entries and
+   their classification, excluded and unresolved amounts, warnings and limitations. Its entries sum
+   exactly to the figure (R10). */
+function openExplain(key,from,to,win){
+  var m=measuresFor(from||null,to||null),ex=F.explain(m,key,win?{entries:m.runway.entries}:null);
+  var fig=win?m.runway.figures[key]:m.figures[key],def=S2DEF[key]||[key,''],KIND={pharmacy:'Pharmacy',personal:'Personal',shared:'Shared (split)',owner_withdrawal:'Owner withdrawal',owner_contribution:'Owner contribution',pharmacy_internal:'Pharmacy internal',personal_internal:'Personal internal',
+    cross_pharmacy_paid_personal:'Personal, paid from pharmacy',cross_personal_paid_pharmacy:'Pharmacy, paid personally',financing:'Financing',loan_repayment:'Loan repayment',external_funding:'External funding',unclassified:'Unresolved'};
+  var per=win?'Runway window: '+fmtD(m.runway.windowStart)+' to '+fmtD(getToday())+' ('+m.runway.historyDays+' days, both included)':'Period: '+periodText(from,to);
+  var h='<div data-explain-sheet="'+esc(key)+'"><div class="card-label">'+esc(def[0])+'</div>';
+  h+=key==='opCash'?opcFigureHTML(fig,'div','ana-val','',' data-explain-figure'):'<div class="ana-val" data-explain-figure data-value="'+fig+'">'+((key==='opResult'||key==='opDiff')?nSigned(fig):fmt(fig))+'</div>';
+  h+='<div class="muted-note">'+esc(per)+'</div><div class="muted-note">'+esc(def[1])+'</div>';
+  h+='<div class="muted-note">Contributing entries ('+ex.entries.length+'):</div><div data-explain-entries>'+(ex.entries.length?ex.entries.map(function(e){
+    var r=e.replay;
+    return'<div class="insight-row" data-explain-entry="'+esc(String(e.id))+'" data-contribution="'+e.contribution+'"><div class="insight-text">'+esc(dateLabel(e.date))+' &middot; '+esc(e.desc||e.type)+' &middot; '+fmt(e.amount)
+      +'<br><span class="muted-note">'+esc(KIND[e.kind]||e.kind)+' &middot; counted here: '+nSigned(e.contribution)+(e.flags&&e.flags.length?' &middot; '+esc(e.flags.join(', ').replace(/_/g,' ')):'')
+      +(r?'<br>Shared replay: balance '+fmt(r.balanceBefore)+' &rarr; '+fmt(r.balanceAfter)+(r.held?', held '+fmt(r.held):'')+'; confirmed portion '+fmt(r.portionBefore)+' &rarr; '+fmt(r.portionAfter)+'; fall '+fmt(r.fall)+'; counted '+fmt(r.c2)+(r.discrepancyReduction?'; '+fmt(r.discrepancyReduction)+' of the fall is the existing discrepancy rule, not spending':''):'')
+      +'</span></div></div>';}).join(''):'<div class="muted-note">No entries in this period.</div>')+'</div>';
+  h+='<div class="muted-note" data-explain-total="'+ex.total+'">Total of the entries listed: '+nSigned(ex.total)+'</div>';
+  if(key==='opCash'){
+    h+='<div class="muted-note">Not included in this total:</div>'+['burnUnresolvedBusiness','burnUnresolvedShared','unresolvedIncomeConfirmedPharmacy'].map(function(k){
+      return'<div class="insight-row" data-explain-excluded="'+k+'"><div class="insight-text">'+esc(S2DEF[k][0])+': '+fmt(m.figures[k])+'</div></div>';}).join('');
+  }
+  if(key==='opDiff')h+='<div class="muted-note">Pharmacy income not received into confirmed pharmacy cash: '+fmt(m.figures.opDiffIncome)+'. Pharmacy expenditure not paid from confirmed pharmacy cash: '+fmt(m.figures.opDiffSpending)+'.</div>';
+  var w=(m.confirmedPharmacyCash.warnings||[]).map(function(x){return x.text;});
+  h+='<div class="muted-note">Limitations: '+esc(S2L.completed)+' Pre-opening parts use the baseline date until stage 4. Income is recorded income, not sales (PBSRx).'+(w.length?' Warnings: '+esc(w.join(' ')):'')+'</div></div>';
+  var b=qs('explain-body');if(b)b.innerHTML=h;openModal('explain-modal');
+}
+document.addEventListener('click',function(e){
+  var x=e.target.closest('[data-explain]');if(!x||!isLive())return;
+  openExplain(x.getAttribute('data-explain'),x.getAttribute('data-ex-from')||null,x.getAttribute('data-ex-to')||null,x.getAttribute('data-ex-window')==='1');
+});
+(function(){var m=qs('explain-modal');if(m)m.addEventListener('click',function(e){if(e.target===m)closeModal('explain-modal');});})();
+
+/* ── Runway (plan 3B, S-4): confirmed available pharmacy cash ÷ average daily pharmacy cash burn ── */
+function calcRunwayS2(){
+  var m=measuresFor(monthStartISO(),getToday()),r=m.runway,liquid=cashNow().available,wf=r.figures;
+  var known=r.known,days=null,msg='',daily=r.dailyBurn;
+  if(r.reason==='short_history')msg='Not enough spending history yet ('+r.historyDays+' of '+r.minDays+' days)';
+  else if(r.reason==='no_spending')msg='No pharmacy spending recorded in the last '+r.historyDays+' days';
+  else if(liquid===0){days=0;msg='No confirmed available pharmacy cash.';}
+  else if(liquid<0){days=0;msg='Available pharmacy cash is negative — no positive runway.';}
+  else days=Math.round(liquid/daily);
+  var color=!known?'#7A7880':days>=180?'#22C55E':days>=90?'#F5A623':'#EF4444';
+  var status=r.reason==='short_history'?'NOT ENOUGH SPENDING HISTORY YET':r.reason==='no_spending'?'NO PHARMACY SPENDING RECORDED (LAST '+r.historyDays+' DAYS)':days>=180?'STRONG':days>=90?'MODERATE':'CRITICAL';
+  var cc=cashCoverFor(obligationsWithin(30)),unr=F.toK(wf.burnUnresolvedOrProvisional),burnK=F.toK(wf.burn),share=burnK>0?Math.round(unr/burnK*1000)/10:0;
+  var el=qs('runway-title');if(el)el.textContent='PHARMACY CASH RUNWAY';
+  el=qs('runway-if');if(el)el.textContent='If no new income arrives';
+  var dEl=qs('runway-days');if(dEl){dEl.textContent=days===null?'--':days>999?'999+':String(days);dEl.style.color=color;}
+  var sEl=qs('runway-status');if(sEl){sEl.textContent=status;sEl.style.color=color;}
+  var rc=qs('runway-card');if(rc){rc.style.borderColor=color;rc.setAttribute('data-stage2','runway');}
+  function cell(lbl,val,attrs){return'<span'+(attrs||'')+'><span style="font-size:9px;color:var(--muted);text-transform:uppercase;letter-spacing:.08em;">'+lbl+'</span><b>'+val+'</b></span>';}
+  var noRate=r.reason==='short_history';
+  var mEl=qs('runway-meta');
+  if(mEl)mEl.innerHTML=cell('Available pharmacy cash',nSigned(liquid),' data-runway="available" data-value="'+liquid+'"')
+    +cell('Daily pharmacy cash burn',noRate?'--':fmt(daily||0),' data-runway="daily" data-value="'+(daily||0)+'"'+explainAttrs('burn',null,null,true))
+    +cell('Monthly (reference)',noRate?'--':fmt((daily||0)*30),' data-runway="monthly"')
+    +cell('History',noRate?r.historyDays+' of '+r.minDays+' days needed':r.historyDays+' days',' data-runway="history"');
+  var bEl=qs('runway-basis');
+  if(bEl)bEl.innerHTML=(msg?'<div data-runway-msg style="color:var(--amber);">'+esc(msg)+'</div>':'')
+    +'Pharmacy cash runway = confirmed available pharmacy cash ÷ average daily pharmacy cash burn over the window ('+fmtD(r.windowStart)+' to today, up to the last 90 days; at least 30 days needed). The burn is pharmacy spending paid from confirmed pharmacy cash, plus unresolved and provisional amounts from pharmacy and Shared accounts, counted conservatively. Spending paid personally or from an unconfirmed source, personal spending, owner withdrawals and loan principal are not in it. Restricted accounts (coop, fixed deposit) are not available cash.'
+    +(unr>0?'<div data-runway="unresolved" data-value="'+wf.burnUnresolvedOrProvisional+'">Of which unresolved or provisional: '+fmt(wf.burnUnresolvedOrProvisional)+' ('+share+'% of the burn) — runway may be understated until these are classified.</div>':'')
+    +'<div data-runway="commitments">Known commitments due in 30 days: '+fmt(cc.due)+(cc.covered>0?' ('+fmt(cc.covered)+' already reserved)':'')+'. Free to use (after earmarks): '+nSigned(cc.freeToUse)+'. <b data-runway="after-commitments" data-value="'+cc.leftAfter+'">Cash after known commitments: '+nSigned(cc.leftAfter)+'</b>. Shown beside the runway, not deducted from it. No future income is assumed.</div>';
+  return{liquid:liquid,monthlyBurn:(daily||0)*30,dailyBurn:daily,runwayDays:days,known:known,reason:r.reason,historyDays:r.historyDays,color:color,burn:r.burn,unresolvedShare:share};
+}
+function runwayClassicLabels(){var el=qs('runway-title');if(el)el.textContent='SPENDING RUNWAY';var rc=qs('runway-card');if(rc)rc.removeAttribute('data-stage2');
+  var bEl=qs('runway-basis');if(bEl)bEl.innerHTML='Spending runway: expenses + interest/fees; excludes owner withdrawals and loan principal. Available cash excludes restricted accounts (coop, fixed deposit). Averaged over the days recorded since your baseline (up to the last 90); at least 30 days are needed.';}
+
+/* ── Home: yesterday, budgets and the budget score (plan 2.2; brief 6.3, 6.4) ── */
+function yesterdayS2(){
+  var yd=getYest(),m=measuresFor(yd,yd),d=F.dailyTotals(m)[yd]||{pharmacyIn:0,pharmacyOut:0,personalIn:0,personalOut:0,unresolvedIn:0,unresolvedOut:0,pharmacyNet:0};
+  var el;
+  el=qs('yd-in-lbl');if(el)el.textContent='Yesterday pharmacy in';el=qs('yd-out-lbl');if(el)el.textContent='Yesterday pharmacy out';el=qs('yd-net-lbl');if(el)el.textContent='Net (pharmacy)';
+  el=qs('yd-in');if(el){el.textContent=fmt(d.pharmacyIn);el.setAttribute('data-value',d.pharmacyIn);}
+  el=qs('yd-out');if(el){el.textContent=fmt(d.pharmacyOut);el.setAttribute('data-value',d.pharmacyOut);}
+  el=qs('yd-net');if(el){el.textContent=nSigned(d.pharmacyNet);el.style.color=d.pharmacyNet>=0?'#22C55E':'#EF4444';el.setAttribute('data-value',d.pharmacyNet);}
+  var g=qs('yd-in');if(g&&g.closest('.grid3'))g.closest('.grid3').setAttribute('data-stage2','yesterday');
+  el=s2Area('yd-note',true);
+  if(el)el.innerHTML='<div class="muted-note" data-yd-day="'+yd+'">Pharmacy in is recorded pharmacy income ('+esc(S2L.recordedIncome)+'). Pharmacy out is pharmacy operating expenditure, however paid. Personal: in '+fmt(d.personalIn)+', out '+fmt(d.personalOut)+'. Unresolved: in '+fmt(d.unresolvedIn)+', out '+fmt(d.unresolvedOut)+'. Movements and financing are not income or spending.</div>';
+}
+function yesterdayClassicLabels(){var el=qs('yd-in-lbl');if(el)el.textContent='Yesterday In';el=qs('yd-out-lbl');if(el)el.textContent='Yesterday Out';el=qs('yd-net-lbl');if(el)el.textContent='Net';
+  var g=qs('yd-in');if(g&&g.closest('.grid3'))g.closest('.grid3').removeAttribute('data-stage2');s2Area('yd-note',false);}
+function budgetsS2(){var lb=liveBudgets();return lb.length?F.budgetConsumption(lb,measuresFor(monthStartISO(),getToday())):[];}
+function budgetListS2(el){
+  var bs=budgetsS2();el.setAttribute('data-stage2','budgets');
+  if(!bs.length){el.innerHTML='<div class="muted-note" data-live-na="budgets">No budgets set yet.</div>';return;}
+  el.innerHTML=bs.map(function(b){var c=hColor(b.pct);return'<div class="budget-row" data-budget="'+esc(b.cat)+'" data-pharmacy="'+b.pharmacy+'" data-personal="'+b.personal+'" data-used="'+b.used+'" data-unresolved="'+b.unresolved+'"><div class="budget-top"><div class="budget-cat">'+esc(b.cat)+'</div><div class="budget-right"><span class="budget-fig">'+fmt(b.used)+' of '+fmt(b.amount)+'</span><span class="budget-pct" style="color:'+c+'">'+b.pct+'%</span></div></div>'
+    +'<div class="budget-track"><div class="budget-bar" data-pct="'+Math.min(100,b.pct)+'" style="background:'+c+';"></div></div>'
+    +'<div style="font-size:10px;color:var(--muted);">Pharmacy '+fmt(b.pharmacy)+' &middot; personal '+fmt(b.personal)+(b.unresolved>0?' &middot; '+fmt(b.unresolved)+' unresolved in this category, not counted until its purpose is known':'')+'</div></div>';}).join('')
+    +'<div class="muted-note">Budgets you set in Settings &rarr; Accounts. This month so far: classified pharmacy and personal spending, shown apart. Unresolved spending, financing, loan principal, transfers and withdrawals are never budget spending.</div>';
+}
+
+/* ── Timeline daily totals (brief 6.4; R9: the same figures as Home "yesterday") ── */
+var DAILY_S2=null;
+function dayHeaderS2(date){
+  if(!DAILY_S2)DAILY_S2=F.dailyTotals(measuresFor(null,null));
+  var d=DAILY_S2[date]||{pharmacyIn:0,pharmacyOut:0,personalIn:0,personalOut:0,unresolvedIn:0,unresolvedOut:0,pharmacyNet:0},parts=[];
+  if(d.pharmacyIn||d.pharmacyOut)parts.push('Pharmacy +'+fmt(d.pharmacyIn)+' &minus;'+fmt(d.pharmacyOut));
+  if(d.personalIn||d.personalOut)parts.push('Personal +'+fmt(d.personalIn)+' &minus;'+fmt(d.personalOut));
+  if(d.unresolvedIn||d.unresolvedOut)parts.push('Unresolved +'+fmt(d.unresolvedIn)+' &minus;'+fmt(d.unresolvedOut));
+  return'<div class="tl-day-net" data-stage2="tl-day" data-day="'+esc(date)+'" data-ph-in="'+d.pharmacyIn+'" data-ph-out="'+d.pharmacyOut+'" data-pe-in="'+d.personalIn+'" data-pe-out="'+d.personalOut+'" data-un-in="'+d.unresolvedIn+'" data-un-out="'+d.unresolvedOut+'" style="color:'+(d.pharmacyNet>=0?'#22C55E':'#EF4444')+';">'+(parts.length?parts.join(' &middot; '):'No income or spending')+'</div>';
+}
+
+/* ── Analytics (brief 6.1, 6.7, 6.8): defined periods, pharmacy / personal / unresolved, burn, financing ── */
+var anaPeriod='this',anaFrom='',anaTo='';
+function anaRange(){
+  var ms=monthStartISO();
+  if(anaPeriod==='last'){var ls=monthShift(ms,-1);return{from:ls,to:monthEndISO(ls),label:'Last month'};}
+  if(anaPeriod==='custom'&&anaFrom&&anaTo&&anaFrom<=anaTo)return{from:anaFrom,to:anaTo,label:'Custom period'};
+  return{from:ms,to:getToday(),label:'This month so far'};
+}
+function renderAnalyticsS2(){
+  var el=s2Area('ana-s2',true);if(!el)return;
+  var R=anaRange(),m=measuresFor(R.from,R.to),f=m.figures,br=F.burnReport(m),fr=R.from,to=R.to;
+  function card(title,body,attr){return'<div class="card"'+(attr||'')+'><div class="card-label">'+title+'</div>'+body+'</div>';}
+  var h='<div class="card" data-ana-period="'+anaPeriod+'"><div class="card-label">Period</div><div style="display:flex;gap:6px;flex-wrap:wrap;">'
+    +[['this','This month'],['last','Last month'],['custom','Custom']].map(function(p){return'<button class="tl-filter-btn'+(anaPeriod===p[0]?' active':'')+'" data-ana-period-btn="'+p[0]+'">'+p[1]+'</button>';}).join('')+'</div>'
+    +(anaPeriod==='custom'?'<div class="grid2" style="margin:8px 0 0;"><input type="date" class="form-input" id="ana-from" value="'+esc(anaFrom)+'"/><input type="date" class="form-input" id="ana-to" value="'+esc(anaTo)+'"/></div>'
+      +(anaFrom&&anaTo&&anaFrom>anaTo?'<div class="muted-note" style="color:var(--red);">The start date is after the end date: showing this month instead.</div>':''):'')
+    +'<div class="muted-note" data-ana-range="'+fr+'|'+to+'" style="margin-bottom:0;">'+esc(R.label)+': '+esc(periodText(fr,to))+'. '+esc(S2L.completed)+'</div></div>';
+  h+=card('Pharmacy',figRow('Pharmacy income (recorded)','pharmacyReceipts',f.pharmacyReceipts,fr,to,{note:esc(S2L.recordedIncome)})
+    +figRow('(i) '+esc(S2L.incomeCashReceived),'incomeCashReceived',f.incomeCashReceived,fr,to,{indent:1})
+    +figRow('(ii) '+esc(S2L.incomeNotConfirmedCash),'incomeNotConfirmedCash',f.incomeNotConfirmedCash,fr,to,{indent:1})
+    +figRow('(iii) '+esc(S2L.incomeOtherAccount),'incomeOtherAccount',f.incomeOtherAccount,fr,to,{indent:1})
+    +figRow('(iv) '+esc(S2L.incomeNoAccount),'incomeNoAccount',f.incomeNoAccount,fr,to,{indent:1})
+    +figRow('Pharmacy operating expenditure','b1',f.b1,fr,to)
+    +figRow('F1 '+esc(S2L.f1),'f1',f.f1,fr,to,{indent:1})
+    +figRow('F2 '+esc(S2L.f2),'f2',f.f2,fr,to,{indent:1,note:'counted against the confirmed pharmacy portion '+fmt(f.f2Counted)+' &middot; not counted '+fmt(f.f2NotCounted)+' &middot; before the opening date '+fmt(f.f2PreOpening)})
+    +figRow('F3 Paid personally','f3',f.f3,fr,to,{indent:1,note:esc(S2L.implicit)})
+    +figRow('F4 Funding source unconfirmed','f4',f.f4,fr,to,{indent:1,note:'not counted in pharmacy cash burn'}),' data-stage2-card="pharmacy"');
+  h+=card('Personal',figRow('Personal income','personalIncome',f.personalIncome,fr,to,{note:m.personalIncomeNoReceivingAccount?'of which no receiving account '+fmt(m.personalIncomeNoReceivingAccount):''})
+    +figRow('Personal spending','personalExpenses',f.personalExpenses,fr,to)+'<div class="muted-note" style="margin-bottom:0;">Personal activity only. Personal cash is not calculated until stage 4.</div>',' data-stage2-card="personal"');
+  h+=card('Unresolved (not pharmacy or personal)',figRow('Unresolved income','unresolvedIncome',f.unresolvedIncome,fr,to)
+    +figRow('Unresolved spending','unresolvedSpending',f.unresolvedSpending,fr,to,{note:'from pharmacy accounts '+fmt(f.unresolvedSpendingBusiness)+' &middot; from Shared accounts '+fmt(f.unresolvedSpendingShared)+' &middot; other '+fmt(f.unresolvedSpendingOther)})
+    +figRow('Loan interest and fees (no position until stage 6)','unresolvedFinanceCost',f.unresolvedFinanceCost,fr,to)
+    +figRow('Loan repayments, split not yet confirmed','provisionalRepayments',f.provisionalRepayments,fr,to)
+    +figRow('All recorded income (comparison)','allRecordedIncome',f.allRecordedIncome,fr,to,{note:'includes personal, unresolved and account-less income'}),' data-stage2-card="unresolved"');
+  var C=br.components,shared=Object.keys(m.sharedReplay||{}).map(function(id){var s=m.sharedReplay[id],a=ACCOUNTS.find(function(x){return x.id===id;});
+    return'<div class="muted-note" data-shared-acct="'+esc(id)+'">'+esc(s.label)+': Shared account balance '+fmt(a?a.balance:s.finalBalance)+' &middot; confirmed pharmacy portion '+fmt(s.finalPortion)+(s.finalPortion===0&&s.declared>0?' — declared '+fmt(s.declared)+' exceeds the balance (discrepancy)':' (declared, static until stage 5)')+'</div>';}).join('');
+  h+=card('Burn (this period)',figRow('Pharmacy cash burn','burn',br.burn,fr,to)
+    +figRow('C1 '+esc(S2L.f1),'f1',C.c1,fr,to,{indent:1})
+    +figRow('C2 counted against Shared accounts\' confirmed pharmacy portion','f2Counted',C.c2,fr,to,{indent:1})
+    +figRow('Unresolved or provisional (included conservatively)','burnUnresolvedOrProvisional',br.unresolvedOrProvisional,fr,to,{indent:1,note:'C3 '+fmt(C.c3)+' &middot; C4 '+fmt(C.c4)+' &middot; C5 '+fmt(C.c5)+' &middot; C6 '+fmt(C.c6)+' &middot; C7 '+fmt(C.c7)+' &middot; C8 '+fmt(C.c8)+'. Shared ones: '+esc(S2L.precaution)})
+    +'<div class="muted-note">'+esc(S2L.b1Gap)+' '+fmt(F.fromK(F.toK(f.f3)+F.toK(f.f4)+F.toK(f.f2NotCounted)+F.toK(f.f2PreOpening)))+' this period.</div>'
+    +figRow('Personal expenditure burn','personalExpenses',f.personalExpenses,fr,to)
+    +figRow('Finance cost (interest and fees)','unresolvedFinanceCost',f.unresolvedFinanceCost,fr,to)+shared
+    +'<div class="muted-note" style="margin-bottom:0;">Basis: the entries dated in the period. The runway uses its own window (Brief screen).</div>',' data-stage2-card="burn"');
+  h+=card('Financing (never income or spending)',figRow('Loans received','loanReceipts',f.loanReceipts,fr,to)+figRow('Loan principal repaid','principalRepaid',f.principalRepaid,fr,to)
+    +figRow('Interest and fees','unresolvedFinanceCost',f.unresolvedFinanceCost,fr,to)+figRow('Loan repayments, split not yet confirmed','provisionalRepayments',f.provisionalRepayments,fr,to)
+    +figRow('Capital injections, own money','capitalOwnMoney',f.capitalOwnMoney,fr,to)+figRow('External funding (not a loan)','externalFunding',f.externalFunding,fr,to)
+    +figRow('Capital injections, source unconfirmed','capitalInjectionsSourceUnconfirmed',f.capitalInjectionsSourceUnconfirmed,fr,to),' data-stage2-card="financing"');
+  var bd=m.breakdown,cats={};
+  [['pharmacyExpenses','pharmacy'],['personalExpenses','personal']].forEach(function(g){Object.keys(bd[g[0]]).forEach(function(c){cats[c]=cats[c]||{pharmacy:0,personal:0};cats[c][g[1]]+=bd[g[0]][c];});});
+  var cs=Object.keys(cats).map(function(c){return[c,cats[c].pharmacy,cats[c].personal];}).sort(function(a,b){return(b[1]+b[2])-(a[1]+a[2]);});
+  h+=card('Classified spending by category',cs.length?cs.map(function(c){return'<div class="cf-row" data-cat-row="'+esc(c[0])+'" data-pharmacy="'+c[1]+'" data-personal="'+c[2]+'"><span class="cf-cat">'+esc(c[0])+'</span><span class="cf-amt">pharmacy '+fmt(c[1])+' &middot; personal '+fmt(c[2])+'</span></div>';}).join('')
+    :'<div class="muted-note">No classified spending in this period.</div>',' data-stage2-card="categories"');
+  var unp=items.filter(function(i){return !i.demo&&(i.state==='Unprocessed'||i.state==='Needs Review');}).length;
+  var vtot=VEHICLES.reduce(function(sm,v){return sm+vTotal(v);},0); // the Vehicles screen's own figure (unchanged; not a Stage 2 measure)
+  h+=card('Insights','<div class="insight-row"><div class="insight-text">Vehicle spending this month, from recorded entries: '+fmt(vtot)+'.</div></div><div class="insight-row"><div class="insight-text">'+(unp?unp+' inbox entr'+(unp===1?'y needs':'ies need')+' your attention.':'No inbox entries need attention.')+'</div></div>'
+    +'<div class="insight-row"><div class="insight-text">Loan proceeds, capital injections and principal repayments are financing: never income or spending. Loan interest and fees are shown separately until stage 6.</div></div>'
+    +(F.toK(f.unresolvedSpending)+F.toK(f.unresolvedIncome)>0?'<div class="insight-row"><div class="insight-text">'+fmt(F.fromK(F.toK(f.unresolvedSpending)+F.toK(f.unresolvedIncome)))+' of income and spending this period has no established purpose. It is shown as unresolved, never guessed.</div></div>':''),' data-stage2-card="insights"');
+  el.innerHTML=h;
+}
+document.addEventListener('click',function(e){var b=e.target.closest('[data-ana-period-btn]');if(!b)return;anaPeriod=b.getAttribute('data-ana-period-btn');if(anaPeriod==='custom'&&!anaFrom){anaFrom=monthStartISO();anaTo=getToday();}renderAnalyticsS2();});
+document.addEventListener('change',function(e){if(e.target&&(e.target.id==='ana-from'||e.target.id==='ana-to')){if(e.target.id==='ana-from')anaFrom=e.target.value;else anaTo=e.target.value;renderAnalyticsS2();}});
+
+/* ── Cash Flow (brief 6.2, 6.8; plan 3E): both operating measures, named and reconciled ── */
+function renderCashFlowS2(){
+  var el=s2Area('cf-s2',true);if(!el)return;
+  var ms=monthStartISO(),me=monthEndISO(ms),m=measuresFor(ms,me),cf=F.cashFlowStatement(m),f=m.figures,fr=ms,to=me;
+  function sec(title,body,attr){return'<div class="card"'+(attr||'')+'><div class="cf-section-title">'+title+'</div>'+body+'</div>';}
+  function total(label,key,v,id){return'<div class="cf-total-row"'+(id?' id="'+id+'"':'')+explainAttrs(key,fr,to)+'><span class="cf-total-lbl">'+label+'</span><span class="cf-total-amt" data-fig="'+key+'" data-value="'+v+'" style="color:'+(v>=0?'#22C55E':'#EF4444')+';">'+nSigned(v)+'</span></div>';}
+  var h='<div class="muted-note" data-cf-period="'+fr+'|'+to+'">This month: '+esc(periodText(fr,to))+'. '+esc(S2L.completed)+'</div>';
+  h+='<div class="grid3" id="cf-s2-grid" style="margin-bottom:12px;">'
+    +'<div class="stat-card"'+explainAttrs('opResult',fr,to)+'><div class="stat-label">Pharmacy operating result</div><div class="stat-val" data-fig="opResult" data-value="'+cf.operatingResult+'" style="color:'+(cf.operatingResult>=0?'#22C55E':'#EF4444')+';">'+nSigned(cf.operatingResult)+'</div></div>'
+    +'<div class="stat-card"'+explainAttrs('opCash',fr,to)+'><div class="stat-label">Pharmacy cash movement from operations</div>'+opcFigureHTML(cf.operatingCash,'div','stat-val','color:'+(cf.operatingCash>=0?'#22C55E':'#EF4444')+';')+'</div>'
+    +'<div class="stat-card"><div class="stat-label">Financing (net)</div><div class="stat-val" data-fig="financingNet" data-value="'+cf.financing.net+'" style="color:'+(cf.financing.net>=0?'#22C55E':'#EF4444')+';">'+nSigned(cf.financing.net)+'</div></div></div>';
+  var op=figRow('Pharmacy income (recorded)','pharmacyReceipts',f.pharmacyReceipts,fr,to,{note:esc(S2L.recordedIncome)})
+    +figRow('(i) '+esc(S2L.incomeCashReceived),'incomeCashReceived',f.incomeCashReceived,fr,to,{indent:1})
+    +figRow('(ii) '+esc(S2L.incomeNotConfirmedCash),'incomeNotConfirmedCash',f.incomeNotConfirmedCash,fr,to,{indent:1})
+    +figRow('(iii) '+esc(S2L.incomeOtherAccount),'incomeOtherAccount',f.incomeOtherAccount,fr,to,{indent:1})
+    +figRow('(iv) '+esc(S2L.incomeNoAccount),'incomeNoAccount',f.incomeNoAccount,fr,to,{indent:1})
+    +figRow('Less pharmacy operating expenditure (all funding sources)','b1',f.b1,fr,to)
+    +figRow('F1 '+esc(S2L.f1),'f1',f.f1,fr,to,{indent:1})
+    +figRow('F2 '+esc(S2L.f2),'f2',f.f2,fr,to,{indent:1,note:'counted against the confirmed pharmacy portion '+fmt(f.f2Counted)+' &middot; '+esc(S2L.f2NotCounted)+' '+fmt(f.f2NotCounted)+' &middot; '+esc(S2L.f2PreOpening)+' '+fmt(f.f2PreOpening)})
+    +figRow('F3 Paid personally','f3',f.f3,fr,to,{indent:1,note:esc(S2L.implicit)})
+    +figRow('F4 Funding source unconfirmed','f4',f.f4,fr,to,{indent:1,note:'not counted in pharmacy cash burn'})
+    +'<div id="cf-op-result">'+total('Pharmacy operating result','opResult',cf.operatingResult)+'<div class="muted-note">'+esc(S2L.opR)+'</div></div>'
+    +'<div class="cf-section-title" style="margin-top:10px;">Confirmed pharmacy cash</div>'
+    +figRow('Cash received into confirmed pharmacy accounts','incomeCashReceived',f.incomeCashReceived,fr,to,{note:esc(S2L.incomeCashReceived)})
+    +figRow('Less paid from pharmacy accounts (F1)','f1',f.f1,fr,to)
+    +figRow('Less counted against Shared accounts\' confirmed pharmacy portion (C2)','f2Counted',f.f2Counted,fr,to)
+    +'<div id="cf-op-cash"><div class="cf-total-row"'+explainAttrs('opCash',fr,to)+'><span class="cf-total-lbl">Pharmacy cash movement from operations</span>'+opcFigureHTML(cf.operatingCash,'span','cf-total-amt','color:'+(cf.operatingCash>=0?'#22C55E':'#EF4444')+';')+'</div>'
+    +'<div class="muted-note">'+esc(S2L.opC)+'</div></div>'
+    +'<div id="cf-op-diff">'+total('Difference between the two','opDiff',cf.difference.total)+'<div class="muted-note" data-cf-diff-text>Difference: pharmacy income not received into confirmed pharmacy cash ('+fmt(cf.difference.incomeNotConfirmedCash)+'), less pharmacy expenditure not paid from confirmed pharmacy cash ('+fmt(cf.difference.spendingNotFromConfirmedCash)+').</div></div>'
+    +'<div id="cf-op-unresolved"><div class="cf-section-title" style="margin-top:10px;">Shown separately (in neither total)</div>'
+    +figRow('Unresolved or provisional — paid from pharmacy accounts; included in the pharmacy cash burn','burnUnresolvedBusiness',f.burnUnresolvedBusiness,fr,to)
+    +figRow('Unresolved or provisional — paid from Shared accounts; included in the pharmacy cash burn','burnUnresolvedShared',f.burnUnresolvedShared,fr,to,{note:esc(S2L.precaution)})
+    +figRow('Unresolved income — purpose not stated; not counted as pharmacy cash received','unresolvedIncomeConfirmedPharmacy',f.unresolvedIncomeConfirmedPharmacy,fr,to,{note:'received into confirmed pharmacy accounts'})
+    +'<div class="autopilot-row" data-s2-row="held"><span class="autopilot-lbl">Held — received from an account that is not resolved; not confirmed pharmacy cash<br><span style="font-size:10px;color:var(--muted);">current amount held, all dates</span></span><span class="autopilot-val" data-fig="held" data-value="'+cf.separate.heldUnresolvedInflows+'">'+fmt(cf.separate.heldUnresolvedInflows)+'</span></div></div>';
+  h+=sec('OPERATING ACTIVITIES',op,' data-cf-section="operating"');
+  h+=sec('PERSONAL (shown apart)',figRow('Personal income','personalIncome',f.personalIncome,fr,to)+figRow('Personal spending','personalExpenses',f.personalExpenses,fr,to)
+    +'<div class="cf-total-row"><span class="cf-total-lbl">Personal net</span><span class="cf-total-amt" data-fig="personalNet" data-value="'+cf.personal.net+'">'+nSigned(cf.personal.net)+'</span></div>',' data-cf-section="personal"');
+  h+=sec('UNRESOLVED (not pharmacy or personal)',figRow('Unresolved income','unresolvedIncome',f.unresolvedIncome,fr,to)+figRow('Unresolved spending','unresolvedSpending',f.unresolvedSpending,fr,to),' data-cf-section="unresolved"');
+  h+=sec('FINANCING (never income or spending)',figRow('Loans received','loanReceipts',f.loanReceipts,fr,to)+figRow('Loan principal repaid','principalRepaid',f.principalRepaid,fr,to)
+    +figRow('Interest and fees','unresolvedFinanceCost',f.unresolvedFinanceCost,fr,to)+figRow('Loan repayments, split not yet confirmed','provisionalRepayments',f.provisionalRepayments,fr,to)
+    +figRow('External funding (not a loan)','externalFunding',f.externalFunding,fr,to)+figRow('Capital injections, source unconfirmed','capitalInjectionsSourceUnconfirmed',f.capitalInjectionsSourceUnconfirmed,fr,to)
+    +'<div class="cf-total-row" id="cf-fin-net"><span class="cf-total-lbl">Financing (net)</span><span class="cf-total-amt" data-fig="financingNet" data-value="'+cf.financing.net+'" style="color:'+(cf.financing.net>=0?'#22C55E':'#EF4444')+';">'+nSigned(cf.financing.net)+'</span></div>'
+    +'<div class="muted-note" style="margin-bottom:0;">Loans received + external funding + capital of unconfirmed source − principal − interest and fees − repayments not yet split.</div>',' data-cf-section="financing"');
+  h+=sec('OWNER AND OTHER MOVEMENTS (never income or spending)',figRow('Owner withdrawals','ownerWithdrawals',f.ownerWithdrawals,fr,to)
+    +figRow('Owner contributions','ownerContributions',f.ownerContributions,fr,to,{note:'of which '+esc(S2L.implicit)+' '+fmt(f.implicitOwnerContribution)})
+    +figRow('Capital injections, own money','capitalOwnMoney',f.capitalOwnMoney,fr,to,{indent:1})
+    +figRow('Internal movements','internalMovements',f.internalMovements,fr,to)+figRow('Unresolved account movements','unresolvedAccountMovements',f.unresolvedAccountMovements,fr,to),' data-cf-section="movements"');
+  var mN=['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'],m6=[];
+  for(var i=5;i>=0;i--){var st=monthShift(ms,-i),en=monthEndISO(st),mm=measuresFor(st,en);m6.push({label:mN[F.parseDate(st).getMonth()],val:F.cashFlowStatement(mm).operatingResult});}
+  var mx=Math.max.apply(null,m6.map(function(x){return Math.abs(x.val)||1;}));
+  h+='<div class="card" data-cf-section="trend"><div class="card-label">Pharmacy operating result, 6 months</div><div class="roi-bar-row">'+m6.map(function(x,i){var hh=Math.max(6,Math.round(Math.abs(x.val)/mx*55)),c=x.val>=0?'#22C55E':'#EF4444';
+    return'<div class="roi-bar-wrap" data-trend-month="'+x.label+'" data-value="'+x.val+'"><div class="roi-bar-val" style="color:'+c+';font-size:8px;">'+(x.val>=0?'+':'-')+'</div><div class="roi-bar" style="height:'+hh+'px;background:'+(i===5?c:c+'88')+';"></div><div class="roi-bar-label">'+x.label+'</div></div>';}).join('')+'</div></div>';
+  var ins=[];
+  ins.push(cf.operatingResult>=0?'Pharmacy operating result is positive at '+fmt(cf.operatingResult)+' this month.':'Pharmacy operating expenditure exceeded recorded pharmacy income by '+fmt(cf.operatingResult)+' this month.');
+  ins.push('Confirmed pharmacy cash moved '+(cf.operatingCash>=0?'up':'down')+' by '+fmt(cf.operatingCash)+' from classified pharmacy operations.');
+  if(F.toK(cf.difference.total))ins.push('The two figures differ by '+nSigned(cf.difference.total)+': income not received into confirmed pharmacy cash, less spending not paid from it (see the difference line).');
+  if(F.toK(f.burnUnresolvedBusiness)+F.toK(f.burnUnresolvedShared)>0)ins.push(fmt(F.fromK(F.toK(f.burnUnresolvedBusiness)+F.toK(f.burnUnresolvedShared)))+' of payments from pharmacy and Shared accounts is unresolved or provisional: shown separately, not in either total.');
+  if(cf.financing.net>0)ins.push('Financing brought in net '+fmt(cf.financing.net)+'. This is borrowed or invested money, not income.');
+  h+='<div class="card" data-cf-section="insights"><div class="card-label">Insights</div>'+ins.map(function(t){return'<div class="insight-row"><div class="insight-text">'+esc(t)+'</div></div>';}).join('')+'</div>';
+  el.innerHTML=h;
+}
+
+/* ── Owner Impact (brief 6.5): withdrawals and contributions from the measures ── */
+function renderOwnerImpactS2(){
+  var el=s2Area('oi-s2',true);if(!el)return;
+  var ms=monthStartISO(),td=getToday(),ls=monthShift(ms,-1),le=monthEndISO(ls),ys=td.slice(0,4)+'-01-01';
+  var cur=measuresFor(ms,td),last=measuresFor(ls,le),ytd=measuresFor(ys,td),f=cur.figures,mo=Number(td.slice(5,7));
+  var wdT=f.ownerWithdrawals,wdL=last.figures.ownerWithdrawals,wdY=ytd.figures.ownerWithdrawals,avg=Math.round(wdY/mo),inc=f.pharmacyReceipts;
+  var ratio=inc>0?Math.round(wdT/inc*100):0,rc=ratio<15?'#22C55E':ratio<30?'#F5A623':'#EF4444';
+  var h='<div class="grid2" data-oi="stats">'+[['This Month',wdT,'#F0EDE8','ownerWithdrawals',ms,td],['Last Month',wdL,'#7A7880','ownerWithdrawals',ls,le],['YTD Total',wdY,'#F5A623','ownerWithdrawals',ys,td],['Monthly Avg',avg,'#3B82F6',null]].map(function(s){
+    return'<div class="stat-card"'+(s[3]?explainAttrs(s[3],s[4],s[5]):'')+'><div class="stat-label">Owner withdrawals: '+s[0]+'</div><div class="stat-val" data-oi-wd="'+s[0]+'" data-value="'+s[1]+'" style="color:'+s[2]+';">'+fmt(s[1])+'</div></div>';}).join('')+'</div>';
+  h+='<div class="card"><div class="card-label">This month</div>'+figRow('Owner withdrawals','ownerWithdrawals',wdT,ms,td,{note:'including personal spending paid from pharmacy accounts'})
+    +figRow('Owner contributions','ownerContributions',f.ownerContributions,ms,td,{note:'of which '+esc(S2L.implicit)+' '+fmt(f.implicitOwnerContribution)+' (pharmacy spending paid personally)'})
+    +figRow('Pharmacy income (recorded)','pharmacyReceipts',inc,ms,td,{note:esc(S2L.recordedIncome)})+figRow('Pharmacy operating expenditure','b1',f.b1,ms,td)
+    +figRow('Personal income','personalIncome',f.personalIncome,ms,td)+figRow('Personal spending','personalExpenses',f.personalExpenses,ms,td)
+    +figRow('Loans received','loanReceipts',f.loanReceipts,ms,td)+figRow('Loan principal repaid','principalRepaid',f.principalRepaid,ms,td)
+    +'<div class="muted-note" style="margin-bottom:0;">Withdrawals and contributions are movements, never spending or income. Each naira is counted once.</div></div>';
+  h+='<div class="card"><div class="card-label">Withdrawals vs recorded pharmacy income</div><div style="display:flex;justify-content:space-between;margin-bottom:4px;"><span style="font-size:12px;color:var(--muted);">Owner took</span><span data-oi="ratio" data-value="'+ratio+'" style="font-family:var(--bebas);font-size:18px;color:'+rc+';">'+ratio+'%</span></div>'
+    +'<div class="wd-ratio-bar"><div class="wd-ratio-fill" style="background:'+rc+';width:'+Math.min(100,ratio)+'%;"></div></div><div style="display:flex;justify-content:space-between;margin-top:2px;"><span style="font-size:9px;color:var(--muted);">Healthy (&lt;15%)</span><span style="font-size:9px;color:var(--muted);">Warning (30%+)</span></div></div>';
+  var ins=[],mom=wdL>0?Math.round((wdT-wdL)/wdL*100):0;
+  if(mom>0)ins.push('Owner withdrawals increased '+mom+'% this month vs last month.');else if(mom<0)ins.push('Owner withdrawals decreased '+Math.abs(mom)+'% vs last month.');
+  if(inc<=0)ins.push('No pharmacy income recorded this month, so the withdrawal ratio cannot be calculated.');
+  else if(ratio>30)ins.push('Withdrawals are '+ratio+'% of this month\'s recorded pharmacy income — above the 30% rule of thumb.');
+  else if(ratio>15)ins.push('Withdrawals are '+ratio+'% of this month\'s recorded pharmacy income — between the 15% and 30% rule-of-thumb levels.');
+  else ins.push('Withdrawals are '+ratio+'% of this month\'s recorded pharmacy income — below the 15% rule of thumb.');
+  if(wdT>wdL&&wdT>avg)ins.push('Withdrawals this month are above both last month and your monthly average.');
+  h+='<div class="card"><div class="card-label">Insights</div>'+ins.map(function(t){return'<div class="insight-row"><div class="insight-text">'+esc(t)+'</div></div>';}).join('')+'</div>';
+  el.innerHTML=h;
+}
+
+/* ── Capital (brief 6.8): financing summary from the measures, all recorded dates ── */
+function capitalS2(){
+  var m=measuresFor(null,null),f=m.figures,ti=F.fromK(F.toK(f.capitalOwnMoney)+F.toK(f.externalFunding)+F.toK(f.capitalInjectionsSourceUnconfirmed));
+  var el=s2Area('cap-financing',true);
+  if(el)el.innerHTML='<div class="card"><div class="card-label">Financing, all recorded dates</div>'+figRow('Loans received','loanReceipts',f.loanReceipts,null,null)+figRow('Loan principal repaid','principalRepaid',f.principalRepaid,null,null)
+    +figRow('Interest and fees','unresolvedFinanceCost',f.unresolvedFinanceCost,null,null)+figRow('Loan repayments, split not yet confirmed','provisionalRepayments',f.provisionalRepayments,null,null)
+    +figRow('Capital injections, own money (agreement checked)','capitalOwnMoney',f.capitalOwnMoney,null,null)+figRow('External funding (not a loan)','externalFunding',f.externalFunding,null,null)
+    +figRow('Capital injections, source unconfirmed','capitalInjectionsSourceUnconfirmed',f.capitalInjectionsSourceUnconfirmed,null,null)
+    +'<div class="muted-note" style="margin-bottom:0;">Kept distinct: loan proceeds, capital (own money, external, source unconfirmed), principal, and interest and fees. None of them is income or spending.</div></div>';
+  return ti;
+}
+/* Director (S-6): the unresolved figures this month, shown as qualifications in "Missing or uncertain". Display
+   only: they are not inputs to the Director's plan, so the floor, free-to-use and free-to-allocate figures, the
+   reservations, the ranking and the safeguards are unchanged. */
+function directorQualificationsS2(){
+  var ms=monthStartISO(),td=getToday(),f=measuresFor(ms,td).figures;
+  var L=[['unresolvedSpending','s2_unresolved_spending','of spending this month has no established purpose (unresolved). The part paid from pharmacy and Shared accounts is counted in the pharmacy cash burn as a precaution.',f.unresolvedSpending],
+    ['unresolvedIncome','s2_unresolved_income','of income this month has no established purpose (unresolved): it is not counted as pharmacy income.',f.unresolvedIncome],
+    ['unresolvedAccountMovements','s2_unresolved_movements','of account movements this month have sides that are not confirmed.',f.unresolvedAccountMovements],
+    ['capitalInjectionsSourceUnconfirmed','s2_capital_unconfirmed','of capital injections this month have an unconfirmed source.',f.capitalInjectionsSourceUnconfirmed]];
+  return'<div data-stage2="director-qualifications">'+L.filter(function(x){return F.toK(x[3])>0;}).map(function(x){
+    return'<div class="muted-note" data-dir-quality="'+x[1]+'" data-value="'+x[3]+'"'+explainAttrs(x[0],ms,td)+' style="color:var(--amber);cursor:pointer;">'+fmt(x[3])+' '+esc(x[2])+' &#9432;</div>';}).join('')+'</div>';
+}
 function renderAll(){
-  recalcBalances();
+  recalcBalances();measuresClear();DAILY_S2=null;
   renderDashboard();renderTimeline();renderInbox();
   renderVehicles();renderCalendar();renderPressure();
   renderCashDrop();renderCapital();renderNetWorth();

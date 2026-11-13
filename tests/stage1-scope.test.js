@@ -19,6 +19,7 @@ const fs = require('fs');
 const path = require('path');
 const { execFileSync } = require('child_process');
 const F = require('./load-engine')();
+const { stage2Texts } = require('./stage2-regions');
 
 const ROOT = path.join(__dirname, '..');
 let pw = null;
@@ -320,7 +321,12 @@ test('measures table: every figure from one function on a fixture, matching hand
   assert.equal(m.unresolvedFinanceCostBusinessAccounts, 4000 + 1000); assert.equal(m.unresolvedFinanceCostSharedAccounts, 0);
   assert.equal(m.unresolvedFinanceCostOther, 5000);
   assert.equal(m.provisionalRepaymentsBusinessAccounts, 0); assert.equal(m.provisionalRepaymentsSharedAccounts, 0); assert.equal(m.provisionalRepaymentsOther, 0);
-  assert.equal(m.pharmacyCashBurn, 105500 + 35000 + 20000 + 5000);                                // 165,500 (same total, new composition)
+  // Stage 2, P-D18 (owner decision 13 Nov 2026; plan v11 3C.6): the burn counts pharmacy expenditure only where it
+  // was paid from confirmed pharmacy cash. The ₦6,000 "Pharmacy item paid personally" is F3 (not in the burn). The
+  // ₦12,000 pharmacy part of the Shared-paid split is F2: the Shared balance (₦260,000) stays above its ₦100,000
+  // declared portion, so C2 = ₦0 under O1. Previously (Stage 1): 105,500 + 35,000 + 20,000 + 5,000 = 165,500.
+  assert.equal(m.pharmacyCashBurn, 105500 - 6000 - 12000 + 35000 + 20000 + 5000);                 // 147,500 (P-D18)
+  assert.equal(m.pharmacyOperatingExpenses, 105500, 'pharmacy operating expenditure (B1) is unchanged by P-D18');
   assert.equal(m.personalFinanceCost, 0);
   assert.equal(m.personalExpenses, 8000 + 3000 + 15000 + 8000);                                   // 34,000 (previously 39,000 incl. 5,000 interest)
   assert.equal(m.ownerWithdrawals, 100000 + 30000 + 8000);                                        // 138,000
@@ -333,10 +339,11 @@ test('measures table: every figure from one function on a fixture, matching hand
   // P-D2, P-D11: the loan receipt and the principal of both repayments.
   assert.equal(m.financing, 200000 + 40000 + 40000);                                              // 280,000
   assert.equal(m.externalFunding, 0); assert.equal(m.unresolvedAccountMovements, 0);
-  // Runway: window 2026-10-01..2026-11-30 (61 days); burn 165,500 + October 10,000.
+  // Runway: window 2026-10-01..2026-11-30 (61 days); burn 147,500 + October 10,000 (P-D18; Stage 1: 165,500 + 10,000).
   assert.equal(m.runway.historyDays, 61); assert.equal(m.runway.windowStart, '2026-10-01');
-  assert.equal(m.runway.burn, 175500); assert.equal(m.runway.days, Math.round(724500 / (175500 / 61)));  // 252
-  assert.equal(m.runway.days, 252);
+  // P-D18: burn 147,500 + October 10,000 (previously 165,500 + 10,000 = 175,500, giving 252 days).
+  assert.equal(m.runway.burn, 157500); assert.equal(m.runway.days, Math.round(724500 / (157500 / 61)));  // 281 (P-D18; previously 252)
+  assert.equal(m.runway.days, 281);
   // Partition over every live November entry; voided, sample and out-of-period entries excluded.
   const live = txns.filter(t => !t.voided && !t.demo && t.date >= '2026-11-01' && t.date <= '2026-11-30');
   assert.equal(m.entries.length, live.length);
@@ -904,7 +911,10 @@ test('N-T10 conservation: on a completion fixture and a generated grid, every ko
     // P-D13c: F10 (no receiving account, purpose pharmacy) is a pharmacy receipt with no receiving account
     // (previously unresolved income: pharmacyReceipts 2,200; unresolvedIncome 19,000).
     pharmacyReceipts: 2200 + 3500, personalIncome: 0, unresolvedIncome: 9000 + 6500, allRecordedIncome: 9000 + 3500 + 6500 + 2200,
-    ownerWithdrawals: 0, unresolvedAccountMovements: 15000 + 4000, opex: 7000, burn: 7000 + 1000 + 12000 + 8000,
+    // P-D18 (Stage 2; plan v11 3C.6): F15 (₦7,000 pharmacy expense paid from Shared) is F2. The Shared balance
+    // (₦268,000 after the period's entries: ₦300,000 − ₦41,000 out + ₦9,000 in) stays above its declared portion, so
+    // C2 = ₦0 under O1 and it leaves the burn. Previously (Stage 1): burn 7,000 + 1,000 + 12,000 + 8,000 = 28,000.
+    ownerWithdrawals: 0, unresolvedAccountMovements: 15000 + 4000, opex: 7000, burn: 1000 + 12000 + 8000,
   });
   assert.equal(m.pharmacyReceiptsNoReceivingAccount, 3500, 'of which: no receiving account (a subdivision of pharmacy receipts)');
   assert.equal(m.personalIncomeNoReceivingAccount, 0);
@@ -1027,12 +1037,19 @@ for (const key of ['test', 'prod']) {
     assert.deepEqual(page.errors, []); await context.close();
   });
 
+  // Stage 2 (plan v11 6.3): extended, not removed or loosened. In live mode the regions Stage 2 renders from the measures
+  // (tests/stage2-regions.js, a closed allow-list) are removed from BOTH pages, exactly as the Stage 1 card is; every
+  // other text on every screen must still equal the Stage 0 build, and every [data-stage2] element must lie inside an
+  // allow-listed region. Each removed region is checked value by value in tests/stage2-screens-browser.test.js. Demo
+  // mode is compared in full, with nothing removed.
   test(`${key === 'test' ? 'TEST build' : 'production candidate'}: every other screen's text is identical to the accepted Stage 0 build, in live and demo mode; demo mode shows no summary`, { skip }, async (t) => {
     if (!stage0[key]) { t.skip('Stage 0 commit not in this checkout'); return; }
     const seed = liveSeed();
     for (const s of [seed, null]) {
       const a = await openSeeded(key, s), b = await openSeeded(key + '0', s);
-      const ta = await screensText(a.page), tb = await screensText(b.page);
+      const ra = await stage2Texts(a.page, !!s), rb = await stage2Texts(b.page, !!s);
+      assert.deepEqual(ra.outside, [], `${s ? 'live' : 'demo'} mode: every Stage 2 element is inside an allow-listed region${s ? '' : ' (demo: none holds text)'}`);
+      const ta = ra.texts, tb = rb.texts;
       assert.equal(ta.length, tb.length);
       for (let i = 0; i < ta.length; i++) assert.equal(ta[i], tb[i], `${s ? 'live' : 'demo'} mode, screen ${tb[i].split(':')[0]}`);
       if (!s) {

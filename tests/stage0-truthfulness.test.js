@@ -98,7 +98,8 @@ const EMPTY_STATES = {
   home: ['Not available: no budgets set yet.', 'No budgets set yet', 'Financial Health (rule-of-thumb)'],
   cashdrop: ['Not available yet'],
   networth: ['Not enough recorded history', 'No target set', 'No net-worth goal set yet.'],
-  analytics: ['No expenses recorded yet'],
+  // Stage 2 (plan v11 2.1, 6.3): Analytics reads the measures; its empty state for the period is this line.
+  analytics: ['No classified spending in this period.'],
   vehicles: ['No target set', 'No entries recorded for this vehicle this month'],
 };
 async function visitAll(page) { for (const sc of await screens(page)) await nav(page, sc); }
@@ -151,9 +152,11 @@ for (const b of BUILDS) {
     assert.match(await text(page, '#nw-trend'), /Not enough recorded history/);
     assert.match(await text(page, '#cap-summary'), /Capital Injected₦0/);
     assert.equal(await text(page, '#runway-days'), '--');
-    assert.match(await text(page, '#runway-status'), /NO SPENDING RECORDED/);
+    // Stage 2 (plan 3B): the runway is the pharmacy cash runway; with no pharmacy cash burn it shows no number.
+    assert.match(await text(page, '#runway-status'), /NO PHARMACY SPENDING RECORDED/);
+    assert.match(await text(page, '[data-runway-msg]'), /No pharmacy spending recorded in the last \d+ days/);
     assert.match(await text(page, '#autopilot-body'), /Financial Health \(rule-of-thumb\)Not available: no spending recorded yet/);
-    assert.match(await text(page, '#insights-list'), /No expenses recorded yet/);
+    assert.match(await text(page, '#ana-s2'), /No classified spending in this period\./); // Stage 2 Analytics (was #insights-list "No expenses recorded yet")
     for (const v of ['fjr', 'green', 'black']) assert.equal(await text(page, `[data-vehicle-spent="${v}"]`), '₦0');
     assert.match(await text(page, '#vehicle-panels'), /No target set/);
     assert.match(await text(page, '#vehicle-panels'), /No entries recorded for this vehicle this month/);
@@ -184,13 +187,17 @@ for (const b of BUILDS) {
     assert.match(ap, /of which earmarked₦30,000/);
     assert.match(ap, /free to use \(after earmarks\)₦491,400/);
     assert.match(ap, /Restricted \(coop, fixed deposit\)₦280,000/);
-    assert.match(await text(page, '#runway-meta'), /Available Cash₦521,400/);
-    // Spending runway = 521,400 / ((90,000 expense + 600 interest) / 90 days) = 518 days (history capped at 90 days).
-    // Counting the 5,000 withdrawal or the 3,000 principal would give a different number.
+    assert.match(await text(page, '#runway-meta'), /Available pharmacy cash₦521,400/);
+    // Stage 2 (P-D18, plan 3B): pharmacy cash runway = 521,400 / ((90,000 paid from a confirmed Business account (F1)
+    // + 600 interest from it (C5)) / 90 days) = 518 days (history capped at 90 days): the same figures as before,
+    // because every payment here was made from confirmed pharmacy cash. Labels: "Available Cash" → "Available
+    // pharmacy cash", "Monthly Burn" → "Monthly (reference)". Counting the 5,000 withdrawal or the 3,000 principal
+    // would give a different number.
     assert.equal(await text(page, '#runway-days'), '518');
-    assert.match(await text(page, '#runway-meta'), /Monthly Burn₦30,200/);
+    assert.match(await text(page, '#runway-meta'), /Monthly \(reference\)₦30,200/);
     assert.match(await text(page, '#runway-meta'), /History90 days/);
-    assert.match(await text(page, '#runway-basis'), /Spending runway: expenses \+ interest\/fees; excludes owner withdrawals and loan principal/);
+    assert.match(await text(page, '#runway-basis'), /Pharmacy cash runway = confirmed available pharmacy cash ÷ average daily pharmacy cash burn/);
+    assert.match(await text(page, '#runway-basis'), /owner withdrawals and loan principal are not in it/);
     await nav(page, 'pressure');
     assert.match(await text(page, '#pressure-vs'), /Cash Now \(gross\)₦521,400Free to Use \(after earmarks\)₦491,400Obligations₦0Left After\+₦491,400/);
     assert.match(await text(page, '#cal-summary'), /Free to Use₦491,400/);
@@ -199,7 +206,7 @@ for (const b of BUILDS) {
     await nav(page, 'capital');
     assert.match(await text(page, '#cap-summary'), /Capital Injected₦20,000/, 'saved capital only, no sample injections');
     await nav(page, 'ownerimpact');
-    assert.match(await text(page, '#wd-stats'), /This Month₦5,000/, 'voided withdrawal excluded');
+    assert.match(await text(page, '#oi-s2'), /Owner withdrawals: This Month₦5,000/, 'voided withdrawal excluded'); // Stage 2 Owner Impact (was #wd-stats "This Month")
     // Earmarks do not change actual balances.
     const cards = await page.$$eval('.acct-card', cs => cs.map(c => c.textContent));
     assert.ok(cards.some(c => /Opay₦115,000/.test(c)), 'Opay card shows its full balance: ' + cards.join(' | '));
@@ -274,7 +281,7 @@ for (const b of BUILDS) {
     assert.equal(fjr[0].vehicleCat, 'Fuel', 'the log category is saved');
     assert.match(await text(page, '#autopilot-body'), /Vehicle Spending₦10,000/);
     await nav(page, 'analytics');
-    assert.match(await text(page, '#insights-list'), /Vehicle spending this month, from recorded entries: ₦10,000/);
+    assert.match(await text(page, '#ana-s2'), /Vehicle spending this month, from recorded entries: ₦10,000/); // Stage 2 Analytics insights (was #insights-list)
     assert.deepEqual(page.errors, []);
     await context.close();
   });
@@ -342,15 +349,17 @@ for (const b of BUILDS) {
     // The old rule (÷ 90 days whatever the history) showed 550,000 / (50,000 / 90) = 990 days here.
     assert.equal(await text(page, '#runway-days'), '--');
     assert.equal(await text(page, '#runway-status'), 'NOT ENOUGH SPENDING HISTORY YET');
+    // Stage 2 (plan 3B): the pharmacy cash runway labels; the same short-history rule and message.
     const meta = await text(page, '#runway-meta');
-    assert.match(meta, /Available Cash₦550,000/);
-    assert.match(meta, /Monthly Burn--/);
-    assert.match(meta, /Daily Burn--/);
+    assert.match(meta, /Available pharmacy cash₦550,000/);
+    assert.match(meta, /Monthly \(reference\)--/);
+    assert.match(meta, /Daily pharmacy cash burn--/);
     assert.match(meta, /History11 of 30 days needed/);
-    assert.match(await text(page, '#runway-basis'), /^Spending runway: expenses \+ interest\/fees; excludes owner withdrawals and loan principal\..*at least 30 days are needed\.$/);
+    assert.equal(await text(page, '[data-runway-msg]'), 'Not enough spending history yet (11 of 30 days)');
+    assert.match(await text(page, '#runway-basis'), /at least 30 days needed/);
     const ap = await text(page, '#autopilot-body');
     assert.match(ap, /Financial Health \(rule-of-thumb\)Not available: not enough spending history yet/);
-    assert.doesNotMatch(ap, /Spending runway is critical/);
+    assert.doesNotMatch(ap, /runway is critical/);
     assert.doesNotMatch(ap, /\d+\/100/, 'no health score from an unavailable runway');
     assert.deepEqual(page.errors, []);
     await context.close();
@@ -371,10 +380,12 @@ for (const b of BUILDS) {
     // Available: Opay 100,000 − 20,000 = 80,000; bank 500,000 − 40,000 − 5,500 = 454,500 → 534,500.
     // Spending: 40,000 expense + 400 interest + 100 fees = 40,500 over 45 days = 900/day; 900 × 30 = 27,000/month.
     // Runway 534,500 / 900 = 593.9 → 594 days. Counting the withdrawal or the principal would lower it.
+    // Stage 2 (P-D18, plan 3B): the 40,000 was paid from a confirmed Business account (F1) and the 500 interest and fees
+    // from it (C5), so the pharmacy cash burn is the same 40,500; only the labels change.
     const meta = await text(page, '#runway-meta');
-    assert.match(meta, /Available Cash₦534,500/);
-    assert.match(meta, /Monthly Burn₦27,000/);
-    assert.match(meta, /Daily Burn₦900/);
+    assert.match(meta, /Available pharmacy cash₦534,500/);
+    assert.match(meta, /Monthly \(reference\)₦27,000/);
+    assert.match(meta, /Daily pharmacy cash burn₦900/);
     assert.match(meta, /History45 days/);
     assert.equal(await text(page, '#runway-days'), '594');
     assert.equal(await text(page, '#runway-status'), 'STRONG');

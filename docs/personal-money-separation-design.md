@@ -11,7 +11,12 @@
     wording and owner decision R-open, treatment 2, and the approved roadmap corrections in section 23
     (commit `ff6e626`);
   - the Stage 0 "Status: accepted" line in section 23 (commit `1ccb369`);
-  - register row P-D13c and its wording (commit `ddd6be5`).
+  - register row P-D13c and its wording (commit `ddd6be5`);
+  - Stage 2: register rows P-D18 (pharmacy cash burn from confirmed pharmacy cash; owner decisions D-F2,
+    D-F2a = O1, D-F2b, D-F2c, D-F4, D-OC) and P-D18a (design clarification of the Shared threshold rule),
+    the section 6 "Pharmacy cash burn" row (revised by P-D18), the two section 3 Shared-rule descriptions
+    (corrected by P-D18a, original wording kept as history) and the Stage 2 status in section 23 (the
+    Stage 2 implementation commit).
 
   Sections 20.1 and 20.2 (the original decision history) are unchanged.
 - **Implementation status:** this document is the design; its [Design] sections do not by themselves
@@ -19,8 +24,10 @@
   - **Stage 0:** accepted (`docs/stage-0-acceptance.md`).
   - **Stage 1:** accepted (source `3bdacf3`, TEST deployment `97e3342`; `docs/stage-1-acceptance.md`;
     evidence in `docs/stage-1-verification.md`).
-  - **Stage 2:** specified (owner's Stage 2 brief v1.0, 13 November 2026). Implementation is not yet
-    authorised.
+  - **Stage 2:** implemented on the feature branch under the owner-authorised Stage 2 implementation
+    plan, revision 11 (13 November 2026), with the owner-approved CF5 and fixture correction; deployed
+    to the isolated TEST site; **awaiting the owner's acceptance**. Evidence in
+    `docs/stage-2-verification.md`. The Stage 1 acceptance record is unchanged.
   - **Stages 3–8:** not implemented.
 - **Code basis:** branch `claude/koboflow-loan-management-qn2vql` at
   `03d8dee190b000457b25e298f323af8976668389`. This is the historical basis the architecture was
@@ -180,7 +187,7 @@ revisions 4–6, all resolved in the design by applying already-decided rules.
 | Setup save keeps **only listed account fields** (`id, label, institution, kind, use, useConfirmedAt, useConfirmedValue, sharedPortion, primary, opening, removed, access`); anything else is dropped | `confirmSetup` |
 | Setup history records opening-balance and baseline changes with old and new values and a time | `saveSetup` change log, `ledgerSetup.history` |
 | Account ownership `use` ∈ `''`/`business`/`personal`/`shared`; confirmation for any chosen value; Shared `sharedPortion {amount, declaredAt}` | `accountOwnership`, `ownershipConfirmed`, `resolveUseAndSharedPortion` |
-| **Shared portion is a static ceiling** `min(declared, balance)`; payments do not lower it | `sharedPortion`, `pharmacyEligibleAccounts` |
+| **Shared portion is a static threshold** (corrected by P-D18a): a confirmed Shared account with a valid declared portion D counts **D** while its balance, after held unresolved inflows, is at least D, and **₦0**, flagged `shared_discrepancy`, below D; payments do not lower D. *Original wording (history, superseded by P-D18a): "Shared portion is a static ceiling `min(declared, balance)`; payments do not lower it".* | `sharedPortion`, `pharmacyEligibleAccounts` (test U5a) |
 | Account kinds wallet, bank, cash, coop, investment; access immediate/restricted | `ACCOUNT_KINDS`, `accountAccess` |
 | Vehicles are a **hard-coded constant** (three named vehicles), not stored records | `VEHICLES` |
 | Duplicate handling: `possible_duplicates` warning; import skips identical signatures (`txSig`, including pre-edit signatures); loan payments carry an `idemKey`; nothing merged automatically | `dataQuality`, `planImport`, `paymentOps` |
@@ -227,8 +234,11 @@ field on loan repayments. The monthly plan uses **owner plan** (`ownerPlan`, `ow
 ### 3.4 Cash, Director, Net Worth [Existing]
 
 - **Recorded balances:** every account, any ownership.
-- **Confirmed pharmacy cash:** confirmed Business balances, plus `min(declared portion, balance)` for
-  a confirmed Shared account, less money received from an unresolved side (capped at the balance).
+- **Confirmed pharmacy cash:** confirmed Business balances, plus, for a confirmed Shared account, its
+  declared portion while the balance (after held unresolved inflows) is at least that portion, and ₦0
+  (flagged) below it (corrected by P-D18a), less money received from an unresolved side (capped at the
+  balance). *Original wording (history, superseded by P-D18a): "plus `min(declared portion, balance)`
+  for a confirmed Shared account".*
 - **Director (`directorPlan`):** free-to-use confirmed cash − uncovered part of every obligation due
   in 30 days (overdue included) − floor = `safeToAllocate` (never below 0). Obligations are **every**
   bill occurrence and **every** loan instalment; linked earmarks cover them once. The Director is
@@ -603,7 +613,7 @@ Every figure is defined once, here, and every screen reads it from one function:
 | **Provisional repayments (Business accounts)** | classification + cash layer | `repaymentSplitPending` of loan repayment entries whose paying account is a confirmed Business account, whatever the entry's date; neither financing nor expense; in the pharmacy cash burn (conservative), separately identifiable; leaves this figure when the split is confirmed. Of which, **pre-opening**: entries dated before that account's effective opening date, shown as a separately identifiable part of this figure (included in it, never added again; they do not change the account's tracked balance, 7.1). |
 | **Provisional repayments (Shared accounts)** | classification + cash layer | the same, whose paying account is a confirmed Shared account, whatever the entry's date; in the pharmacy cash burn (conservative), separately identifiable. Of which, **pre-opening**: entries dated before that account's effective opening date, shown as a separately identifiable part of this figure (included in it, never added again; they do not change the account's tracked balance, 7.1). |
 | **Provisional repayments (other)** | classification | the same, whose paying side is not a confirmed Business or Shared account (any other account or none); listed; not in the pharmacy cash burn; never moved here because of its date |
-| **Pharmacy cash burn** (runway denominator) | measures above | pharmacy operating expenses (incl. pharmacy finance cost) + unresolved spending (pharmacy accounts) + unresolved spending (Shared accounts) + unresolved finance cost (Business accounts) + unresolved finance cost (Shared accounts) + provisional repayments (Business accounts) + provisional repayments (Shared accounts); the Shared-account and provisional amounts are included conservatively and stay separately identifiable (a Shared account is not a pharmacy account) |
+| **Pharmacy cash burn** (runway denominator) (revised by P-D18) | measures above | pharmacy operating expenditure **paid from confirmed pharmacy cash**: paid from confirmed Business accounts (F1, C1), plus, for a pharmacy-purpose payment from a confirmed Shared account, min(its pharmacy part, the fall it caused in the account's confirmed pharmacy portion), by the Shared-account replay in date, time and id order with held unresolved inflows applied at their own position (C2; O1, D-F2c); + unresolved spending (pharmacy accounts) + unresolved spending (Shared accounts) + unresolved finance cost (Business accounts) + unresolved finance cost (Shared accounts) + provisional repayments (Business accounts) + provisional repayments (Shared accounts) (C3–C8, the Shared ones "Counted in full as a precaution — not pharmacy-owned money.", D-F2b). Pharmacy expenditure paid personally (F3, "Implicit owner contribution — not a formal capital contribution"), with an unconfirmed funding source (F4) or not counted against a Shared account's confirmed portion ("Amount not counted against the confirmed pharmacy portion.") is in pharmacy operating expenditure, not in the burn. *Original wording (Stage 1, history, revised by P-D18): "pharmacy operating expenses (incl. pharmacy finance cost) + unresolved spending (pharmacy accounts) + unresolved spending (Shared accounts) + unresolved finance cost (Business accounts) + unresolved finance cost (Shared accounts) + provisional repayments (Business accounts) + provisional repayments (Shared accounts); the Shared-account and provisional amounts are included conservatively and stay separately identifiable (a Shared account is not a pharmacy account)".* |
 | **Pharmacy runway** | measures above | confirmed pharmacy cash (available) ÷ average daily pharmacy cash burn over the existing window rules |
 | **Personal expenses** | classification | `parts.personal` of expense/obligation entries (incl. `cross_pharmacy_paid_personal`) + **personal finance cost** |
 | **Personal finance cost** | classification | from stage 6 (none before), from the `financeCost` component of loan repayment entries: interest and fees on a loan with a personal obligation purpose, plus the **personal part** of interest and fees on a Shared-purpose loan with a valid split, incl. `cross_pharmacy_paid_personal` interest and fees; the position follows the loan's obligation purpose, never the paying account's declared or running portion |
@@ -1831,6 +1841,8 @@ No row amends an approved original decision (D1–D14, Q1–Q5, R1–R4, Option 
 | P-D16 | Loan instalments (obligations, routed) and loan repayment entries (classified by components) stay distinct records; neither is counted as the other | Approved | Clarifies | 12.1, 12.2, H5 | 6, 12.1 | stage 1 |
 | R-open | Treatment 2: account-tested unresolved spending, unresolved finance cost and provisional repayments are assigned by the actual confirmed paying account (Business or Shared) whatever the entry's date, counted when inside the reporting period or runway window (and then in the conservative burn); pre-opening amounts are shown as a separately identifiable "of which" part of each Business and Shared figure, included once; never moved to "(other)" because of their date; balances, confirmed pharmacy cash and every 7.4 baseline consumer unchanged (7.1); non-pharmacy paying sides unchanged | Approved | New | Settles a question the approved text left open (section 6 "cash movement left a pharmacy account" vs 7.1); 7.1, 7.4, Q5 unchanged | 6 | stage 1 (the burn effect appears from stage 4, or wherever a window reaches before an opening date) |
 | R-flag | `missing_source` names the empty required side: the receiving side of income, the paying side of an expense or obligation | Approved | Clarifies | 5.5 | 5.1 | stage 1 |
+| P-D18 | Pharmacy cash burn includes pharmacy operating expenditure only where it was paid from confirmed pharmacy-owned cash. That means confirmed Business accounts, and a confirmed Shared account only for the amount by which a pharmacy-purpose payment reduced the confirmed pharmacy portion under the existing static rule. The account's balance is replayed in date order (date, then time with a missing time first, then id: numeric ids by value before any other id); held unresolved inflows are applied at their own position; the amount is capped at the payment's pharmacy part (D-F2c: min(pharmacy part, fall)); the rest of a fall is the existing discrepancy rule, never spending; payments before the opening date count ₦0. A Shared account is never treated as 100% pharmacy-owned. Pharmacy operating expenditure itself is unchanged and is shown with its funding source: paid from pharmacy accounts; paid from Shared accounts (counted against the confirmed pharmacy portion / "Amount not counted against the confirmed pharmacy portion."); paid personally ("Implicit owner contribution — not a formal capital contribution."); funding source unconfirmed (excluded from the burn, D-F4). The Stage 1 owner-contributions measure is unchanged (D-OC); no reimbursement obligation is created. Unresolved Shared spending, unresolved Shared finance cost and provisional Shared repayments stay in the burn in full: "Counted in full as a precaution — not pharmacy-owned money." (P-D10, P-D11; D-F2b) | Approved (13 Nov 2026) | New | Revises the section 6 "Pharmacy cash burn" row (original wording kept there as history); owner decisions D-F2, D-F2a = O1, D-F2b, D-F2c (part 1), D-F4, D-OC | 6 | stage 2 |
+| P-D18a | Design clarification (D-F2c part 2). The Shared static rule as implemented and tested (`sharedPortion`, `pharmacyEligibleAccounts`, test U5a): a confirmed Shared account with a valid declared portion D counts **D** while its balance (after held unresolved inflows) is at least D, and **₦0**, flagged "shared_discrepancy", below D. This corrects the section 3 description "`min(declared, balance)`", whose original wording is kept as history. No behaviour changes. Stage 1 was accepted on this implemented behaviour; the Stage 1 acceptance record is unchanged | Approved (13 Nov 2026) | Design text | Corrects section 3 (two places); no decision or behaviour changed | 3 | stage 2 (wording) |
 
 ### 20.3 Remaining owner decisions [Open]
 
@@ -1963,6 +1975,9 @@ backup rules. The master plan should be updated separately if the owner approves
 8. **Completion criteria:** personal spending absent from every pharmacy figure; unresolved pharmacy
    outflows visible and in the burn; nothing counted twice.
 9. **Before stage 3:** owner review of before/after figures on TEST.
+10. **Status: implemented, awaiting the owner's acceptance.** Implemented under the owner-authorised Stage 2
+   implementation plan, revision 11 (with the owner-approved CF5 and fixture correction); P-D18 and P-D18a
+   above; deployed to the isolated TEST site only, switches off. Evidence: `docs/stage-2-verification.md`.
 
 ### Stage 3 — Purpose capture, Outside source, vehicle purposes, categories, reconciliation
 

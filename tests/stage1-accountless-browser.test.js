@@ -14,6 +14,7 @@ const fs = require('fs');
 const path = require('path');
 const { execFileSync } = require('child_process');
 const F = require('./load-engine')();
+const { stage2Texts } = require('./stage2-regions');
 
 const ROOT = path.join(__dirname, '..');
 let pw = null;
@@ -244,7 +245,11 @@ for (const key of KEYS) {
     if (!stage0[key]) { t.skip('Stage 0 commit not in this checkout'); return; }
     const sw = seedFor('with');
     const a = await openSeeded(key, sw), b = await openSeeded(key + '0', sw);
-    const ta = await screensText(a.page), tb = await screensText(b.page);
+    // Stage 2 (plan v11 6.3): the regions Stage 2 renders from the measures are removed from both pages (closed
+    // allow-list, tests/stage2-regions.js); every other text must still be identical to the Stage 0 build.
+    const ra = await stage2Texts(a.page, true), rb = await stage2Texts(b.page, true);
+    assert.deepEqual(ra.outside, [], 'every Stage 2 element is inside an allow-listed region');
+    const ta = ra.texts, tb = rb.texts;
     assert.equal(ta.length, tb.length);
     for (let i = 0; i < ta.length; i++) assert.equal(ta[i], tb[i], `screen ${tb[i].split(':')[0]}`);
     assert.deepEqual(a.page.errors, []); assert.deepEqual(b.page.errors, []);
