@@ -2684,6 +2684,7 @@ button{cursor:pointer;}
 .cf-cat{font-size:12px;color:var(--muted);}
 .cf-amt{font-family:var(--bebas);font-size:14px;}
 .cf-total-row{display:flex;justify-content:space-between;align-items:center;padding:10px 12px;border-radius:8px;background:var(--surf2);margin-top:6px;}
+[data-explain]{cursor:pointer;}
 .cf-total-lbl{font-size:13px;font-weight:600;}
 .cf-total-amt{font-family:var(--bebas);font-size:18px;}
 .wd-ratio-bar{height:8px;background:var(--surf3);border-radius:4px;overflow:hidden;margin:8px 0 4px;}
@@ -5467,11 +5468,11 @@ function renderCapital(){
   var capTx=items.filter(function(t){return !t.demo&&F.classifyTxn(t).capitalIn>0;});
   var ti=(isLive()?0:INJECTIONS.reduce(function(s,i){return s+i.amount;},0))+capTx.reduce(function(s,t){return s+t.amount;},0);
   var csEl=qs('cap-summary');
-  if(isLive()){ti=capitalS2();if(csEl)csEl.setAttribute('data-stage2','capital-summary');} // Stage 2: own money + external funding + source unconfirmed (measures)
+  if(isLive()){ti=capitalS2();if(csEl)csEl.removeAttribute('data-stage2');} // Stage 2: own money + external funding + source unconfirmed (measures)
   else{s2Area('cap-financing',false);if(csEl)csEl.removeAttribute('data-stage2');}
   var due30=sumRem(obligationsWithin(30).filter(function(o){return o.kind==='loan';}));
   var cs=qs('cap-summary');
-  if(cs)cs.innerHTML=[{label:'Loans Outstanding',val:fmt(out),color:'#EF4444'},{label:'Capital Injected',val:fmt(ti),color:'#22C55E'},{label:'Loan Repayments (30d)',val:fmt(due30),color:'#F5A623'},{label:'Active Loans',val:views.length,color:'#3B82F6'}].map(function(s){return'<div class="stat-card"><div class="stat-label">'+s.label+'</div><div class="stat-val" style="color:'+s.color+';">'+s.val+'</div></div>';}).join('');
+  if(cs)cs.innerHTML=[{label:'Loans Outstanding',val:fmt(out),color:'#EF4444'},{label:'Capital Injected',val:fmt(ti),color:'#22C55E'},{label:'Loan Repayments (30d)',val:fmt(due30),color:'#F5A623'},{label:'Active Loans',val:views.length,color:'#3B82F6'}].map(function(s){return'<div class="stat-card"'+(isLive()&&s.label==='Capital Injected'?' data-stage2="capital-injected"':'')+'><div class="stat-label">'+s.label+'</div><div class="stat-val" style="color:'+s.color+';">'+s.val+'</div></div>';}).join('');
   var ll=qs('loans-list');
   if(ll)ll.innerHTML=views.length?views.map(agrCard).join(''):'<div class="muted-note">No active loans. Loans are managed in the Loans tab.</div>';
   var il=qs('injections-list');
@@ -5630,15 +5631,15 @@ function renderAutopilot(){
     {lbl:'Expected Inflows',val:'Not forecast',color:'#7A7880'},
     {lbl:'Left After Known Obligations (free to use)',val:(gap<0?'-':'+')+fmt(gap),color:gap>=0?'#22C55E':'#EF4444'},
     {lbl:'Largest Demand',val:largest?esc(largest.label)+' '+fmt(largest.remaining):'--',color:'#F5A623'},
-    {lbl:'Owner W/D This Month',val:fmt(wdThisMonth),color:wdRatio>0.30?'#EF4444':wdRatio>0.15?'#F5A623':'#22C55E'},
+    {lbl:'Owner W/D This Month',s2:1,val:fmt(wdThisMonth),color:wdRatio>0.30?'#EF4444':wdRatio>0.15?'#F5A623':'#22C55E'},
     {lbl:'Vehicle Spending',val:fmt(vCosts),color:'#7A7880'},
     {lbl:'Restocking Cash Spent',val:fmt(restock),color:'#7A7880'},
-    {lbl:'Financial Health (rule-of-thumb)',val:runway.known?health+'/100':runway.reason==='short_history'?'Not available: not enough spending history yet':'Not available: no spending recorded yet',color:runway.known?hColor2:'#7A7880'},
+    {lbl:'Financial Health (rule-of-thumb)',s2:1,val:runway.known?health+'/100':runway.reason==='short_history'?'Not available: not enough spending history yet':'Not available: no spending recorded yet',color:runway.known?hColor2:'#7A7880'},
   ];
   var body=qs('autopilot-body');if(!body)return;
-  if(live)body.setAttribute('data-stage2','autopilot');else body.removeAttribute('data-stage2');
+  body.removeAttribute('data-stage2'); // Stage 2 marks only the rows it changes (Owner W/D, Financial Health)
   body.innerHTML=reminderHTML(3)
-    +rows.map(function(r){return'<div class="autopilot-row"><span class="autopilot-lbl">'+r.lbl+'</span><span class="autopilot-val" style="color:'+r.color+';">'+r.val+'</span></div>';}).join('')
+    +rows.map(function(r){return'<div class="autopilot-row"'+(live&&r.s2?' data-stage2="autopilot-row"':'')+'><span class="autopilot-lbl">'+r.lbl+'</span><span class="autopilot-val" style="color:'+r.color+';">'+r.val+'</span></div>';}).join('')
     +'<div class="muted-note" style="margin-bottom:0;">"Left after" is free-to-use cash less obligations due in 30 days, and assumes no new income arrives. Scheduled repayments are not deducted from your balances until paid.</div>'
     +(warnings.length?'<div class="autopilot-warning">&#9888; '+warnings.join('<br>&#9888; ')+'</div>':'<div class="autopilot-ok">&#10003; All financial indicators are within acceptable ranges.</div>');
 }
@@ -6102,7 +6103,9 @@ var S2DEF={
   unresolvedAccountMovements:['Unresolved account movements','Movements whose sides are not confirmed, including Shared movements (stage 5). Never income or spending.'],
   allRecordedIncome:['All recorded income (comparison)','Every recorded income entry, whatever its position. A comparison only: it includes personal, unresolved and account-less income.']
 };
-function explainAttrs(key,from,to,win){return' data-explain="'+key+'" data-ex-from="'+(from||'')+'" data-ex-to="'+(to||'')+'"'+(win?' data-ex-window="1"':'')+' style="cursor:pointer;"';}
+/* The explanation link: data attributes only. Its pointer cursor is the CSS rule [data-explain], so an element
+   never receives a second style attribute (a browser keeps only the first, which hid the Director's amber). */
+function explainAttrs(key,from,to,win){return' data-explain="'+key+'" data-ex-from="'+(from||'')+'" data-ex-to="'+(to||'')+'"'+(win?' data-ex-window="1"':'');}
 /* One figure row: label, value and an explanation link, with its key and raw value for checking. */
 function figRow(label,key,value,from,to,opts){
   opts=opts||{};var v=Number(value)||0,col=opts.color||(opts.signed?(v>=0?'#22C55E':'#EF4444'):'var(--text)');
@@ -6301,7 +6304,7 @@ function renderCashFlowS2(){
     +figRow('Cash received into confirmed pharmacy accounts','incomeCashReceived',f.incomeCashReceived,fr,to,{note:esc(S2L.incomeCashReceived)})
     +figRow('Less paid from pharmacy accounts (F1)','f1',f.f1,fr,to)
     +figRow('Less counted against Shared accounts\' confirmed pharmacy portion (C2)','f2Counted',f.f2Counted,fr,to)
-    +'<div id="cf-op-cash"><div class="cf-total-row"'+explainAttrs('opCash',fr,to)+'><span class="cf-total-lbl">Pharmacy cash movement from operations</span>'+opcFigureHTML(cf.operatingCash,'span','cf-total-amt','color:'+(cf.operatingCash>=0?'#22C55E':'#EF4444')+';')+'</div>'
+    +'<div id="cf-op-cash"><div class="cf-total-row" style="flex-wrap:wrap;"'+explainAttrs('opCash',fr,to)+'><span class="cf-total-lbl">Pharmacy cash movement from operations</span>'+opcFigureHTML(cf.operatingCash,'span','cf-total-amt','color:'+(cf.operatingCash>=0?'#22C55E':'#EF4444')+';')+'</div>'
     +'<div class="muted-note">'+esc(S2L.opC)+'</div></div>'
     +'<div id="cf-op-diff">'+total('Difference between the two','opDiff',cf.difference.total)+'<div class="muted-note" data-cf-diff-text>Difference: pharmacy income not received into confirmed pharmacy cash ('+fmt(cf.difference.incomeNotConfirmedCash)+'), less pharmacy expenditure not paid from confirmed pharmacy cash ('+fmt(cf.difference.spendingNotFromConfirmedCash)+').</div></div>'
     +'<div id="cf-op-unresolved"><div class="cf-section-title" style="margin-top:10px;">Shown separately (in neither total)</div>'

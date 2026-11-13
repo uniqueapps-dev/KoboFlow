@@ -161,3 +161,59 @@ still corresponds exactly to `1ac94b5`.
   automated tests on both builds and the built TEST-site files.
 - The Analytics vehicle insight shows the Vehicles screen's own figure (unchanged; not a Stage 2 measure).
 - Demo mode shows the earlier sample screens (section 1).
+
+## 7. Acceptance correction release (owner-authorised, after the independent acceptance audit)
+
+The independent audit of `1ac94b5` / `17b5dba` found two display defects and two weaknesses. The owner
+authorised a controlled correction limited to them. No financial rule, definition, calculation, Shared or
+held-inflow logic, Stage 1 behaviour, `DB_VERSION`, backup format or switch changed.
+
+| Finding | Correction |
+|---|---|
+| Cash Flow operating card: the OP-C qualification rendered **beside** the figure (the row did not wrap) | The row wraps; the sentence (unchanged wording) is on its own line directly below the figure. The summary tile and the explanation sheet were already correct and are unchanged. |
+| Director: the unresolved spending and income warnings rendered grey, not amber (the element had two `style` attributes; a browser keeps the first) | The explanation link no longer writes a `style` attribute; its pointer cursor is the CSS rule `[data-explain]`. No element carries two `style` attributes. Amounts, wording and layout unchanged. |
+| The Stage 0 comparison removed the whole Briefing and the whole Capital summary | Only what Stage 2 changes is removed: the Briefing rows "Owner W/D This Month" and "Financial Health (rule-of-thumb)", the two reworded warning sentences, and the Capital tile "Capital Injected". Every other Briefing row, note, warning and reminder, and every other Capital tile, is compared with the Stage 0 build again. |
+| CF7 checked the qualification only by the order of the page's code | New browser checks use rendered boxes (below, close, overlapping), at 360 and 390 px, in all three places; plus the Director colour and the preservation checks below. |
+
+**New browser checks (both builds, and the deployed files with `KOBOFLOW_SITE_DIR`):**
+- the OP-C qualification is visually directly below every displayed OP-C figure (summary tile, operating card,
+  explanation sheet), at 360 and 390 px wide;
+- the Director's unresolved warnings render in amber (the computed colour equals `var(--amber)`), still open
+  their explanation, and no element on any Stage 2 screen has two `style` attributes;
+- unchanged Briefing rows (label, value and colour), notes, warnings and reminders, and unchanged Capital
+  tiles, equal the accepted Stage 1 build (`3bdacf3`) on the same data.
+
+**Shown to detect the defects:** the first two checks fail on the previous deployment (`17b5dba`): "operating
+card: the sentence starts below the figure … not beside it" and "expected rgb(245, 166, 35), actual
+rgb(122, 120, 128)". The narrowed Stage 0 comparison passes on the corrected source and fails when an
+unchanged Briefing row ("Largest Demand") or Capital tile ("Loans Outstanding") is altered, or when a
+changed row's label is altered.
+
+### 7.1 What Import does (verified in the code, `planImport`, and in a disposable profile)
+
+| Data | Behaviour |
+|---|---|
+| Before anything is written | The format check runs first (a format-2 or damaged file is refused: "Import failed: … Nothing was changed."). Otherwise a prompt lists what would be added, skipped and kept; **Cancel writes nothing**. |
+| Existing transactions | Never changed or deleted. An imported entry with the same id and identical content, or the same signature, is skipped; the same id with different content is counted as "conflicting (kept your current version)". |
+| Imported transactions | Every other imported entry is **added** as a new record. Added entries stay until deleted (there is no undo of an import). They move balances wherever they name an account the current setup knows, including quick-capture names through the current mapping. |
+| Existing account setup | **No setup** (a new, empty profile): the backup's setup is restored, with every account's "Used For" confirmation reset ("Account setup (live mode since …) will be restored"). **An existing setup** that differs: it is kept and the backup's is ignored ("The backup has a different account setup; your current setup is kept."). Identical: skipped. |
+| Balances | Not stored; always recalculated from the setup's opening balances and the entries. |
+| Agreements, instalments, allocations, events, opportunities, bills | Added by the same rules (existing records never changed). The review fixture contains none. |
+
+The import prompt describes this behaviour accurately. The earlier checklist sentence that an import "would
+replace your TEST accounts" was wrong: on a profile that already has data the setup is kept, but the fixture's
+12 fictional entries would be **added** to it. The corrected checklist therefore requires an empty Incognito
+tab and tells the owner to tap **Cancel** unless the prompt says "Account setup … will be restored".
+
+**Production:** the production build has no check that refuses a TEST backup (it would add the entries in the
+same way). The review fixture is for the TEST site only; nothing in the checklist uses the production app.
+Adding such a check is outside this release (a recommendation, not done).
+
+### 7.2 Results of the correction release
+
+| Check | Result |
+|---|---|
+| Full suite (`npm test`) | **486 passed, 0 failed, 0 skipped** (480 + 6 new browser checks: OP-C position, Director colour and preservation, on both builds) |
+| Stage 1 and Stage 2 regression | all pass; no financial expectation changed |
+| Build | `node scripts/build-test-file.js --check`: up to date |
+| Performance (start-up render, Stage 2 / Stage 1, ms) | 500: 275 / 210; 3,000: 836 / 593; 10,000: 2,320 / 2,870; 11 measures computations per render pass at every size (timings vary with machine load) |

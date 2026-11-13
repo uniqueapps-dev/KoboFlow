@@ -12,6 +12,10 @@ const path = require('path');
 process.env.PW_EXPERIMENTAL_SERVICE_WORKER_NETWORK_EVENTS = '1';
 const F = require('./load-engine')();
 const gen = require('../scripts/build-test-file.js');
+const { execFileSync } = require('child_process');
+const STAGE1 = '3bdacf30f1ffbe257b324534ee9c1153c1e04651'; // the accepted Stage 1 source
+const stage1 = {};
+for (const [k, f] of [['test1', 'koboflow-test.html'], ['prod1', 'koboflow.html']]) { try { stage1[k] = execFileSync('git', ['show', `${STAGE1}:${f}`], { cwd: path.join(__dirname, '..'), maxBuffer: 1 << 27 }); } catch (e) { stage1[k] = null; } }
 
 const ROOT = path.join(__dirname, '..');
 let pw = null;
@@ -68,8 +72,9 @@ const measures = (seed, from, to) => F.financialMeasures(seed.setup.accounts, se
 /* ── Server and browser ── */
 let server, base, browser;
 const site = Object.fromEntries(gen.buildTestSite());
-const pageFor = { test: () => fs.readFileSync(path.join(ROOT, 'koboflow-test.html')), prod: () => fs.readFileSync(path.join(ROOT, 'koboflow.html')), site: () => SITE_DIR && fs.readFileSync(path.join(SITE_DIR, 'index.html')) };
-const DBN = { test: 'KoboFlowDB-test', prod: 'KoboFlowDB', site: 'KoboFlowDB-test' };
+const pageFor = { test: () => fs.readFileSync(path.join(ROOT, 'koboflow-test.html')), prod: () => fs.readFileSync(path.join(ROOT, 'koboflow.html')), site: () => SITE_DIR && fs.readFileSync(path.join(SITE_DIR, 'index.html')),
+  test1: () => stage1.test1, prod1: () => stage1.prod1 };
+const DBN = { test: 'KoboFlowDB-test', prod: 'KoboFlowDB', site: 'KoboFlowDB-test', test1: 'KoboFlowDB-test', prod1: 'KoboFlowDB' };
 const BUILDS = ['test', 'prod'].concat(SITE_DIR ? ['site'] : []);
 const LABEL = { test: 'TEST build', prod: 'production candidate', site: 'built TEST-site files' };
 test.before(async () => {
@@ -230,6 +235,80 @@ for (const key of BUILDS) {
     assert.equal(await page.evaluate(() => new Dexie().newFinancialFormat), false, 'switch OFF');
     assert.match(await page.evaluate(() => document.getElementById('db-engine').textContent), /IndexedDB v4\b/, 'DB_VERSION 4');
     assert.deepEqual(page.errors, []); await context.close();
+  });
+
+  // Acceptance correction (owner-authorised): the OP-C qualification is checked by its RENDERED position, not by the
+  // order of the page's code. For every displayed OP-C figure (summary tile, operating card, explanation sheet), at
+  // phone widths, the sentence's box starts at or below the figure's bottom edge (never beside it), close under it,
+  // and overlaps it horizontally.
+  test(`${LABEL[key]}: OP-C qualification is visually directly below every displayed OP-C figure (summary tile, operating card, explanation sheet), at 360 and 390 px wide`, { skip }, async () => {
+    for (const width of [360, 390]) {
+      const seed = seedJ(), { context, page } = await openSeeded(key, seed);
+      await page.setViewportSize({ width, height: 844 });
+      await nav(page, 'cashflow');
+      const geo = sel => page.$$eval(sel, els => els.map(f => { const q = f.nextElementSibling, a = f.getBoundingClientRect(), b = q.getBoundingClientRect();
+        return { where: f.closest('#cf-s2-grid') ? 'summary tile' : f.closest('#cf-op-cash') ? 'operating card' : 'explanation sheet', isQual: q.matches('[data-opc-qualification]'), text: q.textContent.replace(/\s+/g, ' ').trim(),
+          figBottom: a.bottom, figLeft: a.left, figRight: a.right, qTop: b.top, qLeft: b.left, qRight: b.right, qVisible: b.width > 0 && b.height > 0 && getComputedStyle(q).visibility !== 'hidden' && getComputedStyle(q).display !== 'none' }; }));
+      const placed = await geo('#screen-cashflow [data-opc]');
+      await page.click('#cf-op-cash [data-explain="opCash"]'); await page.waitForSelector('#explain-modal.open [data-explain-sheet]'); await page.waitForTimeout(150);
+      const sheet = await geo('#explain-modal [data-opc]');
+      const all = placed.concat(sheet);
+      assert.deepEqual(all.map(x => x.where).sort(), ['explanation sheet', 'operating card', 'summary tile'], `${width}px: the three OP-C displays`);
+      for (const x of all) {
+        assert.ok(x.isQual && x.text === OPC, `${width}px ${x.where}: the sentence follows the figure, verbatim`);
+        assert.ok(x.qVisible, `${width}px ${x.where}: the sentence is visible`);
+        assert.ok(x.qTop >= x.figBottom - 1, `${width}px ${x.where}: the sentence starts below the figure (figure bottom ${x.figBottom}, sentence top ${x.qTop}), not beside it`);
+        assert.ok(x.qTop - x.figBottom <= 24, `${width}px ${x.where}: directly below (gap ${x.qTop - x.figBottom}px)`);
+        assert.ok(x.qLeft < x.figRight && x.qRight > x.figLeft, `${width}px ${x.where}: under the figure (horizontal overlap)`);
+      }
+      assert.deepEqual(page.errors, []); await context.close();
+    }
+  });
+
+  // Acceptance correction: the Director's unresolved warnings are amber (their rendered colour equals var(--amber)).
+  test(`${LABEL[key]}: the Director's unresolved spending and income warnings render in amber`, { skip }, async () => {
+    const seed = seedJ(), { context, page } = await openSeeded(key, seed);
+    await nav(page, 'director');
+    const r = await page.evaluate(() => { const probe = document.createElement('span'); probe.style.color = 'var(--amber)'; document.body.appendChild(probe); const amber = getComputedStyle(probe).color; probe.remove();
+      const muted = getComputedStyle(document.querySelector('#director-body .muted-note:not([data-dir-quality^="s2_"])')).color;
+      return { amber, muted, lines: [...document.querySelectorAll('[data-dir-quality^="s2_"]')].map(e => ({ key: e.getAttribute('data-dir-quality'), color: getComputedStyle(e).color, cursor: getComputedStyle(e).cursor, styleAttrs: (e.outerHTML.match(/\sstyle=/g) || []).length })) }; });
+    assert.ok(r.lines.length >= 2, 'the unresolved spending and income lines are shown');
+    assert.ok(r.lines.some(l => l.key === 's2_unresolved_spending') && r.lines.some(l => l.key === 's2_unresolved_income'));
+    assert.notEqual(r.amber, r.muted, 'amber differs from the muted grey');
+    for (const l of r.lines) { assert.equal(l.color, r.amber, l.key + ' is amber'); assert.equal(l.cursor, 'pointer', l.key + ' still opens its explanation'); assert.equal(l.styleAttrs, 1, l.key + ': one style attribute'); }
+    // No element on any Stage 2 screen carries two style attributes.
+    for (const s of ['home', 'analytics', 'cashflow', 'ownerimpact', 'capital', 'director', 'timeline']) {
+      await nav(page, s);
+      assert.equal(await page.evaluate(() => [...document.querySelectorAll('.screen.active *')].filter(e => (e.outerHTML.slice(0, e.outerHTML.indexOf('>') + 1).match(/\sstyle=/g) || []).length > 1).length), 0, s + ': no element with two style attributes');
+    }
+    assert.deepEqual(page.errors, []); await context.close();
+  });
+
+  // Acceptance correction: the Briefing and Capital content Stage 2 does not change is preserved. Every Briefing row
+  // except "Owner W/D This Month" and "Financial Health", every Briefing note and every warning other than the two
+  // reworded ones, and every Capital tile except "Capital Injected", equal the accepted Stage 1 build on the same data.
+  if (key !== 'site') test(`${LABEL[key]}: unchanged Briefing rows, notes and warnings and unchanged Capital tiles equal the accepted Stage 1 build (${STAGE1.slice(0, 7)})`, { skip }, async (t) => {
+    if (!stage1[key + '1']) { t.skip('Stage 1 commit not in this checkout'); return; }
+    const seed = seedJ();
+    const read = async k => { const { context, page } = await openSeeded(k, seed);
+      const o = await page.evaluate(() => ({ rows: [...document.querySelectorAll('#autopilot-body .autopilot-row')].map(r => [r.querySelector('.autopilot-lbl').textContent.trim(), r.querySelector('.autopilot-val').textContent.trim(), r.querySelector('.autopilot-val').getAttribute('style')]),
+        notes: [...document.querySelectorAll('#autopilot-body .muted-note, #autopilot-body .autopilot-ok')].map(e => e.textContent.replace(/\s+/g, ' ').trim()),
+        warnings: [...document.querySelectorAll('#autopilot-body .autopilot-warning')].flatMap(w => w.innerHTML.split(/<br\s*\/?>/i).map(x => x.replace(/<[^>]*>/g, '').replace(/\s+/g, ' ').replace(/^⚠\s*/, '').trim())),
+        reminders: (document.getElementById('autopilot-body').innerHTML.split('<div class="autopilot-row"')[0] || '').replace(/\s+/g, ' ') }));
+      await nav(page, 'capital'); o.tiles = await page.$$eval('#cap-summary .stat-card', els => els.map(e => [e.querySelector('.stat-label').textContent.trim(), e.querySelector('.stat-val').textContent.trim()]));
+      assert.deepEqual(page.errors, []); await context.close(); return o; };
+    const now = await read(key), before = await read(key + '1');
+    const CHANGED_ROWS = ['Owner W/D This Month', 'Financial Health (rule-of-thumb)'], REWORDED = ['runway is critical', 'Owner withdrawals exceed 30% of'];
+    assert.deepEqual(now.rows.map(r => r[0]), before.rows.map(r => r[0]), 'the same Briefing rows, in the same order');
+    const keepRows = rs => rs.filter(r => !CHANGED_ROWS.includes(r[0]));
+    assert.equal(keepRows(now.rows).length, now.rows.length - 2);
+    assert.deepEqual(keepRows(now.rows), keepRows(before.rows), 'every unchanged Briefing row: same label, value and colour');
+    assert.deepEqual(now.notes, before.notes, 'the Briefing notes');
+    const keepW = ws => ws.filter(w => !REWORDED.some(p => w.includes(p)));
+    assert.deepEqual(keepW(now.warnings), keepW(before.warnings), 'every warning other than the two reworded ones');
+    assert.equal(now.reminders, before.reminders, 'the reminders above the Briefing');
+    assert.deepEqual(now.tiles.map(x => x[0]), ['Loans Outstanding', 'Capital Injected', 'Loan Repayments (30d)', 'Active Loans']);
+    assert.deepEqual(now.tiles.filter(x => x[0] !== 'Capital Injected'), before.tiles.filter(x => x[0] !== 'Capital Injected'), 'every unchanged Capital tile');
   });
 
   test(`${LABEL[key]}: runway display rule — available ₦0 → 0 days, "No confirmed available pharmacy cash."; available −₦5,000 → 0 days, the negative message, and −₦5,000 still shown; otherwise the normal days`, { skip }, async () => {
