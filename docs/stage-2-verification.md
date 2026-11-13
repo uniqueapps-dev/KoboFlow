@@ -130,6 +130,21 @@ All runs on the feature branch working tree with the final source, Chromium (Pla
 One memoised result per period (this month to date, the calendar month, yesterday, today, all dates, last
 month, the year to date and the Cash Flow six-month trend); the number does not grow with the entries.
 
+## 5a. TEST deployment
+
+| Item | Value |
+|---|---|
+| Source commit | `1ac94b57947236d485417f60103b2319b57e4933` (feature branch) |
+| TEST repository | `uniqueapps-test/uniqueapps-test.github.io` |
+| Previous TEST deployment | `97e3342` (Stage 1) |
+| **TEST deployment commit** | `17b5dba6c9292150c079177e8c47ce48e5620cb6` (GitHub Pages "pages build and deployment" run 11, conclusion success) |
+| Build | `scripts/build-test-file.js --site` from a fresh, clean clone of `1ac94b5`; every `SOURCE.json` input hash matches the source blob and every output hash matches the published file; `index.html` byte-identical to the committed `koboflow-test.html`; manifest, service worker and icons unchanged |
+| Deployed-file tests | `KOBOFLOW_SITE_DIR` runs of `tests/stage2-screens-browser.test.js` and `tests/stage1-accountless-browser.test.js`: 19 passed, 0 failed (including CF6, CF7, R1–R12 and the runway display rule on the exact deployed files) |
+| Production, `main`, `develop`, PBSRx | untouched (`main` `2f4ab03`, `develop` `e5e9f69`) |
+
+This record is committed after the deployment; it changes no application input, so the deployed build
+still corresponds exactly to `1ac94b5`.
+
 ## 6. Known limitations (stated in the app where relevant)
 
 - Held unresolved inflows: the cash layer's existing, conservative behaviour (fixture H3) is followed, not
